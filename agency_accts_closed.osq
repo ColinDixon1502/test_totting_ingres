@@ -1,0 +1,462 @@
+/****************************************************************************/
+/* Source:      agency_accts_closed.osq                                     */
+/*                                                                          */
+/* Proc Name:   agency_accts_closed                                         */
+/*                                                                          */
+/* Purpose:     This will select from the acct change audit table records   */
+/*              with an action of CLOSE and a record status of READY        */
+/*              ignoring records where the branch_id is not in the agency   */
+/*              acct_branch_incl table.                                     */
+/*              It will then extract these records, adding further details  */
+/*              from sales_accts table and writing them to attachment file. */
+/*                                                                          */
+/* Author:      I Salim                                                     */
+/*                                                                          */
+/* Date:        24/07/2014                                                  */
+/*                                                                          */
+/* Parameters:  Agency Supplier No                                          */
+/*              Branch ID                                                   */
+/*                                                                          */
+/* RETURN Val:  0 - File generated                                          */
+/*              1 - Error                                                   */
+/****************************************************************************/
+/*  Version | Date     | Coded | Description of changes made                */
+/***********|**********|*******|*********************************************/
+/*  1.0     | 24.07.14 | ISS   | Original Code for GSK SAP Project          */
+/***********|**********|*******|*********************************************/
+/*  2.0     | 07.10.14 | ISS   | 1.Only print column headers if there is    */
+/*          |          |       |   data.                                    */
+/*          |          |       | 2.Enclose all data with double quotes to   */
+/*          |          |       |   prevent misalignment of columns.         */
+/***********|**********|*******|*********************************************/
+PROCEDURE agency_accts_closed 
+(
+    pv_agency_supplier         = INTEGER(4)     NOT NULL WITH DEFAULT;
+    pv_file_attach             = VARCHAR(250)   NOT NULL WITH DEFAULT;
+    pv_chg_cnt                 = INTEGER(4)     NOT NULL WITH DEFAULT;        
+
+)=
+ DECLARE
+ 
+    mv_debug                    = INTEGER(4)    NOT NULL WITH DEFAULT;
+ 
+    mv_retcode                  = INTEGER4      NOT NULL,  
+ 
+    mv_row                      = INTEGER2      NOT NULL, 
+    mv_close_rows               = INTEGER2      NOT NULL, 
+    mv_state                    = INTEGER2      NOT NULL, 
+    ma_system_cmd               = VARCHAR(1000) NOT NULL WITH DEFAULT,
+
+    /* Acct Change Audit Table  */ 
+    mv_agency_supplier          = INTEGER(4)    NOT NULL WITH DEFAULT,
+    mv_branch_id                = CHAR(4)       NOT NULL WITH DEFAULT,
+    mv_account_no               = CHAR(9)       NOT NULL WITH DEFAULT,
+    mv_chg_cnt                  = INTEGER(4)    NOT NULL WITH DEFAULT,    
+    mv_action                   = CHAR(8)       NOT NULL WITH DEFAULT,     
+  
+    ma_agency_acct_branch_incl  = ARRAY OF TYPE OF TABLE agency_acct_branch_incl;
+    ma_acct_change_audit        = ARRAY OF TYPE OF TABLE acct_change_audit;
+    ma_sales_accts              = ARRAY OF TYPE OF TABLE sales_accts;
+ 
+    /******************************************************/
+    /** LOCAL PROCEDURES                                 **/
+    /******************************************************/
+  
+    lp_initialise               = PROCEDURE RETURNING INTEGER4 NOT NULL; 
+    lp_ing_error_check          = PROCEDURE RETURNING INTEGER2 NOT NULL;
+    lp_create_closed_recs       = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_log_message              = PROCEDURE RETURNING NONE;
+    lp_get_acct_change_audit    = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_get_sales_accts_data     = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_process_audit            = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_create_closed_heading    = PROCEDURE RETURNING INTEGER4 NOT NULL; 
+    lp_create_closed_hdrs       = PROCEDURE RETURNING INTEGER4 NOT NULL; 
+ 
+/**************************************************************************/
+/*   Start of Code                                                        */
+/**************************************************************************/  
+{    
+    mv_retcode = gc_success;
+ 
+    mv_retcode = lp_initialise();
+    IF (mv_retcode != gc_success)
+    THEN 
+        RETURN gc_fail;
+    ENDIF;
+ 
+    /******************************************/
+    /* Fetch Account updates                  */
+    /******************************************/
+    pv_chg_cnt = 0;   
+
+    mv_retcode = lp_get_acct_change_audit();
+    IF (mv_retcode != gc_success)
+    THEN 
+        RETURN gc_success;
+    ENDIF;
+
+    mv_retcode = lp_create_closed_heading ();
+    IF (mv_retcode != gc_success)
+    THEN
+       RETURN gc_fail;
+    ENDIF;
+
+    IF pv_chg_cnt > 0
+    THEN
+       mv_retcode = lp_create_closed_hdrs ();
+       IF (mv_retcode != gc_success)
+       THEN
+          RETURN gc_fail;
+       ENDIF;
+    ELSE
+       ma_system_cmd = 'echo ' + ' ' + ' >> ' + :pv_file_attach;
+       CALL SYSTEM :ma_system_cmd;
+    ENDIF;
+
+    UNLOADTABLE ma_acct_change_audit (mv_row = _RECORD, mv_state = _STATE )
+    {
+        mv_agency_supplier  = ma_acct_change_audit.agency_supplier;
+        mv_branch_id        = ma_acct_change_audit.branch_id;
+        mv_account_no       = ma_acct_change_audit.account_no;
+        mv_action           = ma_acct_change_audit.action; 
+
+        IF mv_debug = 1
+        THEN
+           MESSAGE 'Frame = agency_accts_closed.osq'                       + X'0A' +
+                   'Call lp_process_audit'                                 + X'0A' +
+                   'Row: ' + VARCHAR(mv_row) + '/' + VARCHAR(pv_chg_cnt)   + X'0A' +
+                   'pv_agency_supplier  = ' + VARCHAR(pv_agency_supplier)  + X'0A' +
+                   'mv_branch_id        = ' + mv_branch_id                 + X'0A' +
+                   'mv_account_no       = ' + mv_account_no                + X'0A' +
+                   'mv_action           = ' + mv_action                   
+           WITH STYLE = POPUP;
+        ENDIF;
+
+        mv_retcode = lp_process_audit(
+                                       lpv_agency_supplier = :pv_agency_supplier,
+                                       lpv_branch_id       = :mv_branch_id,
+                                       lpv_account_no      = :mv_account_no);
+        IF (mv_retcode != gc_success)
+        THEN 
+           CALLPROC lp_log_message(
+                    lpv_audit_text = 'Error lp_process_audit failed CLOSE'    +
+                                    ' Agency '  + VARCHAR(pv_agency_supplier) +
+                                    ' Branch '  + mv_branch_id                +
+                                    ' Account ' + mv_account_no);
+           RETURN gc_fail;
+        ENDIF;
+    };
+
+    CALLPROC lp_log_message(
+       lpv_audit_text = 'Agency Closed Account total =  '  +
+                        CHAR(pv_chg_cnt));
+
+    CALLPROC lp_log_message(
+       lpv_audit_text = 'Agency Closed Account extract finishing. '  +
+                        ' Agency '  + CHAR(pv_agency_supplier)); 
+}
+ 
+/*****************************************************************/
+/** Procedure To set some initial values and conditions         **/
+/*****************************************************************/
+PROCEDURE lp_initialise () =
+DECLARE 
+    lv_ing_result   = INTEGER4 NOT NULL WITH DEFAULT;
+    lv_retcode      = INTEGER4 NOT NULL WITH DEFAULT; 
+{
+    lv_retcode      = gc_success;
+
+    CALLPROC lp_log_message(
+       lpv_audit_text = 'Agency Closed Account extract starting. '  +
+                        ' Agency '  + VARCHAR(pv_agency_supplier)); 
+ 
+    mv_debug   = 0; /* 1: Show debugging popups       */
+                    /* 0: Don't show debugging popups */
+ 
+    lv_retcode = CALLPROC ARRAYCLEAR(ma_agency_acct_branch_incl);
+    lv_retcode = CALLPROC ARRAYCLEAR(ma_sales_accts);
+ 
+    RETURN gc_success;
+}
+ 
+/*****************************************************************/
+/** Procedure To set some initial values and conditions         **/
+/*****************************************************************/
+PROCEDURE lp_get_acct_change_audit () =
+DECLARE 
+    lv_ing_result   = INTEGER4 NOT NULL WITH DEFAULT;
+    lv_retcode      = INTEGER4 NOT NULL WITH DEFAULT; 
+{
+    lv_retcode      = gc_success;
+ 
+    ma_acct_change_audit = 
+    SELECT     *
+    FROM       acct_change_audit
+    WHERE      record_status   = 'READY'
+    AND        action          = 'CLOSE'
+    AND        agency_supplier = :pv_agency_supplier
+    ORDER BY   account_no;
+  
+    INQUIRE_INGRES (pv_chg_cnt = ROWCOUNT);
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'lp_get_acct_change_audit ',
+                              lpv_sql_desc  = 'Reading acct_change_audit table');
+ 
+    IF (lv_ing_result != 0)
+    THEN
+       IF (lv_ing_result != 1) /* Ignore 0 rowcount */
+       THEN
+          IF mv_debug = 1
+          THEN
+              MESSAGE 'Debug Error select acct_change_audit ' WITH STYLE=POPUP;
+          ENDIF;
+
+          CALLPROC lp_log_message(
+                   mv_audit_text = 'Error select acct_change_audit table CLOSE' +
+                                   ' Agency '  + VARCHAR(pv_agency_supplier));
+          RETURN gc_fail;
+       ENDIF;
+    ENDIF;
+
+    RETURN gc_success;      
+}
+
+/*****************************************************************/
+/** Procedure to process CLOSE audit records                    **/
+/*****************************************************************/
+PROCEDURE lp_process_audit(
+    lpv_agency_supplier          = INTEGER(4)    NOT NULL WITH DEFAULT,
+    lpv_branch_id                = CHAR(4)       NOT NULL WITH DEFAULT,
+    lpv_account_no               = CHAR(9)       NOT NULL WITH DEFAULT,
+) =
+DECLARE 
+    lv_addr_line1      = VARCHAR(32) NOT NULL WITH DEFAULT; 
+    lv_addr_line2      = VARCHAR(32) NOT NULL WITH DEFAULT; 
+    lv_addr_line3      = VARCHAR(32) NOT NULL WITH DEFAULT; 
+    lv_addr_line4      = VARCHAR(32) NOT NULL WITH DEFAULT; 
+    lv_post_code       = VARCHAR(8)  NOT NULL WITH DEFAULT; 
+    lv_del_date        = DATE        NOT NULL WITH DEFAULT; 
+    lv_retcode         = INTEGER4 NOT NULL WITH DEFAULT; 
+{
+    lv_retcode         = gc_success;
+ 
+    lv_retcode = lp_get_sales_accts_data(
+                                    lpv_branch_id       = :lpv_branch_id,
+                                    lpv_account_no      = :lpv_account_no);
+    IF (lv_retcode != gc_success)
+    THEN 
+        RETURN gc_fail;
+    ENDIF; 
+
+    lv_addr_line1   = ma_sales_accts[1].addr_line1;
+    lv_addr_line2   = ma_sales_accts[1].addr_line2;
+    lv_addr_line3   = ma_sales_accts[1].addr_line3;
+    lv_addr_line4   = ma_sales_accts[1].addr_line4;
+    lv_post_code    = ma_sales_accts[1].post_code;
+    lv_del_date     = IFNULL(ma_sales_accts[1].del_date,'');
+
+    IF mv_debug = 1 
+    THEN 
+       MESSAGE 'Frame = agency_accts_closed.osq'                           + X'0A' +
+               'Process = lp_process_audit'                                + X'0A' +
+               'AGENCY SUPPLIER = ' + VARCHAR(lpv_agency_supplier)         + X'0A' +
+               'ACCOUNT         = ' + CONCAT(lpv_branch_id,lpv_account_no) + X'0A' +
+               'ADDRESS LINE 1  = ' + lv_addr_line1                        + X'0A' +
+               'ADDRESS LINE 2  = ' + lv_addr_line2                        + X'0A' +
+               'ADDRESS LINE 3  = ' + lv_addr_line3                        + X'0A' +
+               'ADDRESS LINE 4  = ' + lv_addr_line4                        + X'0A' +
+               'POST CODE       = ' + lv_post_code                         + X'0A' +
+               'DEL DATE        = ' + VARCHAR(lv_del_date)              
+       WITH STYLE = POPUP;
+    ENDIF;
+
+    lv_retcode = lp_create_closed_recs(
+                                    lpv_branch_id       = :lpv_branch_id,
+                                    lpv_account_no      = :lpv_account_no,
+                                    lpv_addr_line1      = :lv_addr_line1,
+                                    lpv_addr_line2      = :lv_addr_line2,
+                                    lpv_addr_line3      = :lv_addr_line3,
+                                    lpv_addr_line4      = :lv_addr_line4,
+                                    lpv_post_code       = :lv_post_code,
+                                    lpv_del_date        = :lv_del_date);
+    IF (lv_retcode != gc_success)
+    THEN 
+        RETURN gc_fail;
+    ENDIF; 
+
+    RETURN gc_success;
+}
+ 
+
+/*****************************************************************/
+/** Get Sales Accts Data                                        **/
+/*****************************************************************/
+PROCEDURE lp_get_sales_accts_data (
+    lpv_branch_id       = CHAR(4)     NOT NULL WITH DEFAULT,
+    lpv_account_no      = CHAR(9)     NOT NULL WITH DEFAULT,
+) =
+DECLARE 
+    lv_ing_result       = INTEGER4 NOT NULL WITH DEFAULT;
+    lv_retcode          = INTEGER4 NOT NULL WITH DEFAULT;
+{
+    lv_retcode          = gc_success;
+ 
+    ma_sales_accts    = 
+    SELECT            *
+    FROM       sales_accts
+    WHERE      branch       = :lpv_branch_id
+    AND        account_no   = :lpv_account_no;
+  
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'lp_get_sales_accts_data ',
+                              lpv_sql_desc  = 'Reading sales_accts table');
+ 
+    IF (lv_ing_result != 0)
+    THEN
+       IF mv_debug = 1
+       THEN
+           MESSAGE 'Debug Error select sales_accts ' WITH STYLE=POPUP;
+       ENDIF;
+
+       CALLPROC lp_log_message(
+                lpv_audit_text = 'Error Select sales_accts table CLOSE' +
+                                ' Branch '  + lpv_branch_id              + 
+                                ' Account ' + lpv_account_no);
+       RETURN gc_fail; 
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/*****************************************************************/
+/** Create Email Text File                                      **/
+/*****************************************************************/
+PROCEDURE lp_create_closed_recs (
+    lpv_branch_id      = CHAR(4)     NOT NULL WITH DEFAULT,
+    lpv_account_no     = CHAR(9)     NOT NULL WITH DEFAULT,
+    lpv_addr_line1     = VARCHAR(32) NOT NULL WITH DEFAULT; 
+    lpv_addr_line2     = VARCHAR(32) NOT NULL WITH DEFAULT; 
+    lpv_addr_line3     = VARCHAR(32) NOT NULL WITH DEFAULT; 
+    lpv_addr_line4     = VARCHAR(32) NOT NULL WITH DEFAULT; 
+    lpv_post_code      = VARCHAR(8)  NOT NULL WITH DEFAULT; 
+    lpv_del_date       = DATE        NOT NULL WITH DEFAULT; 
+) =
+{
+
+    IF mv_debug = 1 
+    THEN
+       MESSAGE 'Frame = agency_accts_closed.osq'                     + X'0A' +
+               'Process = lp_create_closed_recs'                     + X'0A' +
+               'pv_agency_supplier = ' + VARCHAR(pv_agency_supplier) + X'0A' +
+               'lv_branch_id   = ' + VARCHAR(lpv_branch_id)          + X'0A' +
+               'lv_account_no  = ' + VARCHAR(lpv_account_no)         + X'0A' +
+               'lv_addr_line1  = ' + lpv_addr_line1                  + X'0A' +
+               'lv_addr_line2  = ' + lpv_addr_line2                  + X'0A' +
+               'lv_addr_line3  = ' + lpv_addr_line3                  + X'0A' +
+               'lv_addr_line4  = ' + lpv_addr_line4                  + X'0A' +
+               'lv_post_code   = ' + lpv_post_code                   + X'0A' +
+               'lv_del_date    = ' + VARCHAR(lpv_del_date)           + X'0A' +  
+               'pv_file_attach = ' + VARCHAR(pv_file_attach)
+       WITH STYLE = POPUP;
+    ENDIF;
+
+    ma_system_cmd = 'echo ' + '''' +
+                       '"'  + TRIM(lpv_branch_id + lpv_account_no)   + '"' + ',' +
+                       '"'  + TRIM(lpv_addr_line1)                   + '"' + ',' +
+                       '"'  + TRIM(lpv_addr_line2)                   + '"' + ',' +
+                       '"'  + TRIM(lpv_addr_line3)                   + '"' + ',' +
+                       '"'  + TRIM(lpv_addr_line4)                   + '"' + ',' +
+                       '"'  + TRIM(lpv_post_code)                    + '"' + ',' +
+                       '"'  + TRIM(IFNULL(VARCHAR(lpv_del_date),'')) + '"' + 
+                       '''' + ' >> ' + :pv_file_attach;
+    CALL SYSTEM :ma_system_cmd;
+
+    ma_system_cmd = 'echo ' + ' ' + ' >> ' + :pv_file_attach;
+    CALL SYSTEM :ma_system_cmd;
+
+    ma_system_cmd = 'echo ' + ' ' + ' >> ' + :pv_file_attach;
+    CALL SYSTEM :ma_system_cmd;
+ 
+    RETURN gc_success;
+}
+
+/*****************************************************************/
+/** Procedure to Log error messages to a log file               **/
+/*****************************************************************/
+PROCEDURE lp_log_message( lpv_audit_text = varchar(256)) =
+DECLARE date_time = VARCHAR(20) NOT NULL,
+{
+    date_time = VARCHAR(DATE('now'));
+    lpv_audit_text = date_time + ' - ' + IFNULL(lpv_audit_text,'Null message');
+
+    CALL SYSTEM 'echo ' + '"' + VARCHAR(lpv_audit_text) + '\n' + '\c' + '"' +
+                ' >> /aahdb/logs/current/agency_accts_closed.log';
+    RETURN;
+}
+ 
+/*****************************************************************/
+/** Error handling                                              **/
+/*****************************************************************/
+PROCEDURE lp_ing_error_check(lpv_procedure    = CHAR(60),
+                             lpv_sql_desc     = CHAR(60)) =
+DECLARE 
+    lv_source_location = CHAR(68);
+    lv_retcode         = INTEGER4 NOT NULL WITH DEFAULT;
+{
+    lv_retcode            = gc_success;
+  
+    lv_source_location = 'Module :agency_accts_closed' +
+                         'Procedure :' + lpv_procedure;
+
+    /* cBatch  cDebug  0 = False/Off  1 = True/On  */
+    lv_retcode = CALLPROC ingdb_error_check(
+                              cModuleName     = 'agency_accts_closed',
+                              cProcedureName  = IFNULL(lpv_procedure,''), 
+                              cSQLdescription = IFNULL(lpv_sql_desc,''),
+                              cBatch          = 1,
+                              cDebug          = 1,
+                              cLogFile        = 'agency_accts_closed.log');
+    RETURN (lv_retcode);
+}
+
+/*****************************************************************/
+/** Procedure to create comma separated <CLOSED> heading file  **/
+/*****************************************************************/
+PROCEDURE lp_create_closed_heading() =
+DECLARE
+    lv_retcode       = INTEGER4 NOT NULL WITH DEFAULT;
+{
+    lv_retcode       = gc_success;
+
+    ma_system_cmd    = 'echo ' + ' ' + '"' + 'Closed Accounts' + '"' 
+                  + ' >> ' + :pv_file_attach;
+    CALL SYSTEM :ma_system_cmd;
+
+    ma_system_cmd = 'echo ' + ' ' + ' >> ' + :pv_file_attach;
+    CALL SYSTEM :ma_system_cmd;
+
+    RETURN(lv_retcode);
+}
+
+/*****************************************************************/
+/** Procedure to create comma separated <CLOSED> headers file  **/
+/*****************************************************************/
+PROCEDURE lp_create_closed_hdrs() =
+DECLARE
+    lv_retcode       = INTEGER4 NOT NULL WITH DEFAULT;
+{
+    lv_retcode       = gc_success;
+
+    ma_system_cmd = 'echo ' + ' ' + '"' + 'Account Number,'            + '"' +
+                                    '"' + 'Address 1,'                 + '"' +
+                                    '"' + 'Address 2,'                 + '"' +
+                                    '"' + 'Address 3,'                 + '"' +
+                                    '"' + 'Address 4,'                 + '"' +
+                                    '"' + 'Post Code,'                 + '"' +
+                                    '"' + 'Date Flagged for Deletion'  + '"' +
+                    ' >> ' + :pv_file_attach;
+    CALL SYSTEM :ma_system_cmd;
+
+    RETURN(lv_retcode);
+}

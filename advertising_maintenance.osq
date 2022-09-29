@@ -1,0 +1,251 @@
+/*
+** Inventory Management System CONTROL development using INGRES
+** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+**
+** MODULE NAME:  advertising_maintenance.osq
+**
+** PURPOSE:      Summary screen of Advertising Frames
+**
+** VERSION:      1.0
+**
+** STATUS:       Development
+**
+** AUTHOR:       Dave Dawson  
+**
+** DATE:         24/11/94
+**
+** CHANGE DATE:  N/A
+**
+** CHANGES:      N/A
+**
+** PARAMETERS:   None
+**
+*/
+
+INITIALIZE(
+	   IIbranch   = char(4),
+	   IIstamp    = char(16),
+	   IIrowcount = integer(4) not null,
+	   IIerrorno  = integer(4) not null,
+	   hf_errtext = char(256) not null,
+	   IIint      = integer(4),
+	   IIchar     = char(20),
+	   IIchar1    = char(20),
+)=
+
+DECLARE
+	   v_fill_table = PROCEDURE RETURNING INTEGER;
+	   h_advert     = type of table advert_messages;
+	   mcs_res      = integer;
+
+{
+	   SET_FORMS FRS(TIMEOUT = :gc_timeout);
+	   SET_FORMS FRS(ACTIVATE(previousfield) = 1);
+
+	   screen_date = 'now';
+	   IIint = CALLPROC v_fill_table ;
+	   
+	   IF IIint !=0 THEN
+	      ROLLBACK;
+	      MESSAGE 'INGRES error in Select'
+		       WITH STYLE = POPUP;
+	      RETURN ;
+	   ENDIF;                
+}
+ 
+ON TIMEOUT = 
+{
+	   CALLFRAME timeout_popup()
+} 
+ 
+'Help', KEY FRSKEY1 =
+{
+    callproc help_proc(SUBJECT = 
+	       'Help on Invoice Advertising frame',
+	       file = :gc_help_dir+'advertising_maintenance.hlp');
+}
+
+'Delete',KEY FRSKEY14 = 
+{
+	      IIchar = '';
+	      
+	      WHILE UPPERCASE(IIchar) != 'N' AND
+		    UPPERCASE(IIchar) != 'Y'
+		 DO 
+		    IIchar = PROMPT 'Delete message (Y/N) ?' 
+			       WITH STYLE = POPUP;
+	      ENDWHILE;
+
+	      IF UPPERCASE(IIchar) = 'N' THEN
+		 RESUME;
+	      ENDIF;   
+		
+	      SELECT IIstamp = advert_timestamp,
+		     IIbranch = advert_branch
+		FROM advert_messages
+	       WHERE advert_branch = :advert_details.branch_no
+		 AND advert_type = :advert_details.advert_type
+		 AND start_date = :advert_details.start_date
+		 AND end_date = :advert_details.end_date
+		 AND company_no = :advert_details.company_no
+		 AND cust_type = :advert_details.cust_type
+		 AND cust_group = :advert_details.cust_group
+		 AND advert_seq = :advert_details.advert_seq ;
+			      
+	      INQUIRE_INGRES (IIerrorno = ERRORNO,
+			     hf_errtext = ERRORTEXT,
+			     IIrowcount = ROWCOUNT);
+		      
+	      IF IIerrorno !=0 THEN
+		 ROLLBACK;
+		 MESSAGE '-01- INGRES error Selecting Advert for Delete'
+		    WITH STYLE = POPUP;
+		 RETURN ;
+	      ENDIF;
+
+	      h_advert = SELECT *
+			   FROM advert_messages
+			  WHERE advert_branch    = :IIbranch
+			    AND advert_timestamp = :IIstamp;
+     
+	      DELETE FROM advert_messages 
+		    WHERE advert_branch = :advert_details.branch_no
+		      AND advert_type = :advert_details.advert_type
+		      AND start_date = :advert_details.start_date
+		      AND end_date = :advert_details.end_date
+		      AND company_no = :advert_details.company_no
+		      AND cust_type = :advert_details.cust_type
+		      AND cust_group = :advert_details.cust_group
+		      AND advert_seq = :advert_details.advert_seq ;
+			   
+	      INQUIRE_INGRES (IIerrorno = ERRORNO,
+			     hf_errtext = ERRORTEXT,
+			     IIrowcount = ROWCOUNT);
+		      
+	      IF IIerrorno !=0 THEN
+		 ROLLBACK;
+		 MESSAGE '-01- INGRES error in Delete'
+		    WITH STYLE = POPUP;
+		 RETURN ;
+	      ENDIF;
+		 
+	      commit;
+		   
+	      mcs_res = callproc open_isam();
+	    
+	      mcs_res = callproc mcs_adverts_out(
+						'D',
+						:h_advert.advert_branch,
+						varchar(:IIstamp),
+						:gv_branch_id,
+						:gv_user_id
+								    );
+			      
+		IF mcs_res != 0
+		THEN
+		    message 'ERROR : MCS returned '+trim(char(:mcs_res))
+			with style = popup;
+		ENDIF;
+	    
+		mcs_res = callproc close_isam();
+		
+		 
+	      DELETEROW advert_details;
+	   
+	      RESUME;
+}
+
+
+'Amend',KEY FRSKEY4 =
+{                   
+	 SELECT IIbranch = advert_branch,
+		IIstamp  = advert_timestamp
+	   FROM advert_messages
+	  WHERE advert_branch = :advert_details.branch_no
+	    AND advert_type = :advert_details.advert_type
+	    AND start_date = :advert_details.start_date
+	    AND end_date = :advert_details.end_date
+	    AND company_no = :advert_details.company_no
+	    AND cust_type = :advert_details.cust_type
+	    AND cust_group = :advert_details.cust_group
+	    AND advert_seq = :advert_details.advert_seq; 
+	    
+	 INQUIRE_INGRES (IIerrorno = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+		      
+	 IF IIerrorno !=0 THEN
+	    ROLLBACK;
+	    MESSAGE '-01- INGRES error in Amend'
+	    WITH STYLE = POPUP;
+	    RETURN ;
+	 ENDIF;
+  
+	 IF IIrowcount < 1 THEN
+	    MESSAGE 'No rows retrieved'
+	    WITH STYLE = POPUP;
+	    RETURN ;
+	 ENDIF;
+	 
+	 IF :advert_details.advert_type = 'L' THEN
+	     CALLFRAME advertising_link
+		      (IIoldbranch = BYREF(IIbranch),
+		       IIoldstamp  = BYREF(IIstamp));
+	 ELSE
+	     CALLFRAME advertising_invoices
+		      (IIoldbranch = BYREF(IIbranch),
+		       IIoldstamp = BYREF(IIstamp)); 
+	 ENDIF;         
+	
+	 IIint = CALLPROC v_fill_table;
+	 
+	 IF IIint !=0 THEN
+	    ROLLBACK;
+	    MESSAGE 'INGRES error in Select'
+		     WITH STYLE = POPUP;
+	    RETURN ;
+	 ENDIF;                
+	  
+	 RESUME;
+}
+
+'End', key frskey3 = 
+{
+       RETURN;
+}
+
+PROCEDURE v_fill_table()=
+{           
+	  INITTABLE advert_details READ;
+	   
+	  advert_details := SELECT branch_no = advert_branch,
+				   advert_type = advert_type, 
+				   company_no = company_no,
+				   cust_type = cust_type,
+				   cust_group = cust_group,
+				   start_date = start_date,
+				   end_date = end_date,
+				   ad_message = advert_message,
+				   advert_seq = advert_seq
+			      FROM advert_messages
+			  ORDER BY start_date ASC,
+				   end_date ASC,
+				   branch_no ASC,
+				   advert_seq ASC;
+				      
+	  INQUIRE_INGRES (IIerrorno = ERRORNO,
+			 hf_errtext = ERRORTEXT,
+			 IIrowcount = ROWCOUNT);
+		      
+	  IF IIerrorno !=0 THEN
+	     ROLLBACK;
+	     RETURN 1;
+	  ENDIF;
+	  
+	  COMMIT;
+	  
+	  set_forms field ''(mode(advert_details)='READ');
+		
+	  RETURN 0;
+};          
+ 

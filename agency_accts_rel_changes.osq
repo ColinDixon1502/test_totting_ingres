@@ -1,0 +1,1079 @@
+/*******************************************************************
+*  Procedure      - agency_accts_rel_changes.osq
+*  Author         - J Hunter 
+*
+*  Date           - 21-Aug-2014
+*
+*  Project        - GSK SAP
+*
+*  Purpose        - Creates reports (1 per agency_supplier)
+*                   highlighting changes in a trading account's 
+*                   hierarchy - i.e. associated head office,  
+*                   top link and delivery accounts. A trading 
+*                   account is one whose pricing group IS NOT 
+*                   9999. (For the time being, the T09 marker
+*                   is ignored - even if it's 1 the account is
+*                   treated as 'trading'.)
+*                   If no separate head office, top link or
+*                   delivery accounts exist then they will
+*                   be set to the trading account. 
+*                   Only hierarchies that have changed will 
+*                   be reported - the old and the new hierarchies
+*                   being displayed. A new trading account 
+*                   obviously won't have an old hierarchy.
+*                   If an account is deleted or becomes non-trading
+*                   then the old hierarchy is not displayed.
+*
+*  Description    - If a change has been made to a trading account's 
+*                   hierarchy (since yesterday) then include
+*                   then old and the new hieracrchy in the report.
+*
+*  Called From    - agency_accts_batch_email.osq
+*  Parameters IN  - agency_supplier, file_name, change count
+*  Parameters OUT - change count 
+*
+*********************************************************************
+* Ver | Date     |Coded| Description
+***** |**********|*****|*********************************************
+* 1.0 |21/08/2014| JNH | Original Version
+*-----|----------|-----|---------------------------------------------
+*********************************************************************/
+PROCEDURE agency_accts_rel_changes
+(
+    pv_agency_supplier     = INTEGER(4)     NOT NULL WITH DEFAULT;
+    pv_file_attach         = VARCHAR(250)   NOT NULL WITH DEFAULT;
+    pv_chg_cnt             = INTEGER(4)     NOT NULL WITH DEFAULT;        
+)=
+
+DECLARE
+/***********************************************************
+** INGRES ERROR HANDLING VARIABLES
+***********************************************************/
+
+    IIerrorno              = INTEGER       NOT NULL WITH DEFAULT,
+    IIrowcount             = INTEGER       NOT NULL WITH DEFAULT,
+    IIerrortext            = VARCHAR (256) NOT NULL WITH DEFAULT,
+
+/***********************************************************
+** PROCEDURE SPECIFIC VARIABLES
+***********************************************************/
+
+    IIchar                 = VARCHAR(32)   NOT NULL WITH DEFAULT,
+    IIint                  = INTEGER       NOT NULL WITH DEFAULT,
+
+    mv_debug               = CHAR(1)       NOT NULL WITH DEFAULT,
+    mv_count               = INTEGER(4)    NOT NULL WITH DEFAULT,
+    mv_cnt_amount          = INTEGER(4)    NOT NULL WITH DEFAULT,
+    mv_upd_cnt             = INTEGER(4)    NOT NULL WITH DEFAULT,
+    mv_new_cnt             = INTEGER(4)    NOT NULL WITH DEFAULT,
+    mv_curr_row            = INTEGER(4)    NOT NULL WITH DEFAULT,
+    mv_command_line        = VARCHAR(100)  NOT NULL WITH DEFAULT,
+    mv_system_cmd          = VARCHAR(1000) NOT NULL WITH DEFAULT,
+    mv_record_to_write     = VARCHAR(2000);
+
+    ma_accts_rel_curr      = ARRAY OF agency_accts_rel;
+    ma_accts_rel_tbl       = ARRAY OF TYPE OF TABLE sales_accts_relationship;
+    ma_accts_rel_last_tbl  = ARRAY OF TYPE OF TABLE sales_accts_relationship_last;
+
+
+/***********************************************************
+** LOCAL PROCEDURES
+***********************************************************/
+
+    lp_display_message     = PROCEDURE RETURNING NONE;
+    lp_create_sess_tbls    = PROCEDURE RETURNING INTEGER;
+    lp_process_data        = PROCEDURE RETURNING INTEGER;
+    lp_tidy_data           = PROCEDURE RETURNING INTEGER;
+    lp_get_last_acct_rel   = PROCEDURE RETURNING INTEGER;
+    lp_write_new_acct_rel  = PROCEDURE RETURNING INTEGER;
+    lp_write_upd_acct_rel  = PROCEDURE RETURNING INTEGER;
+    lp_create_hdr          = PROCEDURE RETURNING INTEGER4 NOT NULL;
+
+
+/***********************************************************
+** MAIN PROCEDURE - agency_accts_rel_changes
+***********************************************************/
+{
+    IIint = gc_success;
+
+    CALLPROC lp_display_message(lpv_message = 'agency_accts_rel_changes STARTED...');
+
+    mv_debug = gc_no;
+
+    mv_new_cnt = 0;
+    mv_upd_cnt = 0;
+
+    CALLPROC lp_display_message(lpv_message =
+                                'Processing Agency Accts Changed Relationships for Agency Supplier ID: '
+                                + VARCHAR(pv_agency_supplier));
+
+    /* Create the driver session tables ...*/
+    IF (lp_create_sess_tbls (lpv_count = BYREF(mv_count)) != gc_success)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Session Tables creation failed');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    /* Continue if rows to process...*/
+    IF (mv_count != 0)
+    THEN
+
+        /* Perform main processing...*/
+        IF (lp_process_data () != gc_success)  
+        THEN
+            CALLPROC lp_display_message(lpv_message = 'Failed in main processing');
+            IF (lp_tidy_data () != gc_success)
+            THEN
+                CALLPROC lp_display_message(lpv_message = 'Failed in tidy-up routine');
+                RETURN gc_fail;
+            ENDIF;
+            RETURN gc_fail;
+        ENDIF;
+
+        /* Tidy up...*/
+        IF (lp_tidy_data () != gc_success)
+        THEN
+            CALLPROC lp_display_message(lpv_message = 'Failed in tidy-up routine');
+            RETURN gc_fail;
+        ENDIF;
+    ENDIF;
+
+    pv_chg_cnt = pv_chg_cnt + mv_new_cnt + mv_upd_cnt;
+
+    CALLPROC lp_display_message(lpv_message = 'Total CHANGED or NEW relationship records for Agency Supplier : '
+                                             + VARCHAR(pv_agency_supplier) + ' is '
+                                             + VARCHAR(pv_chg_cnt));
+    CALLPROC lp_display_message(lpv_message = 'Process COMPLETED');
+
+    RETURN gc_success;
+}
+
+/***********************************************************
+* Procedure to display message
+***********************************************************/
+PROCEDURE lp_display_message
+(
+    lpv_message = VARCHAR(512) 
+)=
+DECLARE date_time = VARCHAR(20) NOT NULL,
+{
+
+    date_time = VARCHAR(DATE('now'));
+		lpv_message = date_time + ' - ' + IFNULL(lpv_message,'Null message');
+
+    CALL SYSTEM 'echo ' + '"' + VARCHAR(lpv_message) + '\n' + '"' +
+                ' >> /aahdb/logs/current/agency_accts_rel_changes.log';
+    RETURN;
+}
+
+/***********************************************************
+* Procedure to create and populate the session tables to   *
+* get the current hierarchy structure. This table has      * 
+* repeated rows for multiple delivery accounts.            *
+* If any of the delivery accounts have a UDI name with     *
+* the pattern '(MND)' in them, replace the delivery        *
+* account with the trading account.                        *
+* A second session table is then populated from this first *
+* table, concatenating multiple delivery accounts into a   *
+* single column.                                           * 
+************************************************************/
+PROCEDURE lp_create_sess_tbls 
+(
+    lpv_count = INTEGER(4) NOT NULL WITH DEFAULT,
+)=
+DECLARE lv_mnd_delivery_acct   = CHAR(13), 
+        lv_delivery_udi_name   = VARCHAR(32),
+        lv_curr_trading_acct   = CHAR(13) NOT NULL,
+        lv_curr_delivery_accts = VARCHAR(1300),
+        lv_update_column       = CHAR(1),
+        lv_update_head_office  = CHAR(13),
+        lv_update_top_link     = CHAR(13),
+        lv_update_delivery     = CHAR(13),
+        lv_table_count         = INTEGER1
+{
+    IIint = CALLPROC drop_session_table('SESSION.first_agency_accts_rel_curr');
+
+    /* Delete all items from the sales_accts_relationsip table */
+    lv_table_count = 1;
+
+    SELECT lv_table_count = count(*)
+    FROM   iitables
+    WHERE  table_type = 'T'
+    AND    table_name = 'sales_accts_relationship';
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        CALLPROC lp_display_message (lpv_message = '-15- INGRES error in checking if table sales_accts_relationship exists' + IIerrortext);
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 5');
+        RETURN gc_fail;
+    ENDIF;
+
+    IF lv_table_count > 0 THEN
+       IF (mv_debug = gc_yes)
+       THEN
+          CALLPROC lp_display_message(lpv_message =
+                   'Modifying sales_accts_relationship to truncated');
+       ENDIF;
+       MODIFY sales_accts_relationship to truncated;
+       MODIFY sales_accts_relationship to btree on
+              purchasing_branch_acct;
+    ELSE
+        CALLPROC lp_display_message (lpv_message = '-16- INGRES Table sales_accts_relationship DOES NOT EXIST');
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 10');
+        RETURN gc_fail;
+    ENDIF;
+  
+    COMMIT;
+
+    DECLARE GLOBAL TEMPORARY TABLE SESSION.first_agency_accts_rel_curr
+    AS
+
+    SELECT CONCAT(vda.delivery_acc_branch, vda.delivery_account) AS delivery_branch_acct,
+           CONCAT(sa3.trans_acc_branch, sa3.trans_acc_no) AS head_office_branch_acct,
+           sa3.addr_line1 AS purchasing_acct_name,
+           CONCAT(sa3.branch, sa3.account_no) AS purchasing_branch_acct,
+           sm.mkr_status AS t09_mkr_status,
+           CONCAT(al2.branch, al2.account_no) AS top_link_branch_acct
+     FROM sales_accts sa1
+     LEFT JOIN acctlinks al1
+     ON        sa1.branch = al1.branch
+     AND       sa1.account_no = al1.account_no
+     LEFT JOIN acctlinks al2
+     ON        al1.pay_code = al2.pay_code
+     AND       al2.purchase_code = '0000'
+     AND       al2.delivery_code = '00'
+     LEFT JOIN sales_accts sa2
+     ON        al2.branch = sa2.branch
+     AND       al2.account_no = sa2.account_no
+     LEFT JOIN van_system_deliv_accts vda
+     ON        vda.account_branch = sa1.branch
+     AND       vda.account_no = sa1.account_no
+     LEFT JOIN saccts_mkrs sm
+     ON        sm.branch = sa1.branch
+     AND       sm.account_no = sa1.account_no
+     AND       sm.mkr_code = 'T09'
+     JOIN      sales_accts sa3
+     ON        sa3.branch = sa1.branch
+     AND       sa3.account_no = sa1.account_no
+     AND       sa3.pricing_group != 9999
+     JOIN      agency_acct_branch_incl ab
+     ON        sa1.branch = ab.branch_id
+     AND       agency_supplier = :pv_agency_supplier 
+    ON COMMIT PRESERVE ROWS WITH NORECOVERY;
+
+    MODIFY SESSION.first_agency_accts_rel_curr to btree on purchasing_branch_acct, delivery_branch_acct;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+       
+        CALLPROC lp_display_message( lpv_message = '-20- INGRES error in DECLARE table ' + IIerrortext);
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 15');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    IF (mv_debug = gc_yes)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Driver tbl rowcount is ' + varchar(IIrowcount));
+    ENDIF;
+
+    /* Remove any Internal accounts from the driver table...*/
+    DELETE FROM SESSION.first_agency_accts_rel_curr a
+    WHERE EXISTS (SELECT 1 
+                  FROM internal_trans b
+                  WHERE a.purchasing_branch_acct = CONCAT(b.branch,b.account_no));
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        CALLPROC lp_display_message(lpv_message = '-25- INGRES error in deleting internal accounts from SESSION.first_agency_accts_rel_curr table ' + IIerrortext);
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 20');
+        ROLLBACK;
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    /* Can't use CASE statements when loading the table so do */
+    /* some tidy ups now */
+    /* If head_office_branch_acct is null, an empty string or */
+    /* if the account no is '99999999W, set head_office_branch_acct */
+    /* to purchasing_branch_acct */
+    /* If top_link_branch_acct is null or an empty string, set */
+    /* top_link_branch_acct to purchasing_branch_acct */
+    /* If delivery_branch_accts is null or an empty string, set */
+    /* delivery_branch_accts to purchasing_branch_acct */
+
+    IIint = CALLPROC ARRAYCLEAR(ma_accts_rel_curr);
+   
+    /* Load the array from the session table...*/
+    ma_accts_rel_curr = SELECT *
+                    FROM SESSION.first_agency_accts_rel_curr
+                    ORDER by purchasing_branch_acct,
+                             delivery_branch_acct;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        CALLPROC lp_display_message(lpv_message= '-26- INGRES error in load array (0) ' + IIerrortext);
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 25');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+   
+    UNLOADTABLE ma_accts_rel_curr (mv_curr_row = _RECORD)
+    {
+        lv_update_column = 'N';
+        lv_update_head_office = ma_accts_rel_curr[mv_curr_row].head_office_branch_acct;
+        lv_update_top_link = ma_accts_rel_curr[mv_curr_row].top_link_branch_acct;
+        lv_update_delivery = ma_accts_rel_curr[mv_curr_row].delivery_branch_acct;
+
+        IF ( (lv_update_head_office is NULL) OR
+             (lv_update_head_office = '') OR
+             (SHIFT(lv_update_head_office,-4) 
+                 = '99999999W') )
+        THEN
+           lv_update_head_office = ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct;
+           lv_update_column = 'Y';
+        ENDIF;
+
+        IF ( (lv_update_top_link is NULL) OR
+             (lv_update_top_link = '') )
+        THEN
+           lv_update_top_link = ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct;
+           lv_update_column = 'Y';
+        ENDIF;
+
+        IF ( (lv_update_delivery is NULL) OR
+             (lv_update_delivery = '') )
+        THEN
+           lv_update_delivery = ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct;
+           lv_update_column = 'Y';
+        ENDIF;
+
+        IF (lv_update_column = 'Y')
+        THEN
+           IF ( (ma_accts_rel_curr[mv_curr_row].delivery_branch_acct is NULL) OR
+                (ma_accts_rel_curr[mv_curr_row].delivery_branch_acct = '') )
+           THEN
+              UPDATE SESSION.first_agency_accts_rel_curr 
+              SET head_office_branch_acct     = :lv_update_head_office,
+                  top_link_branch_acct        = :lv_update_top_link,
+                  delivery_branch_acct        = :lv_update_delivery
+              WHERE purchasing_branch_acct    =
+                    :ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct
+           ELSE
+              UPDATE SESSION.first_agency_accts_rel_curr 
+              SET head_office_branch_acct     = :lv_update_head_office,
+                  top_link_branch_acct        = :lv_update_top_link,
+                  delivery_branch_acct        = :lv_update_delivery
+              WHERE purchasing_branch_acct    =
+                    :ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct
+              AND   delivery_branch_acct      =
+                    :ma_accts_rel_curr[mv_curr_row].delivery_branch_acct;
+           ENDIF;
+  
+           INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+           IF (IIerrorno != gc_success)
+           THEN
+                CALLPROC lp_display_message(lpv_message = 'Process FAILED 30');
+                RETURN gc_fail;
+           ENDIF;
+           
+           COMMIT;
+        ENDIF;
+    };
+                          
+    IIint = CALLPROC ARRAYCLEAR(ma_accts_rel_curr);
+   
+    /* Load the array from the session table...*/
+    ma_accts_rel_curr = SELECT *
+                    FROM SESSION.first_agency_accts_rel_curr
+                    ORDER by purchasing_branch_acct,
+                             delivery_branch_acct;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 35');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+   
+    /* Now see if any of the delivery accounts need replacing by the */
+    /* trading account because they contain the pattern '(MND)' in   */
+    /* their UDI name.                                               */ 
+    UNLOADTABLE ma_accts_rel_curr (mv_curr_row = _RECORD)
+    {
+       IF (ma_accts_rel_curr[mv_curr_row].delivery_branch_acct !=
+           ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct)
+       THEN
+          SELECT udi_name AS lv_delivery_udi_name 
+          FROM sales_accts
+          WHERE CONCAT(branch,account_no) =
+               :ma_accts_rel_curr[mv_curr_row].delivery_branch_acct;
+
+          INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+          IF (IIerrorno != gc_success)
+          THEN
+             CALLPROC lp_display_message(lpv_message = 'Process FAILED 40');
+             RETURN gc_fail;
+          ENDIF;
+ 
+          IF lv_delivery_udi_name LIKE '%(MND)%'
+          THEN
+             UPDATE SESSION.first_agency_accts_rel_curr 
+             SET delivery_branch_acct =
+                   :ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct
+             WHERE purchasing_branch_acct =
+                   :ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct
+             AND   delivery_branch_acct =
+                   :ma_accts_rel_curr[mv_curr_row].delivery_branch_acct;
+  
+             INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+             IF (IIerrorno != gc_success)
+             THEN
+                CALLPROC lp_display_message(lpv_message = 'Process FAILED 45');
+                RETURN gc_fail;
+             ENDIF;
+             COMMIT;
+          ENDIF;
+       ENDIF;
+    };
+
+    /* Clear the array and reload it ready for the next parse */
+    IIint = CALLPROC ARRAYCLEAR(ma_accts_rel_curr);
+   
+    /* Load the array from the session table...*/
+    ma_accts_rel_curr = SELECT *
+                    FROM SESSION.first_agency_accts_rel_curr
+                    ORDER BY purchasing_branch_acct, delivery_branch_acct;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 50');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    /* Now parse all the entries in the first_agency_accts_rel_curr  */
+    /* SESSION table and place multiple delivery accounts for a      */
+    /* trading account into one ';' separated list */
+    lv_curr_trading_acct =  '';
+    lv_curr_delivery_accts = '';
+    UNLOADTABLE ma_accts_rel_curr (mv_curr_row = _RECORD)
+    {
+       IF (mv_curr_row > 1)
+       THEN
+          IF (lv_curr_trading_acct != ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct)
+          THEN
+             IF (lv_curr_delivery_accts = '')
+             THEN
+                lv_curr_delivery_accts = ma_accts_rel_curr[mv_curr_row-1].delivery_branch_acct;
+             ELSE
+                lv_curr_delivery_accts = lv_curr_delivery_accts + ';' +
+                                         ma_accts_rel_curr[mv_curr_row-1].delivery_branch_acct;
+             ENDIF;
+           
+             /* Need to insert an entry into the sales_accts_relationship table */  
+             /* table for lv_curr_trading_acct (the previously processed */
+             /* trading account) */
+
+             INSERT INTO sales_accts_relationship  
+               VALUES (:ma_accts_rel_curr[mv_curr_row-1].head_office_branch_acct,
+                       :ma_accts_rel_curr[mv_curr_row-1].top_link_branch_acct, 
+                       :lv_curr_delivery_accts, 
+                       :lv_curr_trading_acct,
+                       :ma_accts_rel_curr[mv_curr_row-1].purchasing_acct_name, 
+                       :ma_accts_rel_curr[mv_curr_row-1].t09_mkr_status);
+             INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+             IF (IIerrorno != gc_success)
+             THEN
+                CALLPROC lp_display_message(lpv_message =  '-50- INGRES error in inserting into SESSION.sec_agency_accts_rel_curr table ' + IIerrortext);
+                CALLPROC lp_display_message(lpv_message = 'Process FAILED 55');
+                ROLLBACK;  /* No need really - it's a session table */
+                RETURN gc_fail;
+             ENDIF;
+
+             lv_curr_trading_acct = ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct;
+             lv_curr_delivery_accts = '';
+          ELSE
+             IF (lv_curr_delivery_accts = '')
+             THEN
+                lv_curr_delivery_accts = ma_accts_rel_curr[mv_curr_row-1].delivery_branch_acct;
+             ELSE
+                lv_curr_delivery_accts = lv_curr_delivery_accts + ';' +
+                                   ma_accts_rel_curr[mv_curr_row-1].delivery_branch_acct;
+             ENDIF;
+          ENDIF; 
+       ELSE  
+          lv_curr_trading_acct = ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct;
+       ENDIF;
+    };
+          
+    IF (lv_curr_delivery_accts = '')
+    THEN
+       lv_curr_delivery_accts = ma_accts_rel_curr[mv_curr_row].delivery_branch_acct;
+    ELSE
+       lv_curr_delivery_accts = lv_curr_delivery_accts + ';' +
+                                ma_accts_rel_curr[mv_curr_row].delivery_branch_acct;
+    ENDIF;
+
+    /* Now need to process the last iteration in the UNLOADTABLE loop */
+    INSERT INTO sales_accts_relationship 
+       VALUES (:ma_accts_rel_curr[mv_curr_row].head_office_branch_acct,
+               :ma_accts_rel_curr[mv_curr_row].top_link_branch_acct, 
+               :lv_curr_delivery_accts, 
+               :ma_accts_rel_curr[mv_curr_row].purchasing_branch_acct, 
+               :ma_accts_rel_curr[mv_curr_row].purchasing_acct_name, 
+               :ma_accts_rel_curr[mv_curr_row].t09_mkr_status);
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+       CALLPROC lp_display_message(lpv_message = '-55- INGRES error in inserting last record into SESSION.sec_agency_accts_rel_curr table ' + IIerrortext);
+       CALLPROC lp_display_message(lpv_message = 'Process FAILED 60');
+       ROLLBACK;  /* No need really - it's a session table */
+       RETURN gc_fail;
+    ENDIF;
+
+    SELECT COUNT(*) AS lpv_count
+    FROM sales_accts_relationship;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 65');
+        RETURN gc_fail;
+    ENDIF;
+
+    IF (mv_debug = gc_yes)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Driver tbl Final count is ' + varchar(lpv_count));
+        mv_cnt_amount = (lpv_count / 8); 
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to perform main processing
+* First process new account relationships
+* Then process updated account relationships
+*******************************************************/
+PROCEDURE lp_process_data (
+)=
+DECLARE lv_counter     = INTEGER(4)  NOT NULL WITH DEFAULT,
+        lv_retcode     = INTEGER(4)
+{
+    IIint = CALLPROC ARRAYCLEAR(ma_accts_rel_tbl);
+
+    /* Load the array from the driver table...*/
+    ma_accts_rel_tbl = SELECT *
+                    FROM sales_accts_relationship
+                    ORDER BY purchasing_branch_acct;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 70');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    /* Process array ... just looking for new account hierarchies */
+    UNLOADTABLE ma_accts_rel_tbl  (mv_curr_row = _RECORD)
+    {
+       /* Load related row from LAST table...*/
+       IF (lp_get_last_acct_rel () != gc_success)
+       THEN
+           CALLPROC lp_display_message(lpv_message = 'Extracting last account relationship for ' + 
+               ma_accts_rel_tbl[mv_curr_row].purchasing_branch_acct +
+               ' failed ');
+           RETURN gc_fail;
+       ENDIF;
+
+       /* Only looking for new accounts on this first pass */
+       IF (IIrowcount = 0)
+       THEN
+          /* Write new account's hierarchy to the file...*/
+          IF (lp_write_new_acct_rel () != gc_success)
+          THEN
+             CALLPROC lp_display_message(lpv_message = 'Write records failed');
+             RETURN gc_fail;
+          ENDIF;
+          mv_new_cnt = mv_new_cnt + 1;
+
+          IF (mv_debug = gc_yes)
+          THEN
+             IF (lv_counter = mv_cnt_amount)
+             THEN
+                CALLPROC lp_display_message(lpv_message = 'No of records processed so far: ' + 
+                         VARCHAR(lv_counter));
+                lv_counter = 0;
+             ENDIF;
+          ENDIF;
+       ENDIF;
+    };
+
+    lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, '', 'N', 'Y');
+    IF (lv_retcode != gc_success)
+    THEN
+       RETURN(lv_retcode);
+    ENDIF;
+
+    IF (mv_new_cnt = 0)
+    THEN
+       /* Need to write new header to the file */
+       mv_system_cmd  = 'echo ' + ' ' + '"' + 'New Account Relationships' + '"'
+                  + ' >> ' + pv_file_attach;
+       CALL SYSTEM :mv_system_cmd;
+
+       mv_system_cmd = 'echo ' + ' ' + '"' + '' + '"' +  ' >> ' + pv_file_attach;
+       CALL SYSTEM mv_system_cmd;
+
+       mv_system_cmd = 'echo ' + ' ' + '"' + '' + '"' +  ' >> ' + pv_file_attach;
+       CALL SYSTEM mv_system_cmd;
+    ENDIF;
+
+    IF (mv_new_cnt > 0)
+    THEN
+       /* Want two blank lines in the file */
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, '', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, '', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+    ENDIF;
+
+    /* Now look for updated hierarchies */
+    IIint = CALLPROC ARRAYCLEAR(ma_accts_rel_tbl);
+
+    /* Load the array from the driver table...*/
+    ma_accts_rel_tbl = SELECT *
+                    FROM sales_accts_relationship;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 75');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    /* Process array ... looking for changed account hierarchies */
+    UNLOADTABLE ma_accts_rel_tbl (mv_curr_row = _RECORD)
+    {
+       /* Load related row from LAST table...*/
+       IF (lp_get_last_acct_rel () != gc_success)
+       THEN
+           CALLPROC lp_display_message(lpv_message = 'Extracting last account relationship for ' + 
+               ma_accts_rel_tbl[mv_curr_row].purchasing_branch_acct +
+               ' failed ');
+           RETURN gc_fail;
+       ENDIF;
+
+       /* Only looking for existing accounts now */
+       IF (IIrowcount > 0)
+       THEN
+          /* Ignore name changes */
+          IF (   (ma_accts_rel_tbl[mv_curr_row].top_link_branch_acct !=  
+                  ma_accts_rel_last_tbl[1].top_link_branch_acct)
+              OR (ma_accts_rel_tbl[mv_curr_row].head_office_branch_acct != 
+                  ma_accts_rel_last_tbl[1].head_office_branch_acct)
+              OR (ma_accts_rel_tbl[mv_curr_row].delivery_branch_accts !=  
+                  ma_accts_rel_last_tbl[1].delivery_branch_accts)  )
+          THEN
+             /* Write old and new account's hierarchy to the file...*/
+             IF (lp_write_upd_acct_rel () != gc_success)
+             THEN
+                CALLPROC lp_display_message(lpv_message = 'Write records failed 2');
+                RETURN gc_fail;
+             ENDIF;
+             mv_upd_cnt = mv_upd_cnt + 1;
+
+             IF (mv_debug = gc_yes)
+             THEN
+                IF (lv_counter = mv_cnt_amount)
+                THEN
+                   CALLPROC lp_display_message(lpv_message = 'No of records processed so far: ' + 
+                            VARCHAR(lv_counter));
+                   lv_counter = 0;
+                ENDIF;
+             ENDIF;
+          ENDIF;
+       ENDIF;
+    };
+       
+    IF (mv_upd_cnt = 0)
+    THEN
+       /* Need to write changed header to the file */
+       mv_system_cmd  = 'echo ' + ' ' + '"' + 'Changed Account Relationships' + '"'
+                  + ' >> ' + pv_file_attach;
+       CALL SYSTEM :mv_system_cmd;
+       IF (mv_new_cnt > 0)
+       THEN
+          mv_system_cmd = 'echo ' + ' ' + '"' + '' + '"' +  ' >> ' + pv_file_attach;
+          CALL SYSTEM mv_system_cmd;
+
+          mv_system_cmd = 'echo ' + ' ' + '"' + '' + '"' +  ' >> ' + pv_file_attach;
+          CALL SYSTEM mv_system_cmd;
+       ENDIF;
+    ENDIF;
+
+    CALLPROC lp_display_message(lpv_message = 'Write footnote');
+    IF ((mv_new_cnt + mv_upd_cnt) > 0)
+    THEN
+       /* Two blank lines */
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, '', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, '', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+
+       /* Write the footnote (Key) to the file */
+
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, 'Key', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+
+       /* Blank line */
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, '', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, 'GSK Term,AAH Term', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, 'Sold To Account,Purchasing Account', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+ 
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, 'Payer Account,Top-Link Account', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, 'Bill To Account,Head Office Account', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, 'Ship To Account(s),Delivery Location Account(s)', 'N', 'N');
+       IF (lv_retcode != gc_success)
+       THEN
+          RETURN(lv_retcode);
+       ENDIF;
+    ENDIF;
+    COMMIT;
+
+    RETURN gc_success;
+}
+
+/*************************************************************
+* Procedure to get LAST account hierarchy for the given
+* branch and account (current entry in ma_accts_rel_tbl  
+**************************************************************/
+PROCEDURE lp_get_last_acct_rel ()=
+{
+    IIint = CALLPROC ARRAYCLEAR(ma_accts_rel_last_tbl);
+
+    ma_accts_rel_last_tbl = 
+        SELECT head_office_branch_acct,
+               top_link_branch_acct,
+               delivery_branch_accts,
+               purchasing_branch_acct,
+               purchasing_acct_name
+        FROM sales_accts_relationship_last
+        WHERE purchasing_branch_acct = :ma_accts_rel_tbl[mv_curr_row].purchasing_branch_acct;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED 80');
+        RETURN gc_fail;
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to write new account hierarchy to the file
+*******************************************************/
+PROCEDURE lp_write_new_acct_rel (
+)=
+DECLARE lv_retcode     = INTEGER4 NOT NULL WITH DEFAULT, 
+        lv_acct_name   = VARCHAR(32),
+        lv_temp_string = VARCHAR(32),
+        lv_char_pos    = INTEGER1;
+{
+   lv_retcode      = gc_success;
+
+   IF (mv_new_cnt = 0)
+   THEN
+      lv_retcode = lp_create_hdr (lpv_header_type = 'N');
+      IF (lv_retcode != gc_success)
+      THEN
+         CALLPROC lp_create_error_file();
+         RETURN gc_fail;
+      ENDIF;
+   ENDIF;
+    
+   /* Replace commas with spaces in the account name field */
+   lv_acct_name = ma_accts_rel_tbl[mv_curr_row].purchasing_acct_name;
+
+   lv_char_pos = locate(lv_acct_name,',');
+   WHILE (lv_char_pos) <= size(lv_acct_name)
+   DO 
+        lv_temp_string = left(lv_acct_name,lv_char_pos-1) + ' ' +
+                             shift(lv_acct_name,-lv_char_pos);
+        lv_acct_name   = lv_temp_string;
+        lv_char_pos    = locate(lv_acct_name,',');
+   ENDWHILE;
+ 
+   ma_accts_rel_tbl[mv_curr_row].purchasing_acct_name = ifnull(lv_acct_name,'');
+   mv_record_to_write = 'New,' + 
+            ma_accts_rel_tbl[mv_curr_row].purchasing_branch_acct + ',' + 
+            TRIM(ma_accts_rel_tbl[mv_curr_row].purchasing_acct_name) + ',' +
+            ma_accts_rel_tbl[mv_curr_row].top_link_branch_acct + ',' + 
+            ma_accts_rel_tbl[mv_curr_row].head_office_branch_acct + ',' +
+            SQUEEZE(ma_accts_rel_tbl[mv_curr_row].delivery_branch_accts); 
+
+   lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, mv_record_to_write, 'N', 'N');
+   IF (lv_retcode != gc_success)
+   THEN
+      RETURN(lv_retcode);
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+/**********************************************************
+* Procedure to write changed account hierarchy to the file
+**********************************************************/
+PROCEDURE lp_write_upd_acct_rel (
+)=
+DECLARE lv_retcode            = INTEGER4 NOT NULL WITH DEFAULT, 
+        lv_acct_name          = VARCHAR(32),
+        lv_temp_string        = VARCHAR(32),
+        lv_the_head_office    = VARCHAR(15),
+        lv_the_top_link       = VARCHAR(15),
+        lv_the_delivery_accts = VARCHAR(1302),
+        lv_char_pos           = INTEGER1;
+{
+   lv_retcode = gc_success;
+
+   IF (mv_upd_cnt = 0)
+   THEN
+      lv_retcode = lp_create_hdr (lpv_header_type = 'U');
+      IF (lv_retcode != gc_success)
+      THEN
+         CALLPROC lp_create_error_file();
+         RETURN gc_fail;
+      ENDIF;
+   ENDIF;
+
+   /* Replace commas with spaces in the account name field */
+   lv_acct_name = ma_accts_rel_last_tbl[1].purchasing_acct_name;
+
+   lv_char_pos = locate(lv_acct_name,',');
+   WHILE (lv_char_pos) <= size(lv_acct_name)
+   DO 
+        lv_temp_string = left(lv_acct_name,lv_char_pos-1) + ' ' +
+                            shift(lv_acct_name,-lv_char_pos);
+        lv_acct_name   = lv_temp_string;
+        lv_char_pos    = locate(lv_acct_name,',');
+   ENDWHILE;
+ 
+   ma_accts_rel_last_tbl[1].purchasing_acct_name = ifnull(lv_acct_name,'');
+
+   /* Always use the new name, in case it's changed */
+   /* cast to VARCHAR below otherwise SQUEEZE won't work */ 
+   mv_record_to_write = 'Before,' + 
+           VARCHAR (ma_accts_rel_last_tbl[1].purchasing_branch_acct) + ',' + 
+           VARCHAR (SQUEEZE(ma_accts_rel_tbl[mv_curr_row].purchasing_acct_name)) + ',' +
+           VARCHAR (ma_accts_rel_last_tbl[1].top_link_branch_acct) + ',' + 
+           VARCHAR (ma_accts_rel_last_tbl[1].head_office_branch_acct) + ',' +
+           SQUEEZE(ma_accts_rel_last_tbl[1].delivery_branch_accts); 
+
+   /* Already opened the file when the New account hierarchies */
+   /* were written */
+   lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, mv_record_to_write, 'N', 'N');
+
+   IF (lv_retcode != gc_success)
+   THEN
+      RETURN(lv_retcode);
+   ENDIF;
+
+   /* Replace commas with spaces in the account name field */
+   lv_acct_name = ma_accts_rel_tbl[mv_curr_row].purchasing_acct_name;
+
+   lv_char_pos = locate(lv_acct_name,',');
+   WHILE (lv_char_pos) <= size(lv_acct_name)
+   DO 
+        lv_temp_string = left(lv_acct_name,lv_char_pos-1) + ' ' +
+                            shift(lv_acct_name,-lv_char_pos);
+        lv_acct_name   = lv_temp_string;
+        lv_char_pos    = locate(lv_acct_name,',');
+   ENDWHILE;
+ 
+   ma_accts_rel_tbl[mv_curr_row].purchasing_acct_name = ifnull(lv_acct_name,'');
+
+   /* Have to put asterisks in front of changed fields */
+   /* Never check names - if only name has changed there is no */
+   /* hierarchy entry, and if name and account relationship has */
+   /* changed, before and after name fields are set to the new name */
+
+   IF (ma_accts_rel_tbl[mv_curr_row].top_link_branch_acct !=
+               ma_accts_rel_last_tbl[1].top_link_branch_acct)
+   THEN
+      lv_the_top_link = '**' + ma_accts_rel_tbl[mv_curr_row].top_link_branch_acct;
+   ELSE
+      lv_the_top_link = ma_accts_rel_tbl[mv_curr_row].top_link_branch_acct;
+   ENDIF;
+
+   IF (ma_accts_rel_tbl[mv_curr_row].head_office_branch_acct !=
+               ma_accts_rel_last_tbl[1].head_office_branch_acct)
+   THEN
+      lv_the_head_office = '**' + ma_accts_rel_tbl[mv_curr_row].head_office_branch_acct;
+   ELSE
+      lv_the_head_office = ma_accts_rel_tbl[mv_curr_row].head_office_branch_acct;
+   ENDIF;
+
+   IF (ma_accts_rel_tbl[mv_curr_row].delivery_branch_accts !=
+               ma_accts_rel_last_tbl[1].delivery_branch_accts)
+   THEN
+      lv_the_delivery_accts = '**' + ma_accts_rel_tbl[mv_curr_row].delivery_branch_accts;
+   ELSE
+      lv_the_delivery_accts = ma_accts_rel_tbl[mv_curr_row].delivery_branch_accts;
+   ENDIF;
+       
+   /* Don't ask why but without the VARCHAR cast below (even though the  */
+   /* variables are VARCHAR) the squeeze doesn't get rid of the trailing */
+   /* spaces.                                                            */
+   
+   mv_record_to_write = 'After,' + 
+            VARCHAR (ma_accts_rel_tbl[mv_curr_row].purchasing_branch_acct) + ',' + 
+            VARCHAR (SQUEEZE(ma_accts_rel_tbl[mv_curr_row].purchasing_acct_name)) + ',' +
+            VARCHAR (SQUEEZE(lv_the_top_link)) + ',' + 
+            VARCHAR (SQUEEZE(lv_the_head_office)) + ',' +
+            VARCHAR (SQUEEZE(lv_the_delivery_accts)); 
+
+   lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, mv_record_to_write, 'N', 'N');
+
+   IF (lv_retcode != gc_success)
+   THEN
+      RETURN(lv_retcode);
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to tidy-up the data
+*******************************************************/
+PROCEDURE lp_tidy_data ()=
+{
+    /*  Main tidy moved to calling process so it can be re-run */
+    IIint = CALLPROC drop_session_table('SESSION.first_agency_accts_rel_curr');
+
+    COMMIT;
+
+    RETURN gc_success;
+}
+
+/*****************************************************************/
+/** Procedure to write comma separated header for account       **/
+/** hierarchies.                                                **/
+/** Input param = 'N' for 'New'; 'U' for 'Update'               **/ 
+/*****************************************************************/
+PROCEDURE lp_create_hdr(
+    lpv_header_type = CHAR(1) 
+) =
+DECLARE 
+    lv_retcode      = INTEGER4 NOT NULL WITH DEFAULT; 
+{
+    lv_retcode      = gc_success;
+
+    IF (lpv_header_type = 'N')
+    THEN
+       lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, 'New Account Relationships', 'Y', 'N');
+    ELSE
+       IF (mv_new_cnt = 0)
+       THEN
+          /* Need to open file */
+          lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, 'Changed Account Relationships', 'Y', 'N');
+       ELSE
+          /* File already open */
+          lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, 'Changed Account Relationships', 'N', 'N');
+       ENDIF;
+    ENDIF;
+
+    IF (lv_retcode != gc_success)
+    THEN
+       RETURN(lv_retcode);
+    ENDIF;
+
+    lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, '', 'N', 'N');
+    IF (lv_retcode != gc_success)
+    THEN
+       RETURN(lv_retcode);
+    ENDIF;
+
+    lv_retcode = CALLPROC sales_accts_rel_write (pv_file_attach, 'Status,Sold To Account,Name,Payer Account,Bill To Account,Ship To Account(s)', 'N', 'N');
+    IF (lv_retcode != gc_success)
+    THEN
+       RETURN(lv_retcode);
+    ENDIF;
+
+    RETURN(lv_retcode);
+}
+

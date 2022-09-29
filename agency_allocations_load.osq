@@ -1,0 +1,4415 @@
+/****************************************************************************/
+/*  Procedure     - agency_allocations_load                                 */
+/*                                                                          */
+/*  Author        - I.Salim                                                 */
+/*                                                                          */
+/*  Date          - 08.08.17                                                */
+/*                                                                          */
+/*  Type          - Batch Procedure                                         */
+/*                                                                          */
+/*  Source        - agency_allocations_load.osq                             */
+/*                                                                          */
+/*  Details       - Update following values in table product-quotas from    */
+/*                  data loaded into agency_allocations table by MASAI.     */
+/*                  - product_quotas.day_quota (daily allocation)           */
+/*                  - product_quotas.month_quota (monthly allocation)       */
+/*                  The agency no will be passed in from calling shell      */
+/*                  script.                                                 */
+/*                  Agency ID, Agency Group and EAN code to be validated    */
+/*                  prior to updating Ingres tables.                        */
+/*                  Handle processing of multiple files. A separate email   */
+/*                  to be generated for each file with filename in subject  */
+/*                  line.                                                   */
+/*                                                                          */
+/*  Called From   - agency_allocations_load.ksh                             */
+/*                                                                          */
+/*  Parameters IN - Agency Supplier                                         */
+/*                                                                          */
+/*  Useful        - Rejected codes for data processed by Ingres:            */
+/*                  '40' Agency ID                         - Invalid        */
+/*                  '41' EAN Code Validation 1             - Invalid        */
+/*                  '42' EAN Code Validation 2             - Invalid        */
+/*                  '43' Duplicate Allocations             - Invalid        */
+/*                  '44' Non-trading account               - Invalid        */
+/*                  '45' Duplicate Agency ID (Brn Trn)     - Invalid        */
+/*                  '46' Duplicate Agency ID (Non Brn Trn) - Invalid        */
+/*                                                                          */
+/*                - Rejected codes for data processed by MASAI:             */
+/*                  '1'  Empty File                                         */
+/*                  '2'  File corrupt            - Invalid Footer           */
+/*                  '?'  ID Flag                 - Invalid                  */
+/*                  '?'  Agency_ID               - Invalid                  */
+/*                  '17' Agency_Group            - Invalid                  */
+/*                  '?'  EAN Code                - Invalid                  */
+/*                  '?'  Day Quota               - Invalid                  */
+/*                  '?'  Month Quota             - Invalid                  */
+/*                  '?'  Deletion Mkr            - Invalid                  */
+/*                                                                          */
+/*                - Logfile: agency_allocations_load_xxxxx.tmp              */
+/*                  (xxxxx = agency supplier name)                          */
+/*                                                                          */
+/****************************************************************************/
+/*  Version | Date     | Coded | Description of changes made                */
+/***********|**********|*******|*********************************************/
+/*  1.0     | 08.08.17 | ISS   | Original code                              */
+/***********|**********|*******|*********************************************/
+/*  2.0     | 04.12.17 | ISS   | Re-write of code due to performance issues.*/
+/*          |          |       | Change from line level processing to bulk  */
+/*          |          |       | update/insert of SQL statements.           */
+/***********|**********|*******|*********************************************/
+/*  2.1     | 01.02.19 | ISS   | Change logic for identifying duplicates.   */
+/*          |          |       | When processing a quota file with a large  */
+/*          |          |       | number of group-level allocations, most of */
+/*          |          |       | the records are being falsely rejected as  */
+/*          |          |       | "duplicates"                               */
+/*          |          |       | For acct-level quotas brnacc and ean_code  */
+/*          |          |       | fields guarantee uniqueness, however for   */
+/*          |          |       | managed group-level quotas the brnacc      */
+/*          |          |       | field is always set to "001B77777777W"     */
+/*          |          |       | To fix this we will include the group id   */
+/*          |          |       | when running the duplicate check.          */
+/*          |          |       | The agency_cust_grp_id field will be set   */
+/*          |          |       | for both customer-level and group-level    */
+/*          |          |       | allocations and should provide uniqueness  */
+/*          |          |       | when checking group-level allocations.     */
+/***********|**********|*******|*********************************************/
+/*  2.2     | 15.02.19 | ISS   | Incident # 1073916. Change # 37516.        */
+/*          |          |       | 1.Fixed issue with mixed allocation file.  */
+/*          |          |       | When file has both customer and managed    */
+/*          |          |       | allocations, only customer allocations are */
+/*          |          |       | being processed. If file has either        */
+/*          |          |       | customer or managed allocations then file  */
+/*          |          |       | is processed correctly.                    */
+/*          |          |       | 2.There are a number of accounts that have */
+/*          |          |       | moved branch and therefore we have multiple*/
+/*          |          |       | records of a unique account against a      */
+/*          |          |       | non-unique branch for the same agency id.  */
+/*          |          |       | (The agency id is how Sanofi recognise AAH */
+/*          |          |       | accounts) Currently when processing an     */
+/*          |          |       | allocation with one of these agency id's   */
+/*          |          |       | the Ingres process rejects the allocation  */
+/*          |          |       | as invalid as it expects the agency id to  */
+/*          |          |       | be unique. A fix has been applied to       */
+/*          |          |       | distinguish between those non-unique agency*/
+/*          |          |       | id allocations where all matches are       */
+/*          |          |       | against non trading accounts and those     */
+/*          |          |       | where a max of one account is trading.     */
+/*          |          |       | In this case we would reject the former    */
+/*          |          |       | and process the latter.                    */
+/***********|**********|*******|*********************************************/
+/*  2.3     | 06.09.19 | ISS   | Incident # 1221791 Change # 42424.         */
+/*          |          |       | 1.Removed restriction of pricing group     */
+/*          |          |       | having to be zero in order to process      */
+/*          |          |       | allocation. This restriction was added in  */
+/*          |          |       | error as part of Change # 37516.           */
+/*          |          |       | ------------------------------------------ */
+/*          |          |       | 2. Due to saccts_supplier_acctno (ssa)     */
+/*          |          |       | having non unique agency id this table can */            
+/*          |          |       | no longer be relied on to update agency    */
+/*          |          |       | allocations table, therefore an extract of */
+/*          |          |       | ssa table based on agency id in input file */
+/*          |          |       | will be created (sess7) to include pricing */
+/*          |          |       | group. Another temp table (sess3) will     */
+/*          |          |       | contain all non-unique agency id's from    */
+/*          |          |       | temp table sess7. Any agency id from sess3 */
+/*          |          |       | that does not have max of 1 account with   */
+/*          |          |       | pricing group 0 will be rejected and       */
+/*          |          |       | inserted into reject table and deleted     */
+/*          |          |       | from agency allocations table.             */
+/*          |          |       | Any account against the remaining agency   */
+/*          |          |       | id will have both a 9999 and 0 pricing     */
+/*          |          |       | group. In this case delete from sess7 acc  */
+/*          |          |       | with pricing group 9999 to leave only the  */
+/*          |          |       | active account. All agency id's in sess7   */
+/*          |          |       | will now be unique so can be used to update*/
+/*          |          |       | agency allocations table.                  */
+/*          |          |       | ------------------------------------------ */
+/*          |          |       | 3. Agency allocations validation is now run*/
+/*          |          |       | before agency allocations rejects one. Do  */
+/*          |          |       | not reset lv_alloc_cnt value to 0 before   */
+/*          |          |       | agency allocations rejects validation.     */
+/***********|**********|*******|*********************************************/
+/*  2.4     | 29.06.20 | ISS   | SR # 1396157 Change # C52900               */
+/*          |          |       | 1.Reject non-trading accounts using reject */
+/*          |          |       | code 44. Non-trading account is defined as */
+/*          |          |       | account where pricing group=9999 and dfd   */
+/*          |          |       | marker set to 'Y'.                         */
+/*          |          |       | ------------------------------------------ */
+/*          |          |       | 2.Changed SQL in lp_refresh_quotas_c so    */
+/*          |          |       | delete/insert is done one branch at a time */
+/*          |          |       | ------------------------------------------ */
+/*          |          |       | 3.Only run rejection report if Masai marks */
+/*          |          |       | file with reject code 1 or 2.              */
+/***********|**********|*******|*********************************************/
+/*  2.5     | 11.08.20 | ISS   | Incident # 1607940 Change # C54290         */
+/*          |          |       | Transaction log file error occuring when   */
+/*          |          |       | job runs due to commit being required when */
+/*          |          |       | records are being deleted one branch at a  */
+/*          |          |       | time so added the commit                   */
+/*          |          |       | In case of error recovery of data is via a */
+/*          |          |       | backup table.                              */
+/***********|**********|*******|*********************************************/
+/*  2.6     | 16.10.20 | ISS   | Incident # 1672964 Change # C56538         */
+/*          |          |       | 1.Table _cs_agency_sessiontab5 now copied  */
+/*          |          |       | out to /aahdb/archive/daily/current dir    */
+/*          |          |       | as agency_product_quotas_bak.yyyymmdd.     */
+/*          |          |       | 2.Commit once before changes are made to   */
+/*          |          |       | allocation/rejects table and second time   */
+/*          |          |       | at the end.                                */
+/*          |          |       | 3.Add join to branch and account during    */
+/*          |          |       | loop delete of type A quotas so amount of  */
+/*          |          |       | data deleted/added is significantly less.  */
+/***********|**********|*******|*********************************************/
+/*  2.7     | 01.09.21 | ISS   | Incident # 1977604 Change # C66812         */
+/*          |          |       | 1.Masai rejected data in agency group field*/
+/*          |          |       | and moved it to agency allocations rejects */
+/*          |          |       | table. An insert into a working table      */
+/*          |          |       | caused SQL error as non-integer was being  */
+/*          |          |       | inserted into integer2 field.              */
+/*          |          |       | Fix is to update custgroup from temp sales */
+/*          |          |       | accts table and not interchange custgroup  */
+/*          |          |       | field with agency group.                   */
+/*          |          |       | 2.Rejected lines no longer to be included  */
+/*          |          |       | in body of email as volume of rejections is*/
+/*          |          |       | too high. Instead the following logic will */
+/*          |          |       | be applied:                                */
+/*          |          |       | Cap will be set in applications_parameters */
+/*          |          |       | table where parameter_id='ALLOC_CAP'       */
+/*          |          |       | In all cases the body of the email will    */
+/*          |          |       | include a summary of the counts.           */
+/*          |          |       | a)If number of rejections is less than the */
+/*          |          |       | cap then all valid allocations will be     */
+/*          |          |       | processed and those that fail validation   */
+/*          |          |       | will be rejected and included in a reject  */
+/*          |          |       | report along with reject reasons.          */
+/*          |          |       | b)If number of rejections exceeds the cap  */
+/*          |          |       | then no allocations will be processed and  */
+/*          |          |       | no rejection report will be generated.     */
+/*          |          |       | c)If there are no rejections then no       */
+/*          |          |       | report will be generated.                  */
+/***********|**********|*******|*********************************************/
+/*  2.8     | 02.12.21 | ISS   | Incident # 2194318  Change # C68228        */
+/*          |          |       | 1.Run rejection report whether cap has     */
+/*          |          |       | been exceeded or not.                      */
+/*          |          |       | 2.Provide breakdown of rejections in log   */
+/*          |          |       | and email notification.                    */
+/*          |          |       | 3.Any Agency ID with multiple AAH accounts */
+/*          |          |       | (not brn trn) are being rejected as error  */
+/*          |          |       | code 45 even if one account is active.     */
+/*          |          |       | Fixed issue so active AAH account is used  */
+/*          |          |       | to update the allocation. Any agency id's  */
+/*          |          |       | that do not have an active account will be */
+/*          |          |       | rejected using error code 46.              */
+/*          |          |       | 4.Increase cap to 250K.                    */
+/***********|**********|*******|*********************************************/
+/*  2.9     | 20.01.21 | ISS   | Incident # 2195311  Change # C68900        */
+/*          |          |       | Fix issue of quota being inserted twice    */
+/*          |          |       | with 2 different custtype_no's into        */
+/*          |          |       | product_quotas table.                      */
+/***********|**********|*******|*********************************************/
+/*  3.0     | 05.04.22 | ISS   | Incident # 2270298  Change # C70667        */
+/*          |          |       | Fix issue of managed quotas being inserted */
+/*          |          |       | instead of overwriting existing active one */
+/***********|**********|*******|*********************************************/
+/*  3.1     | 20.07.22 | ISS   | Incident # 2399821  Change # C72725        */
+/*          |          |       | Handle invalid Agency group managed quotas */
+/*          |          |       | to prevent catastrophic error causing      */
+/*          |          |       | failure of job.                            */
+/***********|**********|*******|*********************************************/
+
+PROCEDURE agency_allocations_load(
+   pv_agency_supplier       = INTEGER(4)  NOT NULL WITH DEFAULT;
+   pv_filename              = VARCHAR(64) NOT NULL;   
+)= 
+DECLARE
+
+/******************************************************/
+/* INGRES ERROR HANDLING VARIABLES                    */
+/******************************************************/
+   IIint                    = INTEGER(4)   NOT NULL,
+   IIrowcount               = INTEGER(4)   NOT NULL,
+   IIerrorno                = INTEGER(4)   NOT NULL,
+   IIerrtext                = CHAR(256)    NOT NULL,
+  
+   lv_param_list            = VARCHAR(500) NOT NULL,
+   lv_report_name           = VARCHAR(76)  NOT NULL,
+   lv_reject_reason         = CHAR(64)     NOT NULL,
+   lv_reject_code           = INTEGER(2)   NOT NULL,
+   lv_reject_file_flag      = INTEGER(2)   NOT NULL,
+   array_rows               = INTEGER(4)   NOT NULL,   
+   lv_errno                 = INTEGER(4)   NOT NULL,
+   temp_tabowner            = VARCHAR(32)  NOT NULL,
+   logfile                  = VARCHAR(50),
+   outfile                  = VARCHAR(64)  NOT NULL,
+   attachfile               = VARCHAR(76)  NOT NULL,
+   logmess                  = VARCHAR(256), 
+   
+   lv_row_no                = INTEGER(4)   NOT NULL,   
+   lv_row_no_char           = CHAR(6),
+   
+   lv_brnacc                = CHAR(13)     NOT NULL,
+   lv_agency_id             = CHAR(20),
+   lv_agency_group          = INTEGER(2),
+   lv_agency_group_char     = CHAR(3),
+   lv_line_no               = INTEGER(4),
+   lv_line_no_char          = CHAR(6),
+   ret_code                 = INTEGER(4)   NOT NULL,
+   lv_agency_name           = VARCHAR(32)  NOT NULL,
+   lv_ean_code              = CHAR(14)     NOT NULL, 
+   lv_product_code          = CHAR(8)      NOT NULL, 
+   lv_ean_exists_1          = CHAR(1)      NOT NULL, 
+   lv_ean_exists_2          = CHAR(1)      NOT NULL, 
+   lv_id_flag               = CHAR(1)      NOT NULL, 
+   lv_daily_alloc_char      = VARCHAR(8),
+   lv_monthly_alloc_char    = VARCHAR(8),
+   lv_day_enable            = CHAR(1)      NOT NULL, 
+   lv_day_quota             = INTEGER(4),      
+   lv_month_quota           = INTEGER(4),
+   lv_start_date_new        = DATE,
+   lv_end_date_new          = DATE,
+   lv_deletion_flag         = CHAR(1)      NOT NULL, 
+   sessiontable1            = VARCHAR(100) NOT NULL,
+   sessiontable2            = VARCHAR(100) NOT NULL,
+   sessiontable3            = VARCHAR(100) NOT NULL,
+   sessiontable4            = VARCHAR(100) NOT NULL,
+   sessiontable5            = VARCHAR(100) NOT NULL,
+   sessiontable6            = VARCHAR(100) NOT NULL,
+   sessiontable7            = VARCHAR(100) NOT NULL,
+   sessiontable8            = VARCHAR(100) NOT NULL,
+   sessiontable9            = VARCHAR(100) NOT NULL,
+   temp_tabname1            = VARCHAR(100) NOT NULL,
+   temp_tabname1a           = VARCHAR(100) NOT NULL,
+   temp_tabname1b           = VARCHAR(100) NOT NULL,
+   temp_tabname1c           = VARCHAR(100) NOT NULL,
+   temp_tabname1d           = VARCHAR(100) NOT NULL,
+   temp_tabname2            = VARCHAR(100) NOT NULL,
+   temp_tabname3a           = VARCHAR(100) NOT NULL,
+   temp_tabname3b           = VARCHAR(100) NOT NULL,
+   temp_tabname4            = VARCHAR(100) NOT NULL,
+   temp_tabname5            = VARCHAR(100) NOT NULL,
+   temp_tabname5a           = VARCHAR(100) NOT NULL,
+   temp_tabname5b           = VARCHAR(100) NOT NULL,
+   temp_tabname5c           = VARCHAR(100) NOT NULL,
+   temp_tabname5d           = VARCHAR(100) NOT NULL,
+   temp_tabname5e           = VARCHAR(100) NOT NULL,
+   temp_tabname5f           = VARCHAR(100) NOT NULL,
+   temp_tabname5g           = VARCHAR(100) NOT NULL,
+   temp_tabname7a           = VARCHAR(100) NOT NULL,
+   temp_tabname7b           = VARCHAR(100) NOT NULL,
+   temp_tabname7c           = VARCHAR(100) NOT NULL,
+   temp_tabname7d           = VARCHAR(100) NOT NULL,
+   temp_tabname7e           = VARCHAR(100) NOT NULL,
+   temp_tabname8a           = VARCHAR(100) NOT NULL,
+   temp_tabname8b           = VARCHAR(100) NOT NULL,
+   temp_tabname8c           = VARCHAR(100) NOT NULL,
+   temp_tabname9a           = VARCHAR(100) NOT NULL,
+   temp_tabname9b           = VARCHAR(100) NOT NULL,
+   lv_alloc_cnt             = INTEGER4     NOT NULL,
+   lv_alloc_cnt_c           = INTEGER4     NOT NULL,
+   lv_alloc_cnt_m           = INTEGER4     NOT NULL,
+   lv_mas_ok_cnt            = INTEGER4     NOT NULL,
+   lv_mas_rej_cnt           = INTEGER4     NOT NULL,
+   lv_mas_lin0_cnt          = INTEGER4     NOT NULL,
+   lv_tot_cnt               = INTEGER4     NOT NULL,
+   lv_process_allocations   = INTEGER4     NOT NULL,
+   lv_ok_cnt                = INTEGER4     NOT NULL,
+   lv_rej_cnt               = INTEGER4     NOT NULL,
+   lv_agency_supplier       = INTEGER(4)   NOT NULL  WITH DEFAULT,
+   lv_param_string          = VARCHAR(100) NOT NULL,
+   lv_sequence_no           = INTEGER(4)   NOT NULL  WITH DEFAULT,
+   lv_attach_file           = VARCHAR(100) NOT NULL,
+   lv_agency_file           = VARCHAR(50)  NOT NULL,
+   lv_agency_rejects_file   = VARCHAR(50)  NOT NULL,
+   lv_processed_flag        = INTEGER(1)   NOT NULL,
+   lv_debug_flag            = INTEGER(1)   NOT NULL,
+   lv_alloc_cap             = INTEGER(4)   NOT NULL,
+   lv_filename              = CHAR(64)     NOT NULL, /* without extension      */
+   lv_curr_filename         = CHAR(64)     NOT NULL, /* with extension         */
+   str                      = CHAR(200)            , /* to parse command line  */
+   i                        = INTEGER2             , /* to parse command line  */
+   loop_cnt                 = INTEGER(4)   NOT NULL,
+   branch_cnt               = INTEGER(4)   NOT NULL,
+   lv_timestamp             = CHAR(8)      NOT NULL, 
+   lv_rej_agency_id1        = INTEGER4 NOT NULL;
+   lv_ins_cnt1              = INTEGER4 NOT NULL;
+   lv_ins_cnt2              = INTEGER4 NOT NULL;
+   lv_del_cnt1              = INTEGER4 NOT NULL;
+   lv_del_cnt2              = INTEGER4 NOT NULL;
+   lv_rej_ean1              = INTEGER4 NOT NULL;
+   lv_rej_ean2              = INTEGER4 NOT NULL;
+   lv_rej_dupl              = INTEGER4 NOT NULL;
+   lv_rej_nontrade          = INTEGER4 NOT NULL;
+ 
+   branch_array             = ARRAY OF c4type,
+   agency_id_array1         = ARRAY OF TYPE OF TABLE saccts_supplier_acctno;
+   agency_id_array2         = ARRAY OF TYPE OF TABLE saccts_supplier_acctno;
+   agency_alloc_rec         = ARRAY OF TYPE OF TABLE agency_allocations_rejects;
+   agency_alloc_rej_rec     = ARRAY OF TYPE OF TABLE agency_allocations_rejects;  
+ 
+/*******************************************************
+** LOCAL PROCEDURES
+*******************************************************/
+   lp_create_err_file       = PROCEDURE RETURNING NONE,
+   lp_create_rej_file       = PROCEDURE RETURNING NONE,
+   lp_write_log_msg         = PROCEDURE RETURNING NONE, 
+   lp_write_out_msg         = PROCEDURE RETURNING NONE, 
+
+   lp_create_worktable1     = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable1a    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable1b    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable1c    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable1d    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable2     = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable3a    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable3b    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable4     = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable5     = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable5a    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable5b    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable5c    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable5d    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable5e    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable5f    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable5g    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable7a    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable7b    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable7c    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable7d    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable7e    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable8a    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable8b    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable8c    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable9a    = PROCEDURE RETURNING INTEGER,
+   lp_create_worktable9b    = PROCEDURE RETURNING INTEGER,
+   lp_get_tot_count         = PROCEDURE RETURNING INTEGER,
+   lp_upd_allocation_table  = PROCEDURE RETURNING INTEGER,
+   lp_upd_rejects_table     = PROCEDURE RETURNING INTEGER,
+   lp_load_sessiontable1    = PROCEDURE RETURNING INTEGER,
+   lp_create_sessiontable4  = PROCEDURE RETURNING INTEGER,
+   lp_update_validation1    = PROCEDURE RETURNING INTEGER,   
+   lp_update_validation2    = PROCEDURE RETURNING INTEGER,   
+   lp_update_validation3    = PROCEDURE RETURNING INTEGER,   
+   lp_mark_duplicate_recs   = PROCEDURE RETURNING INTEGER,   
+   lp_update_validation4    = PROCEDURE RETURNING INTEGER,   
+   lp_insert_rejects        = PROCEDURE RETURNING INTEGER,
+   lp_create_sessiontable5  = PROCEDURE RETURNING INTEGER,
+
+   lp_set_quota_status_c    = PROCEDURE RETURNING INTEGER,
+   lp_update_quota_c        = PROCEDURE RETURNING INTEGER,
+   lp_update_exp_quota_c    = PROCEDURE RETURNING INTEGER,
+   lp_insert_quota_c        = PROCEDURE RETURNING INTEGER,
+   lp_insert_exp_quota_c    = PROCEDURE RETURNING INTEGER,
+   lp_refresh_quotas_c      = PROCEDURE RETURNING INTEGER,
+
+   lp_set_quota_status_m    = PROCEDURE RETURNING INTEGER,
+   lp_update_quota_m        = PROCEDURE RETURNING INTEGER,
+   lp_update_exp_quota_m    = PROCEDURE RETURNING INTEGER,
+   lp_insert_quota_m        = PROCEDURE RETURNING INTEGER,
+   lp_insert_exp_quota_m    = PROCEDURE RETURNING INTEGER,
+   lp_refresh_quotas_m      = PROCEDURE RETURNING INTEGER,
+
+   lp_check_ingres_error    = PROCEDURE RETURNING INTEGER;
+{
+   /* Get the passed in parameters... (Already validated in calling script) */
+   lv_param_string          = CALLPROC CommandLineParameters();
+   str                      = SQUEEZE(lv_param_string);
+   i = locate (str,' ');
+
+   pv_agency_supplier       = IFNULL(INT4(LEFT (str,i-1)),0);
+   str                      = SHIFT(str,-i); 
+   lv_agency_supplier       = pv_agency_supplier;
+
+   i = locate (str,' ');
+   pv_filename              = IFNULL(LEFT (str,i-1),'');
+
+   str                      = SHIFT(str,-i); 
+
+   lv_filename              = pv_filename;
+
+   lv_curr_filename         = TRIM(:lv_filename) + '.csv'; 
+
+   lv_agency_file           = 'agency_allocations';
+
+   lv_agency_rejects_file   = 'agency_allocations_rejects';
+
+   lv_sequence_no           = 41;
+
+   lv_reject_file_flag      = 0;
+
+   lv_processed_flag        = 1;
+
+   SELECT temp_tabowner     = dbmsinfo('username'); 
+
+   ret_code = CALLPROC lp_check_ingres_error (proc_no = 010);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* Read the DEBUG Flag                                                   */
+   SELECT lv_debug_flag  = INT1(parameter_value)
+   FROM   application_parameters
+   WHERE  parameter_id   = 'ALLOCDEBUG';
+
+   ret_code = CALLPROC lp_check_ingres_error (proc_no = 020);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* Read the CAP value                                                    */
+   SELECT lv_alloc_cap = INT4(parameter_value)
+   FROM   application_parameters
+   WHERE  parameter_id = 'ALLOC_CAP';
+
+   ret_code = CALLPROC lp_check_ingres_error (proc_no = 030);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   sessiontable1 = 'session.agency_allocations';
+   sessiontable2 = 'session.sessiontable2';
+   sessiontable3 = 'session.sessiontable3';     
+   sessiontable4 = 'session.sessiontable4';     
+   sessiontable5 = 'session.sessiontable5';
+   sessiontable6 = 'session.sessiontable6';
+   sessiontable7 = 'session.sessiontable7';
+   sessiontable8 = 'session.sessiontable8';
+   sessiontable9 = 'session.sessiontable9';
+
+   lv_start_date_new = DATE('today') + '1 day'; 
+   lv_end_date_new   = DATE('today');
+
+   /* Get Agency Name                                                       */
+   SELECT lv_agency_name  =  supplier_name
+   FROM   agency_supplier
+   WHERE  agency_supplier = :lv_agency_supplier;
+
+   ret_code = CALLPROC lp_check_ingres_error (proc_no = 040);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* Get timestamp */
+   SELECT CHAR(YEAR(DATE('TODAY')) * 10000 + MONTH(DATE('TODAY')) * 100 + DAY(DATE('TODAY'))) AS lv_timestamp;
+   ret_code = CALLPROC lp_check_ingres_error (proc_no = 050);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   logfile = TRIM(:lv_agency_file) + '_load_' + TRIM(LOWERCASE(lv_agency_name)) + '.tmp';
+
+   gv_branch_id = '409V';
+   gv_user_id   = 'cron';
+   gv_proc      = 'agenalloc';
+   
+   outfile      = TRIM(:lv_agency_file)         + '.' + TRIM(:lv_filename) + '.out';
+   attachfile   = TRIM(:lv_agency_rejects_file) + '.' + TRIM(:lv_filename) + '.txt';
+
+   CALL SYSTEM 'touch ' + :gc_temp + TRIM(:outfile);
+
+   /* Fetch ALL the branches  */
+   ret_code = CALLPROC ARRAYCLEAR(branch_array);
+
+   branch_array = SELECT 
+                  DISTINCT branch AS c4_var
+                  FROM     product_quotas_view
+                  WHERE    branch != ''
+                  ORDER BY branch;
+
+   ret_code = CALLPROC lp_check_ingres_error (proc_no = 060);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   branch_cnt = IIrowcount;   
+   
+   /* Get count of rows                                                        */
+   IF branch_cnt <= 0
+   THEN
+      logmess = 'No Branch Rows Found';
+      CALLPROC lp_write_log_msg();
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Get total count of Allocations Loaded by MASAI                           */
+   /****************************************************************************/
+   ret_code = CALLPROC lp_get_tot_count();
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Update Agency ID/Group, Acc No, Link Code in agency allocations table    */
+   /****************************************************************************/
+   IF lv_process_allocations = 1
+   THEN
+      ret_code = CALLPROC lp_upd_allocation_table();
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      /*************************************************************************/
+      /* Update Agency ID/Group, Account No, Link Code in rejects table        */
+      /*************************************************************************/
+      ret_code = CALLPROC lp_upd_rejects_table();
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Create/Load session table with data from both permanent tables           */
+   /****************************************************************************/
+   ret_code = CALLPROC lp_load_sessiontable1();
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Create session table of qualifying Agency products                       */
+   /****************************************************************************/
+   IF lv_process_allocations = 1
+   THEN
+      ret_code = CALLPROC lp_create_sessiontable4();
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      /*************************************************************************/
+      /* Update session table records where reject code is 40                  */
+      /*************************************************************************/
+      ret_code = CALLPROC lp_update_validation1();
+      IF lv_errno != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      /*************************************************************************/
+      /* Update session table records where reject code is 41                  */
+      /*************************************************************************/
+      ret_code = CALLPROC lp_update_validation2();
+      IF lv_errno != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      /*************************************************************************/
+      /* Update session table records where reject code is 42                  */
+      /*************************************************************************/
+      ret_code = CALLPROC lp_update_validation3();
+      IF lv_errno != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      /*************************************************************************/
+      /* Update session table records where reject code is 43                  */
+      /*************************************************************************/
+      ret_code = CALLPROC lp_mark_duplicate_recs();
+      IF lv_errno != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      /*************************************************************************/
+      /* Update session table records where reject code is 44                  */
+      /*************************************************************************/
+      ret_code = CALLPROC lp_update_validation4();
+      IF lv_errno != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      /*************************************************************************/
+      /* Insert rejects from session table to rejects table                    */
+      /*************************************************************************/
+      ret_code = CALLPROC lp_insert_rejects();
+      IF lv_errno != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      /*************************************************************************/
+      /* If number of rejected allocations exceed cap do not process the file  */
+      /* but inform agency with summary and report attached to email           */
+      /*************************************************************************/
+      IF lv_rej_cnt > lv_alloc_cap
+      THEN
+         CALLPROC lp_create_rej_file(); 
+         lv_reject_file_flag=1;
+
+         /* Update Agency Allocations table processed_flag to 1                */
+         UPDATE agency_allocations 
+         SET    processed_flag     = :lv_processed_flag,
+                processed_date     =  DATE('now')
+         WHERE  agency_supplier    = :lv_agency_supplier 
+         AND    original_file_name = :lv_curr_filename;
+        
+         ret_code = CALLPROC lp_check_ingres_error(proc_no = 070);
+         IF ret_code != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      ENDIF;
+
+      /*************************************************************************/
+      /* Create session table with qualifying data from product-quotas         */
+      /*************************************************************************/
+      ret_code = CALLPROC lp_create_sessiontable5();
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      IF lv_reject_file_flag = 0
+      THEN
+         /**********************************************************************/
+         /* Update session table quota-status (Customer)                       */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_set_quota_status_c(); 
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update session table records that are UPDATES (Customer)           */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_update_quota_c();
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update session table records that are UPDATES (EXPIRED) (Customer) */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_update_exp_quota_c();
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update session table records that are INSERTS (Customer)           */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_insert_quota_c();
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update session table records that are INSERTS (EXPIRED) (Customer) */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_insert_exp_quota_c();
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update/Insert product-quotas table (Customer)                      */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_refresh_quotas_c();
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update session table quota-status (Managed)                        */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_set_quota_status_m(); 
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update session table records that are UPDATES (Managed)            */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_update_quota_m();
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update session table records that are UPDATES (EXPIRED) (Managed)  */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_update_exp_quota_m();
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update session table records that are INSERTS (Customer) (Managed) */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_insert_quota_m();
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update session table records that are INSERTS (EXPIRED) (Managed)  */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_insert_exp_quota_m();
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Update/Insert product-quotas table (Managed)                       */
+         /**********************************************************************/
+         ret_code = CALLPROC lp_refresh_quotas_m();
+         IF lv_errno != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         /**********************************************************************/
+         /* Load qualifying data from agency_allocations for each file into    */
+         /* array. Pass in agency supplier and file name.                      */
+         /**********************************************************************/
+         lv_alloc_cnt = 0;
+      
+         ret_code = arrayclear(agency_alloc_rec);
+      
+         agency_alloc_rec =
+           SELECT   *
+           FROM    :sessiontable1
+           WHERE    agency_supplier    = :lv_agency_supplier
+           AND      original_file_name = :lv_curr_filename
+           ORDER BY original_file_name, line_no ASC;
+      
+            ret_code = CALLPROC lp_check_ingres_error(proc_no = 080);
+            IF ret_code != gc_success
+            THEN
+               RETURN gc_fail;
+            ENDIF;
+         
+            array_rows    = ArrayAllRows(agency_alloc_rec);
+            lv_row_no     = 0;
+            lv_alloc_cnt  = array_rows;
+
+            IF lv_agency_supplier = 13
+            THEN
+               IF array_rows <= 0
+               THEN
+                  /* Data to process - NO */
+               ELSE
+                  /* Data to process - YES */
+      
+                  CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+         
+                  IF lv_debug_flag > 1 
+                  THEN
+                     logmess = 'Reporting Allocations ...';
+                     CALLPROC lp_write_log_msg();
+            
+                     /* Go through all OK Allocations and write out to log file */
+                     WHILE lv_row_no          < array_rows
+                     DO
+                        lv_row_no             = lv_row_no + 1;
+            
+                        lv_reject_code        = agency_alloc_rec[lv_row_no].reject_code;
+                        lv_agency_id          = agency_alloc_rec[lv_row_no].agency_id;
+            
+                        lv_agency_group_char  = IFNULL(agency_alloc_rec[lv_row_no].agency_group,'0');
+            
+                        lv_brnacc             = IFNULL(agency_alloc_rec[lv_row_no].brnacc,'');
+                        lv_id_flag            = IFNULL(agency_alloc_rec[lv_row_no].id_flag,'');
+                        lv_ean_code           = IFNULL(agency_alloc_rec[lv_row_no].ean_code,'');
+                        lv_product_code       = IFNULL(agency_alloc_rec[lv_row_no].product_code,'');
+            
+                        lv_daily_alloc_char   = IFNULL(agency_alloc_rec[lv_row_no].daily_allocation,'');
+                        lv_monthly_alloc_char = IFNULL(agency_alloc_rec[lv_row_no].monthly_allocation,'0');
+            
+                        lv_deletion_flag      = IFNULL(agency_alloc_rec[lv_row_no].deletion_flag,'');
+                        lv_line_no            = agency_alloc_rec[lv_row_no].line_no;
+            
+                        lv_line_no_char       = RIGHT (CONCAT ('000000', VARCHAR (lv_line_no)), 6);
+                        lv_row_no_char        = RIGHT (CONCAT ('000000', VARCHAR (lv_row_no)), 6);
+            
+                        IF lv_id_flag = 'C'
+                        THEN
+                           IF lv_reject_code = 0
+                           THEN
+                              logmess = VARCHAR(lv_row_no_char) + '/' + VARCHAR(array_rows) + 
+                                        ' - Processed OK '                                  + 
+                                        ' Line='      + VARCHAR(lv_line_no_char)            +          
+                                        ' Type='      + TRIM(lv_id_flag)                    + 
+                                        ' Acc='       + TRIM(lv_brnacc)                     + 
+                                        ' AgencyId='  + TRIM(lv_agency_id)                  + 
+                                        ' EAN='       + TRIM(lv_ean_code)                   + 
+                                        ' Prod='      + TRIM(lv_product_code)               + 
+                                        ' Del='       + TRIM(lv_deletion_flag)              + 
+                                        ' DlyAlloc='  + TRIM(lv_daily_alloc_char)           + 
+                                        ' DayEnab='   + TRIM(lv_day_enable)                 + 
+                                        ' MthAlloc='  + TRIM(lv_monthly_alloc_char);
+                           ELSE
+            
+                              logmess = VARCHAR(lv_row_no_char) + '/' + VARCHAR(array_rows) + 
+                                        ' - Rejected     '                                  + 
+                                        ' Line='      + VARCHAR(lv_line_no_char)            +          
+                                        ' Type='      + TRIM(lv_id_flag)                    + 
+                                        ' Acc='       + TRIM(lv_brnacc)                     + 
+                                        ' AgencyId='  + TRIM(lv_agency_id)                  + 
+                                        ' EAN='       + TRIM(lv_ean_code)                   + 
+                                        ' Prod='      + TRIM(lv_product_code)               + 
+                                        ' Del='       + TRIM(lv_deletion_flag)              + 
+                                        ' DlyAlloc='  + TRIM(lv_daily_alloc_char)           + 
+                                        ' DayEnab='   + TRIM(lv_day_enable)                 + 
+                                        ' MthAlloc='  + TRIM(lv_monthly_alloc_char);
+                           ENDIF
+            
+                        ELSE
+            
+                           IF lv_reject_code = 0
+                           THEN
+                              logmess = VARCHAR(lv_row_no_char) + '/' + VARCHAR(array_rows) +
+                                        ' - Processed OK '                                  +
+                                        ' Line='      + VARCHAR(lv_line_no_char)            +         
+                                        ' Type='      + TRIM(lv_id_flag)                    +
+                                        ' AgencyGrp=' + TRIM(lv_agency_group_char)          +
+                                        ' EAN='       + TRIM(lv_ean_code)                   +
+                                        ' Prod='      + TRIM(lv_product_code)               +
+                                        ' Del='       + TRIM(lv_deletion_flag)              +
+                                        ' DlyAlloc='  + TRIM(lv_daily_alloc_char)           +
+                                        ' DayEnab='   + TRIM(lv_day_enable)                 +
+                                        ' MthAlloc='  + TRIM(lv_monthly_alloc_char);
+                           ELSE  
+                              logmess = VARCHAR(lv_row_no_char) + '/' + VARCHAR(array_rows) +
+                                        ' - Rejected     '                                  +
+                                        ' Line='      + VARCHAR(lv_line_no_char)            +         
+                                        ' Type='      + TRIM(lv_id_flag)                    +
+                                        ' AgencyGrp=' + TRIM(lv_agency_group_char)          +
+                                        ' EAN='       + TRIM(lv_ean_code)                   +
+                                        ' Prod='      + TRIM(lv_product_code)               +
+                                        ' Del='       + TRIM(lv_deletion_flag)              +
+                                        ' DlyAlloc='  + TRIM(lv_daily_alloc_char)           +
+                                        ' DayEnab='   + TRIM(lv_day_enable)                 +
+                                        ' MthAlloc='  + TRIM(lv_monthly_alloc_char);
+                           ENDIF
+            
+                        ENDIF;
+            
+                        CALLPROC lp_write_log_msg();
+            
+                     ENDWHILE; 
+         
+                  ENDIF; /* End of lv_debug_flag > 1 */
+
+               ENDIF; /* End of array_rows <= 0 */
+
+            ENDIF; /* End of lv_agency_supplier = 13 */
+
+      ENDIF; /* End of lv_reject_file_flag = 0 */
+
+      /* Update Agency Allocations table processed_flag to 1                   */
+      UPDATE agency_allocations 
+      SET    processed_flag     = :lv_processed_flag,
+             processed_date     =  DATE('now')
+      WHERE  agency_supplier    = :lv_agency_supplier 
+      AND    original_file_name = :lv_curr_filename;
+     
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 090);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+    
+   ENDIF; /* End of lv_process_allocations = 1 */
+   
+   /****************************************************************************/
+   /* Get summary counts for OK and rejected allocations from database         */
+   /****************************************************************************/
+   IF lv_agency_supplier = 13
+   THEN
+      SELECT lv_ok_cnt = COUNT(*)
+      FROM  :sessiontable1
+      WHERE  reject_reason      = 'OK'
+      AND    original_file_name = :lv_curr_filename;
+
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 100);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      SELECT lv_rej_cnt = COUNT(*)
+      FROM   agency_allocations_rejects
+      WHERE  original_file_name = :lv_curr_filename;
+     
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 110);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      logmess = 'OK Lines                     : ' +  VARCHAR(lv_ok_cnt);
+      CALLPROC lp_write_log_msg();
+      IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+      THEN
+         CALLPROC lp_write_out_msg(); 
+      ENDIF;
+
+      IF lv_rej_cnt > 0 AND IFNULL(lv_mas_lin0_cnt,0) = 0
+      THEN
+         CALL SYSTEM 'echo "' + '" >> ' + :gc_temp + TRIM(:outfile);
+      ENDIF;
+
+      logmess = ' Rejected Lines              : ' +  VARCHAR(lv_rej_cnt);
+      CALLPROC lp_write_log_msg(); 
+      IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+      THEN
+         CALLPROC lp_write_out_msg(); 
+      ENDIF;
+
+      IF lv_rej_cnt > 0 AND IFNULL(lv_mas_lin0_cnt,0) = 0
+      THEN
+         logmess = '  Agency ID Invalid [Sing]   : ' +  VARCHAR(lv_rej_agency_id1);
+         CALLPROC lp_write_log_msg();
+         IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+         THEN
+            CALLPROC lp_write_out_msg(); 
+         ENDIF;
+   
+         logmess = '  Agency ID Invalid [Mult 1] : ' +  VARCHAR(lv_ins_cnt1);
+         CALLPROC lp_write_log_msg();
+         IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+         THEN
+            CALLPROC lp_write_out_msg(); 
+         ENDIF;
+   
+         logmess = '  Agency ID Invalid [Mult 2] : ' +  VARCHAR(lv_ins_cnt2);
+         CALLPROC lp_write_log_msg();
+         IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+         THEN
+            CALLPROC lp_write_out_msg(); 
+         ENDIF;
+   
+         logmess = '  EAN Code 1 Invalid         : ' +  VARCHAR(lv_rej_ean1);
+         CALLPROC lp_write_log_msg();
+         IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+         THEN
+            CALLPROC lp_write_out_msg(); 
+         ENDIF;
+   
+         logmess = '  EAN Code 2 Invalid         : ' +  VARCHAR(lv_rej_ean2);
+         CALLPROC lp_write_log_msg();
+         IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+         THEN
+            CALLPROC lp_write_out_msg(); 
+         ENDIF;
+   
+         logmess = '  Duplicate Allocations      : ' +  VARCHAR(lv_rej_dupl);
+         CALLPROC lp_write_log_msg();
+         IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+         THEN
+            CALLPROC lp_write_out_msg(); 
+         ENDIF;
+   
+         logmess = '  Non-Trading Accounts       : ' +  VARCHAR(lv_rej_nontrade);
+         CALLPROC lp_write_log_msg();
+         IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+         THEN
+            CALLPROC lp_write_out_msg(); 
+         ENDIF;
+   
+         logmess = '  Masai Rejections           : ' +  VARCHAR(lv_mas_rej_cnt);
+         CALLPROC lp_write_log_msg();
+         IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+         THEN
+            CALLPROC lp_write_out_msg(); 
+         ENDIF;
+         CALL SYSTEM 'echo "' + '" >> ' + :gc_temp + TRIM(:outfile);
+      ENDIF;
+  
+      logmess = 'Total Lines                  : ' + VARCHAR(lv_tot_cnt);
+      CALLPROC lp_write_log_msg(); 
+      IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+      THEN
+         CALLPROC lp_write_out_msg(); 
+      ENDIF;
+  
+      CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+      logmess = 'Rejected Lines CAP           : ' + VARCHAR(lv_alloc_cap);
+      CALLPROC lp_write_log_msg(); 
+      IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no = 0)
+      THEN
+         CALLPROC lp_write_out_msg(); 
+      ENDIF;
+
+      IF lv_reject_file_flag = 1
+      THEN
+         CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+      ENDIF;
+     
+      /*************************************************************************/
+      /* Ingres processing complete. Load data from rejects table to array.    */
+      /* Report on reject data from agency_allocations_rejects table.          */
+      /*************************************************************************/
+      IF lv_rej_cnt > 0
+      THEN
+         IF lv_reject_file_flag = 1
+         THEN
+            logmess = 'File rejected because reject cap exceeded';
+            CALLPROC lp_write_log_msg();
+         ENDIF;
+
+         ret_code = arrayclear(agency_alloc_rej_rec);
+    
+         agency_alloc_rej_rec =
+           SELECT   *
+           FROM     agency_allocations_rejects
+           WHERE    processed_flag     =  0
+           AND      agency_supplier    = :lv_agency_supplier
+           AND      original_file_name = :lv_curr_filename
+           ORDER BY original_file_name, line_no ASC;
+   
+         ret_code = CALLPROC lp_check_ingres_error(proc_no = 115);
+         IF ret_code != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+  
+         array_rows = ArrayAllRows(agency_alloc_rej_rec);
+         lv_row_no  = 0;
+ 
+         IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no != 0)
+         THEN
+            CALL SYSTEM 'echo "' + '" >> ' + :gc_temp + TRIM(:outfile);
+         ENDIF;
+
+         /**********************************************************************/
+         /* Go through all unprocessed errors and write details to a reject    */
+         /* file to be used to report all line errors to Agency except for     */
+         /* confirmation orders                                                */
+         /**********************************************************************/
+         
+         IF lv_mas_lin0_cnt = 0
+         THEN
+            logmess = 'Generate reject file as attachment';
+            CALLPROC lp_write_log_msg();
+
+            lv_report_name = TRIM(:lv_agency_rejects_file) + '_load';
+            lv_param_list  = '';
+            lv_attach_file = :gc_temp + TRIM(:attachfile);
+      
+            CALL REPORT (
+               report = :lv_report_name,
+               param  = :lv_param_list,
+               file   = :lv_attach_file);
+     
+            CALL SYSTEM 'echo "' + '" >> ' + :gc_temp + TRIM(:outfile);
+
+         ENDIF;
+         
+         /* Update reject table processed_flag to 1                            */
+         UPDATE agency_allocations_rejects
+         SET    processed_flag     = :lv_processed_flag,
+                processed_date     =  DATE('now')
+         WHERE  agency_supplier    = :lv_agency_supplier 
+         AND    original_file_name = :lv_curr_filename;
+    
+         ret_code = CALLPROC lp_check_ingres_error(proc_no = 120);
+         IF ret_code != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+
+      ELSE
+
+         logmess = 'No Rejected Allocations to report';
+         CALLPROC lp_write_log_msg();
+
+      ENDIF;
+
+      CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+
+      IF lv_alloc_cnt > 0 OR (lv_alloc_cnt = 0 AND lv_line_no != 0)
+      THEN
+         CALL SYSTEM 'echo "' + '" >> ' + :gc_temp + TRIM(:outfile); 
+      ENDIF;
+
+      lv_errno = CALLPROC lp_create_worktable1();
+      IF lv_errno != 0 
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      /* END OF PROCESSING SANOFI ALLOCATIONS DATA                             */
+
+   ELSE
+
+      /* START OF PROCESSING OF ALLOCATIONS FOR ANOTHER AGENCY                 */
+
+      /* Add next agency logic here                                            */     
+
+      /* END OF PROCESSING OF ALLOCATIONS FOR ANOTHER AGENCY                   */
+
+      logmess = 'Agency ' + VARCHAR(lv_agency_supplier) + ' (' + lv_agency_name + ') not included for allocations load';
+      CALLPROC lp_write_log_msg(); 
+
+   ENDIF;
+
+   COMMIT;
+}
+
+
+PROCEDURE lp_get_tot_count() =
+{  
+   lv_process_allocations = 1;
+
+   /* MASAI OK Count */
+   SELECT   lv_mas_ok_cnt      = COUNT(*)  
+   FROM     agency_allocations
+   WHERE    processed_flag     =  0
+   AND      agency_supplier    = :lv_agency_supplier
+   AND      original_file_name = :lv_curr_filename; 
+   
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 125);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* MASAI Validation Reject Count */
+   SELECT   lv_mas_rej_cnt     = COUNT(*) 
+   FROM     agency_allocations_rejects
+   WHERE    processed_flag     =  0
+   AND      line_no           !=  0
+   AND      agency_supplier    = :lv_agency_supplier
+   AND      original_file_name = :lv_curr_filename; 
+   
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 130);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* MASAI Empty File Reject Count */
+   SELECT   lv_mas_lin0_cnt    = COUNT(*) 
+   FROM     agency_allocations_rejects
+   WHERE    processed_flag     =  0
+   AND      line_no            =  0
+   AND      agency_supplier    = :lv_agency_supplier
+   AND      original_file_name = :lv_curr_filename; 
+   
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 135);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_tot_cnt = lv_mas_ok_cnt + lv_mas_rej_cnt + lv_mas_lin0_cnt;
+
+   logmess = 'Number of rows loaded: ' + VARCHAR(lv_tot_cnt);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_tot_cnt = 1
+   THEN
+      IF lv_mas_lin0_cnt = 1
+      THEN
+         lv_process_allocations = 0;
+         logmess = 'Process MASAI Rejected File';
+         CALLPROC lp_write_log_msg();
+      ENDIF;
+   ENDIF;
+
+   COMMIT;
+}
+
+
+PROCEDURE lp_upd_allocation_table(
+) =
+DECLARE
+   agency_id_cnt    = INTEGER4 NOT NULL;
+   agency_group_cnt = INTEGER4 NOT NULL;
+   brnacc_cnt       = INTEGER4 NOT NULL; 
+   prod_cnt         = INTEGER4 NOT NULL;
+   lv_cnt           = INTEGER4 NOT NULL;
+   lv_array_rows1   = INTEGER4 NOT NULL;
+   lv_array_rows2   = INTEGER4 NOT NULL;
+   lv_record        = INTEGER4 NOT NULL;
+   lv_branch        = CHAR(4)  NOT NULL;
+   lv_account_no    = CHAR(9)  NOT NULL;
+   lv_pg_zero_cnt   = INTEGER4 NOT NULL;
+{  
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_allocation_table.'            + 
+                ' agency_supplier = ' + VARCHAR(lv_agency_supplier) +
+                ' original_file_name = ' + TRIM(lv_curr_filename);
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_allocation_table. Update agency_allocations 1';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /* Populate agency id field in Agency Allocations table                     */
+   UPDATE agency_allocations
+   SET    agency_id          = agency_cust_grp_id
+   WHERE  id_flag            = 'C'
+   AND    processed_flag     =  0
+   AND    line_no           !=  0
+   AND    agency_supplier    = :lv_agency_supplier
+   AND    original_file_name = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 140);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF; 
+
+   /* Get count of rows updated                                                */
+   agency_id_cnt = IIrowcount;
+
+   logmess = 'Number of Agency ID ' + '(' + 'C' + ')' + ' rows updated in Agency Allocations: ' + VARCHAR(agency_id_cnt);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_allocation_table. Update agency_allocations 2';
+      CALLPROC lp_write_log_msg(); 
+   endif;
+   
+   /* Populate agency group field in Agency Allocations table                  */
+   UPDATE agency_allocations
+   SET    agency_group       = agency_cust_grp_id
+   WHERE  id_flag            = 'M'
+   AND    processed_flag     =  0
+   AND    line_no           !=  0
+   AND    agency_supplier    = :lv_agency_supplier
+   AND    original_file_name = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 145);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* Get count of rows updated                                                */
+   agency_group_cnt = IIrowcount;
+
+   logmess = 'Number of Agency Group ' + '(' + 'M' + ')' + ' rows updated in Agency Allocations: ' + VARCHAR(agency_group_cnt);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_allocation_table. Update agency_allocations 3';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /* Create session table so we don't keep hitting sales_accts                */
+   IIint = CALLPROC drop_session_table (sessiontable6);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   DECLARE GLOBAL TEMPORARY TABLE :sessiontable6 AS
+   SELECT * 
+   FROM   sales_accts
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 150);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Create session table of extract of saccts_supplier_acctno table based    */
+   /* on agency id from this file and include pricing group.                   */ 
+   /****************************************************************************/
+   IIint = CALLPROC drop_session_table (sessiontable7);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   DECLARE GLOBAL TEMPORARY TABLE :sessiontable7 AS
+   SELECT   ss.*,
+            s6.pricing_group
+   FROM     saccts_supplier_acctno    ss,
+           :sessiontable6             s6
+   WHERE    sequence_no            = :lv_sequence_no
+   AND EXISTS(
+   SELECT   *
+   FROM     agency_allocations        a
+   WHERE    processed_flag         =  0
+   AND      original_file_name     = :lv_curr_filename
+   AND      ss.supplier_account_no =  a.agency_cust_grp_id
+   AND      s6.branch              =  ss.branch
+   AND      s6.account_no          =  ss.account_no)
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 155);
+   if ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable7a();
+   IF lv_errno != 0
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Before updating brnacc in agency_allocation table identify any Agency    */
+   /* ID assigned to multiple AAH accounts.                                    */
+   /* Multiple AAH Accounts (Brn only different) - Reject Code 45              */
+   /* Multiple AAH Accounts (Brn/Acc different)  - Reject Code 46              */
+   /****************************************************************************/
+
+   IIint = CALLPROC drop_session_table (sessiontable3);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* sessiontable3 will store the Agency ID associated with multiple AAH      */
+   /* accounts where only the branch has changed (Branch Transfer)             */
+   /****************************************************************************/
+
+   DECLARE GLOBAL TEMPORARY TABLE :sessiontable3 AS
+   SELECT   supplier_account_no,
+            account_no
+   FROM    :sessiontable7
+   GROUP BY supplier_account_no,
+            account_no
+   HAVING   COUNT(*) > 1
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 160);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable3a();
+   IF lv_errno != 0
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* sessiontable9 stores Agency ID's associated with multiple AAH accounts   */
+   /* (not branch transfers)                                                   */
+   /****************************************************************************/
+
+   IIint = CALLPROC drop_session_table (sessiontable9);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   DECLARE GLOBAL TEMPORARY TABLE :sessiontable9 AS
+   SELECT   supplier_account_no
+   FROM    :sessiontable7     s7
+   WHERE NOT EXISTS (SELECT   *
+                     FROM    :sessiontable3            s3
+                     WHERE    s3.supplier_account_no = s7.supplier_account_no)
+                     GROUP BY supplier_account_no
+                     HAVING   COUNT(*)               > 1
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 165);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable9a();
+   IF lv_errno != 0
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+
+   lv_ins_cnt1 = 0;
+   lv_del_cnt1 = 0;
+
+   ret_code = CALLPROC ARRAYCLEAR(agency_id_array1); 
+
+   agency_id_array1 = SELECT     supplier_account_no,
+                                 account_no
+                      FROM      :sessiontable3
+                      ORDER BY 2 asc;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 170);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_array_rows1 = ArrayAllRows(agency_id_array1); 
+   
+   logmess = 'Count Duplicate Agency ID Type 1 in saccts supplier acctno table: ' + VARCHAR(lv_array_rows1);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_array_rows1 > 0
+   THEN
+      UNLOADTABLE agency_id_array1 (lv_record = _RECORD)
+      {
+         lv_account_no = agency_id_array1[lv_record].account_no;
+         lv_agency_id  = agency_id_array1[lv_record].supplier_account_no;
+         
+         SELECT lv_pg_zero_cnt = COUNT(*)
+         FROM  :sessiontable6 /* Extract of sales_accts                        */
+         WHERE  account_no     = :lv_account_no
+         AND    pricing_group  =  0;
+
+         ret_code = CALLPROC lp_check_ingres_error(proc_no = 175);
+         IF ret_code != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+         
+         IF lv_pg_zero_cnt != 1
+         THEN
+            /*******************************************************************/
+            /* There are multiple occurences of the same Agency ID where there */
+            /* there is either no active account or too many active accounts   */
+            /* so reject any Customer Allocations with this Agency ID. This    */
+            /* is the result of a branch transfer where the old AAH account    */
+            /* has been made non-trading and the new one is trading. Account   */
+            /* no remains the same but branch has been changed.                */
+            /*******************************************************************/
+            INSERT INTO agency_allocations_rejects
+                      ( agency_supplier
+                      , brnacc
+                      , agency_cust_grp_id
+                      , agency_id
+                      , agency_group
+                      , id_flag
+                      , ean_code
+                      , product_code
+                      , daily_allocation
+                      , monthly_allocation
+                      , deletion_flag
+                      , line_no
+                      , load_date
+                      , processed_flag
+                      , processed_date
+                      , original_file_name
+                      , reject_code
+                      , reject_reason
+                      )
+            SELECT      a.agency_supplier
+                      , a.brnacc
+                      , a.agency_cust_grp_id
+                      , a.agency_id
+                      , a.agency_group
+                      , a.id_flag
+                      , a.ean_code
+                      , a.product_code
+                      , a.daily_allocation
+                      , a.monthly_allocation
+                      , a.deletion_flag
+                      , a.line_no
+                      , a.load_date
+                      , a.processed_flag
+                      , date('now')
+                      , a.original_file_name
+                      , 45
+                      , 'ING-Agency ID Invalid Multiple 1'
+            FROM        agency_allocations       a
+            INNER JOIN :sessiontable3            s
+            ON          a.agency_cust_grp_id  =  s.supplier_account_no
+            WHERE       processed_flag        =  0
+            AND         original_file_name    = :lv_curr_filename
+            AND         s.supplier_account_no = :lv_agency_id;
+
+            ret_code = CALLPROC lp_check_ingres_error(proc_no = 180);
+            IF ret_code != gc_success
+            THEN
+               RETURN gc_fail;
+            ENDIF;
+
+            lv_ins_cnt1 = lv_ins_cnt1 + IIrowcount;
+   
+
+            /*******************************************************************/
+            /* Delete rejected multiple Type 1 Agency ID from table            */
+            /* agency_allocations                                              */
+            /*******************************************************************/
+            DELETE
+            FROM        agency_allocations              a
+            WHERE       a.original_file_name         = :lv_curr_filename
+            AND         a.processed_flag             =  0
+            AND EXISTS (SELECT 1
+                        FROM  :sessiontable3            s
+                        WHERE  s.supplier_account_no = :lv_agency_id
+                        AND    a.agency_cust_grp_id  =  s.supplier_account_no);
+      
+            ret_code = CALLPROC lp_check_ingres_error(proc_no = 185);
+            IF ret_code != gc_success
+            THEN
+               RETURN gc_fail;
+            ENDIF;
+   
+            lv_del_cnt1 = lv_del_cnt1 + IIrowcount;
+
+
+            /*******************************************************************/
+            /* Delete rejected multiple Type 1 Agency ID from sessiontable7    */
+            /*******************************************************************/
+            DELETE
+            FROM   :sessiontable7
+            WHERE   supplier_account_no = :lv_agency_id;
+      
+            ret_code = CALLPROC lp_check_ingres_error(proc_no = 190);
+            IF ret_code != gc_success
+            THEN
+               RETURN gc_fail;
+            ENDIF;
+
+            /* Delete rejected multiple Type 1 Agency ID from sessiontable3 */
+            DELETE
+            FROM   :sessiontable3
+            WHERE   supplier_account_no = :lv_agency_id;
+      
+            ret_code = CALLPROC lp_check_ingres_error(proc_no = 195);
+            IF ret_code != gc_success
+            THEN
+               RETURN gc_fail;
+            ENDIF;
+
+         ENDIF;
+      };
+
+      logmess = 'Number of Duplicate Agency ID Type 1 records inserted into reject table: ' + VARCHAR(lv_ins_cnt1);
+      CALLPROC lp_write_log_msg();
+
+      logmess = 'Number of Duplicate Agency ID Type 1 records deleted from allocations table: ' + VARCHAR(lv_del_cnt1);
+      CALLPROC lp_write_log_msg();
+
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable7b();
+   IF lv_errno != 0
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable3b();
+   IF lv_errno != 0
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+
+   lv_ins_cnt2 = 0;
+   lv_del_cnt2 = 0;
+
+   ret_code = CALLPROC ARRAYCLEAR(agency_id_array2); 
+
+   agency_id_array2 = SELECT     supplier_account_no
+                      FROM      :sessiontable9
+                      ORDER BY 1 asc;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 200);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_array_rows2 = ArrayAllRows(agency_id_array2); 
+   
+   logmess = 'Count Duplicate Agency ID Type 2 in saccts supplier acctno table: ' + VARCHAR(lv_array_rows2);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_array_rows2 > 0
+   THEN
+      UNLOADTABLE agency_id_array2 (lv_record = _RECORD)
+      {
+         lv_agency_id  = agency_id_array2[lv_record].supplier_account_no;
+
+         /* worktable7b active */
+         /* worktable9a active */
+
+         SELECT     lv_pg_zero_cnt         =  COUNT(*)
+         FROM      :sessiontable7             s7
+                 , :sessiontable9             s9
+         WHERE      pricing_group          =  0
+         AND        s7.supplier_account_no = :lv_agency_id
+         AND        s7.supplier_account_no =  s9.supplier_account_no
+         ORDER BY 1 asc;
+
+         ret_code = CALLPROC lp_check_ingres_error(proc_no = 205);
+         IF ret_code != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+
+         IF lv_pg_zero_cnt != 1
+         THEN
+            /*******************************************************************/
+            /* There are multiple occurences of the same Agency ID where       */
+            /* there is either no active AAH account or too many so reject     */
+            /* any Customer Allocations with this Agency ID. Each AAH          */
+            /* account is unique and not the result of a branch transfer       */
+            /*******************************************************************/
+            INSERT INTO agency_allocations_rejects
+                      ( agency_supplier
+                      , brnacc
+                      , agency_cust_grp_id
+                      , agency_id
+                      , agency_group
+                      , id_flag
+                      , ean_code
+                      , product_code
+                      , daily_allocation
+                      , monthly_allocation
+                      , deletion_flag
+                      , line_no
+                      , load_date
+                      , processed_flag
+                      , processed_date
+                      , original_file_name
+                      , reject_code
+                      , reject_reason
+                      )
+            SELECT      a.agency_supplier
+                      , a.brnacc
+                      , a.agency_cust_grp_id
+                      , a.agency_id
+                      , a.agency_group
+                      , a.id_flag
+                      , a.ean_code
+                      , a.product_code
+                      , a.daily_allocation
+                      , a.monthly_allocation
+                      , a.deletion_flag
+                      , a.line_no
+                      , a.load_date
+                      , a.processed_flag
+                      , date('now')
+                      , a.original_file_name
+                      , 46
+                      , 'ING-Agency ID Invalid Multiple 2'
+            FROM        agency_allocations       a
+            INNER JOIN :sessiontable9            s
+            ON          a.agency_cust_grp_id  =  s.supplier_account_no
+            WHERE       processed_flag        =  0
+            AND         original_file_name    = :lv_curr_filename
+            AND         s.supplier_account_no = :lv_agency_id;
+
+            ret_code = CALLPROC lp_check_ingres_error(proc_no = 210);
+            IF ret_code != gc_success
+            THEN
+               RETURN gc_fail;
+            ENDIF;
+
+            lv_ins_cnt2 = lv_ins_cnt2 + IIrowcount;
+
+            /*******************************************************************/
+            /* Delete rejected multiple Type 1 Agency ID from table            */
+            /* agency_allocations                                              */ 
+            /*******************************************************************/
+            DELETE
+            FROM        agency_allocations              a
+            WHERE       a.original_file_name         = :lv_curr_filename
+            AND         a.processed_flag             =  0
+            AND EXISTS (SELECT 1
+                        FROM  :sessiontable9            s
+                        WHERE  s.supplier_account_no = :lv_agency_id
+                        AND    a.agency_cust_grp_id  =  s.supplier_account_no);
+
+            ret_code = CALLPROC lp_check_ingres_error(proc_no = 215);
+            IF ret_code != gc_success
+            THEN
+               RETURN gc_fail;
+            ENDIF;
+
+            lv_del_cnt2 = lv_del_cnt2 + IIrowcount;
+
+            /*******************************************************************/
+            /* Delete rejected multiple Type 2 Agency ID from sessiontable7    */
+            /*******************************************************************/
+            DELETE
+            FROM   :sessiontable7
+            WHERE   supplier_account_no = :lv_agency_id;
+      
+            ret_code = CALLPROC lp_check_ingres_error(proc_no = 220);
+            IF ret_code != gc_success
+            THEN
+               RETURN gc_fail;
+            ENDIF;
+
+            /* Delete rejected multiple Type 2 Agency ID from sessiontable9 */
+            DELETE
+            FROM   :sessiontable9
+            WHERE   supplier_account_no = :lv_agency_id;
+      
+            ret_code = CALLPROC lp_check_ingres_error(proc_no = 225);
+            IF ret_code != gc_success
+            THEN
+               RETURN gc_fail;
+            ENDIF;
+
+         ENDIF;
+      };
+
+      logmess = 'Number of Duplicate Agency ID Type 2 records inserted into reject table: ' + VARCHAR(lv_ins_cnt2);
+      CALLPROC lp_write_log_msg();
+
+      logmess = 'Number of Duplicate Agency ID Type 2 records deleted from allocations table: ' + VARCHAR(lv_del_cnt2);
+      CALLPROC lp_write_log_msg();
+
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable7c();
+   IF lv_errno != 0
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable9b();
+   IF lv_errno != 0
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Create sessiontable8 from valid data in sessiontable3 (Multi Brn Trn)    */
+   /* and sessiontable9 (Multi Non Brn Trn)                                    */
+   /****************************************************************************/
+   IIint = CALLPROC drop_session_table (sessiontable8);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Create sessiontable8 for multiple type 1 Agency ID's                     */
+   /* worktable7c active                                                       */
+   /* worktable3b active                                                       */
+   /****************************************************************************/
+   DECLARE GLOBAL TEMPORARY TABLE :sessiontable8 AS
+   SELECT *
+   FROM  :sessiontable7 s7
+   WHERE EXISTS (
+   SELECT *
+   FROM  :sessiontable3 s3
+   WHERE  s7.supplier_account_no = s3.supplier_account_no)
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 230);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_cnt = IIrowcount;
+
+   logmess = 'Number of Duplicate Type 1 records in sessiontable8: ' + VARCHAR(lv_cnt);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable8a();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* worktable7c active                                                       */
+   /* worktable8a active                                                       */
+   /* worktable9b active                                                       */
+   /****************************************************************************/
+   INSERT 
+   INTO   :sessiontable8
+   SELECT  *
+   FROM   :sessiontable7 s7
+   WHERE EXISTS (
+   SELECT *
+   FROM  :sessiontable9 s9
+   WHERE  s7.supplier_account_no = s9.supplier_account_no);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 240);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_cnt = IIrowcount;
+
+   logmess = 'Number of Duplicate Type 2 records in sessiontable8: ' + VARCHAR(lv_cnt);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable8b();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_allocation_table. Insert into sessiontable8 [1]';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /****************************************************************************/
+   /* Delete valid multiple type 1 and type 2 records from sessiontable7       */
+   /* worktable7c active                                                       */
+   /* worktable3b active                                                       */
+   /****************************************************************************/
+   DELETE 
+   FROM :sessiontable7 s7
+   WHERE EXISTS (
+   SELECT *
+   FROM  :sessiontable3 s3
+   WHERE  s7.supplier_account_no = s3.supplier_account_no);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 245);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* worktable7c active                                                       */
+   /* worktable9b active                                                       */
+   /****************************************************************************/
+   DELETE 
+   FROM :sessiontable7 s7
+   WHERE EXISTS (
+   SELECT *
+   FROM  :sessiontable9 s9
+   WHERE  s7.supplier_account_no = s9.supplier_account_no);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 250);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+
+   /****************************************************************************/
+   /* Delete all agency id records where AAH account is not active to leave    */
+   /* single active AAH account against each agency id                         */
+   /* worktable8b active                                                       */
+   /****************************************************************************/
+   DELETE 
+   FROM   :sessiontable8
+   WHERE   pricing_group != 0;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 255);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_cnt = IIrowcount;
+
+   logmess = 'Number of Duplicate records deleted in sessiontable8: ' + VARCHAR(lv_cnt);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable8c();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Merge contents of sessiontable7 with sessiontable8 to get full suite     */
+   /* of agency ID's against active accounts                                   */
+   /* worktable7c active                                                       */
+   /* worktable8c active                                                       */
+   /****************************************************************************/
+   INSERT
+   INTO   :sessiontable7
+   SELECT  *
+   FROM   :sessiontable8;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 260);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_cnt = IIrowcount;
+
+   logmess = 'Number of Clean records inserted into sessiontable7: ' + VARCHAR(lv_cnt);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable7d();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_allocation_table. Delete from sessiontable8 [2]';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /****************************************************************************/
+   /* Populate brnacc field in Agency Allocations table for Customer           */
+   /* worktable7d active                                                       */
+   /****************************************************************************/
+   UPDATE  agency_allocations        a
+   FROM   :sessiontable7             s7
+   SET     brnacc                 =  CONCAT(s7.branch,s7.account_no)
+   WHERE   id_flag                = 'C'
+   AND     sequence_no            = :lv_sequence_no
+   AND     processed_flag         =  0
+   AND     line_no               !=  0
+   AND     original_file_name     = :lv_curr_filename
+   AND     a.agency_cust_grp_id   =  s7.supplier_account_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 265);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Get count of rows updated                                                */
+   /****************************************************************************/
+   brnacc_cnt = IIrowcount;
+
+   logmess = 'Number of Customer Allocation Brnacc rows updated in Agency Allocations: ' + VARCHAR(brnacc_cnt);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_allocation_table. Update agency_allocations 6';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /****************************************************************************/
+   /* Populate brnacc field for Managed Allocations                            */
+   /****************************************************************************/
+   UPDATE  agency_allocations
+   SET     brnacc              = '001B77777777W'
+   WHERE   id_flag             = 'M'
+   AND     processed_flag      =  0
+   AND     line_no            !=  0
+   AND     agency_supplier     = :lv_agency_supplier
+   AND     original_file_name  = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 270);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Get count of rows updated                                                */
+   /****************************************************************************/
+   brnacc_cnt = IIrowcount;
+
+   logmess = 'Number of Managed Allocation Brnacc rows updated in Agency Allocations table: ' + VARCHAR(brnacc_cnt);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_allocation_table. Update agency_allocations 7';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /****************************************************************************/
+   /* Populate product code in Agency Allocations table                        */
+   /****************************************************************************/
+   UPDATE  agency_allocations      a
+   FROM    ean_codes               e
+   SET     product_code         =  e.product_code
+   WHERE   seq_no               =  1
+   AND     processed_flag       =  0
+   AND     line_no             !=  0
+   AND     agency_supplier      = :lv_agency_supplier  
+   AND     original_file_name   = :lv_curr_filename
+   AND     e.ean_code           =  a.ean_code;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 310);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Get count of rows updated                                                */
+   /****************************************************************************/
+   prod_cnt = IIrowcount;
+
+   logmess = 'Number of Product rows updated in Agency Allocations: ' + VARCHAR(prod_cnt);
+   CALLPROC lp_write_log_msg();
+
+   CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+}
+
+
+PROCEDURE lp_upd_rejects_table(
+) =
+DECLARE
+   agency_id_cnt    = INTEGER4 NOT NULL;
+   agency_group_cnt = INTEGER4 NOT NULL;
+   brnacc_cnt       = INTEGER4 NOT NULL; 
+   prod_cnt         = INTEGER4 NOT NULL;
+{  
+   /****************************************************************************/
+   /* Do not update if reject code = 1 or reject code = 2                      */
+   /****************************************************************************/
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_rejects_table. Update agency_allocations_rejects 1';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /****************************************************************************/
+   /* Populate agency id field in rejects table                                */
+   /****************************************************************************/
+   UPDATE agency_allocations_rejects
+   SET    agency_id          = agency_cust_grp_id
+   WHERE  id_flag            = 'C'
+   AND    processed_flag     =  0
+   AND    line_no           !=  0
+   AND    agency_supplier    = :lv_agency_supplier
+   AND    original_file_name = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 320);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Get count of rows updated                                                */
+   /****************************************************************************/
+   agency_id_cnt = IIrowcount;
+
+   logmess = 'Number of Agency ID ' + '(' + 'C' + ')' + ' rows updated in Rejects: ' + VARCHAR(agency_id_cnt);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_rejects_table. Update agency_allocations_rejects 2';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /****************************************************************************/
+   /* Populate agency group field in rejects table                             */
+   /****************************************************************************/
+   UPDATE agency_allocations_rejects
+   SET    agency_group       = agency_cust_grp_id
+   WHERE  id_flag            = 'M'
+   AND    processed_flag     =  0
+   AND    line_no           !=  0
+   AND    agency_supplier    = :lv_agency_supplier
+   AND    original_file_name = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 330);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Get count of rows updated                                                */
+   /****************************************************************************/
+   agency_group_cnt = IIrowcount;
+
+   logmess = 'Number of Agency Group ' + '(' + 'M' + ')' + ' rows updated in Rejects: ' + VARCHAR(agency_group_cnt);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_rejects_table. Update agency_allocations_rejects 3';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable7e();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Populate brnacc field in rejects table for Customer Allocations          */
+   /* worktable7e active                                                       */
+   /****************************************************************************/
+   UPDATE  agency_allocations_rejects r
+   FROM   :sessiontable7              s7
+   SET     brnacc                  =  CONCAT(s7.branch,s7.account_no)
+   WHERE   id_flag                 = 'C'
+   AND     sequence_no             = :lv_sequence_no
+   AND     processed_flag          =  0
+   AND     line_no                !=  0
+   AND     agency_supplier         = :lv_agency_supplier
+   AND     original_file_name      = :lv_curr_filename
+   AND     r.agency_id             =  s7.supplier_account_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 340);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Get count of rows updated                                                */
+   /****************************************************************************/
+   brnacc_cnt = IIrowcount;
+
+   logmess = 'Number of Customer Allocation Brnacc rows updated in Rejects: ' + VARCHAR(brnacc_cnt);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_rejects_table. Update agency_allocations_rejects 4';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /****************************************************************************/
+   /* Populate brnacc field in rejects table for Managed Allocations           */
+   /****************************************************************************/
+   UPDATE  agency_allocations_rejects
+   SET     brnacc                = '001B77777777W'
+   WHERE   id_flag               = 'M'
+   AND     processed_flag        =  0
+   AND     line_no              !=  0
+   AND     agency_supplier       = :lv_agency_supplier
+   AND     original_file_name    = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 350);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Get count of rows updated                                                */
+   /****************************************************************************/
+   brnacc_cnt = IIrowcount;
+
+   logmess = 'Number of Managed Allocation Brnacc rows updated in Rejects: ' + VARCHAR(brnacc_cnt);
+   CALLPROC lp_write_log_msg();
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_upd_rejects_table. Update agency_allocations_rejects 5';
+      CALLPROC lp_write_log_msg();
+   ENDIF;
+
+   /****************************************************************************/
+   /* Populate product code in rejects table                                   */
+   /****************************************************************************/
+   UPDATE  agency_allocations_rejects r
+   FROM    ean_codes                  e  
+   SET     product_code            =  e.product_code
+   WHERE   seq_no                  =  1
+   AND     processed_flag          =  0
+   AND     line_no                !=  0
+   AND     agency_supplier         = :lv_agency_supplier
+   AND     original_file_name      = :lv_curr_filename
+   AND     e.ean_code              =  r.ean_code;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 360);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /****************************************************************************/
+   /* Get count of rows updated                                                */
+   /****************************************************************************/
+   prod_cnt = IIrowcount;
+
+   logmess = 'Number of Product rows updated in Rejects: ' + VARCHAR(prod_cnt);
+   CALLPROC lp_write_log_msg();
+}
+
+
+PROCEDURE lp_load_sessiontable1() =
+{  
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_load_sessiontable1. CALLPROC drop_session_table';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   IIint = CALLPROC drop_session_table (sessiontable1);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_load_sessiontable1. DECLARE GLOBAL TEMPORARY TABLE';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   DECLARE GLOBAL TEMPORARY TABLE :sessiontable1
+     ( agency_supplier      INTEGER2 NOT NULL WITH DEFAULT
+     , brnacc               CHAR(13) NOT NULL WITH DEFAULT
+     , brn                  CHAR(4)  NOT NULL WITH DEFAULT
+     , acc                  CHAR(9)  NOT NULL WITH DEFAULT
+     , agency_cust_grp_id   CHAR(25) NOT NULL WITH DEFAULT
+     , agency_id            CHAR(25) NOT NULL WITH DEFAULT
+     , agency_group         CHAR(25) NOT NULL WITH DEFAULT
+     , custgroup_no         INTEGER2 NOT NULL WITH DEFAULT
+     , custtype_no          INTEGER2 NOT NULL WITH DEFAULT
+     , id_flag              CHAR(8)  NOT NULL WITH DEFAULT
+     , ean_code             CHAR(25) NOT NULL WITH DEFAULT
+     , product_code         CHAR(8)  NOT NULL WITH DEFAULT
+     , daily_allocation     CHAR(8)  NOT NULL WITH DEFAULT
+     , day_enable           CHAR(1)  NOT NULL WITH DEFAULT
+     , monthly_allocation   CHAR(8)  NOT NULL WITH DEFAULT
+     , deletion_flag        CHAR(4)  NOT NULL WITH DEFAULT
+     , line_no              INTEGER4 NOT NULL WITH DEFAULT
+     , load_date            DATE     NOT NULL WITH DEFAULT
+     , processed_flag       INTEGER1 NOT NULL WITH DEFAULT
+     , processed_date       DATE     NOT NULL WITH DEFAULT
+     , original_file_name   CHAR(50) NOT NULL WITH DEFAULT
+     , reject_code          INTEGER2 NOT NULL WITH DEFAULT
+     , reject_reason        CHAR(64) NOT NULL WITH DEFAULT
+     , quota_status         CHAR(2)  NOT NULL WITH DEFAULT/* I=insert, IX=insert expired, U=update, UX=update expired */
+     )
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 370);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_load_sessiontable1. Load unprocessed data from Agency Allocations table';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /****************************************************************************/
+   /* Load unprocessed data from Agency Allocations table                      */
+   /****************************************************************************/
+   INSERT INTO :sessiontable1
+          ( agency_supplier
+          , brnacc  
+          , brn
+          , acc
+          , agency_cust_grp_id
+          , agency_id
+          , agency_group
+          , id_flag
+          , ean_code
+          , product_code
+          , daily_allocation
+          , day_enable
+          , monthly_allocation
+          , deletion_flag
+          , line_no
+          , load_date
+          , processed_flag
+          , processed_date
+          , original_file_name
+          , reject_code
+          , reject_reason
+          , quota_status
+          )
+   SELECT   agency_supplier
+          , IFNULL (brnacc, '')    
+          , IFNULL(LEFT(brnacc,4),'')
+          , IFNULL(RIGHT(brnacc,9),'')
+          , IFNULL (agency_cust_grp_id, '')
+          , IFNULL (agency_id, '')
+          , IFNULL (agency_group, '')
+          , id_flag
+          , IFNULL (ean_code, '')    
+          , IFNULL (product_code, '')    
+          , IFNULL (daily_allocation, '')
+          , 'N'
+          , IFNULL (monthly_allocation, '')
+          , IFNULL (deletion_flag, '')
+          , line_no
+          , load_date
+          , processed_flag
+          , IFNULL (processed_date, '')
+          , original_file_name
+          , 0
+          , 'OK'
+          , ''
+   FROM     agency_allocations
+   WHERE    processed_flag     =  0
+   AND      agency_supplier    = :lv_agency_supplier
+   AND      original_file_name = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 380);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'DEBUG In PROC lp_load_sessiontable1. Load unprocessed data from Agency Allocations Reject table';
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   /****************************************************************************/
+   /* Load unprocessed data from Agency Allocations Reject table               */
+   /****************************************************************************/
+   INSERT INTO :sessiontable1
+          ( agency_supplier
+          , brnacc  
+          , brn
+          , acc
+          , agency_cust_grp_id
+          , agency_id
+          , agency_group
+          , id_flag
+          , ean_code
+          , product_code
+          , daily_allocation
+          , day_enable
+          , monthly_allocation
+          , deletion_flag
+          , line_no
+          , load_date
+          , processed_flag
+          , processed_date
+          , original_file_name
+          , reject_code
+          , reject_reason
+          , quota_status
+          )
+   SELECT   agency_supplier
+          , IFNULL (brnacc, '')    
+          , IFNULL(LEFT(brnacc,4),'')
+          , IFNULL(RIGHT(brnacc,9),'')
+          , IFNULL (agency_cust_grp_id, '')
+          , IFNULL (agency_id, '')
+          , IFNULL (agency_group, '')
+          , IFNULL (id_flag, '')
+          , IFNULL (ean_code, '')    
+          , IFNULL (product_code, '')    
+          , IFNULL (daily_allocation, '')
+          , 'N'
+          , IFNULL (monthly_allocation, '')
+          , IFNULL (deletion_flag, '')
+          , line_no
+          , load_date
+          , processed_flag
+          , IFNULL (processed_date, '')
+          , original_file_name
+          , reject_code
+          , reject_reason
+          , ''
+   FROM     agency_allocations_rejects
+   WHERE    processed_flag     =  0
+   AND      agency_supplier    = :lv_agency_supplier
+   AND      original_file_name = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 390);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+
+   IF lv_process_allocations = 1
+   THEN
+      /*************************************************************************/
+      /* Set day_enable field to Y if there is a daily allocation              */
+      /*************************************************************************/
+      UPDATE :sessiontable1
+      SET     day_enable        = 'Y'
+      WHERE   daily_allocation != '';
+   
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 400);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      logmess = 'Number of day-enable rows set to Y: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg(); 
+
+      UPDATE :sessiontable1  a
+      FROM   :sessiontable6  b
+      SET     custgroup_no = b.custgroup_no
+      WHERE   a.brn        = b.branch
+      AND     a.acc        = b.account_no;
+   
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 410);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      logmess = 'Number of custgroup_no ' + '(' + 'C' + ')' + ' rows updated: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg(); 
+
+
+      /****************************************************************************/
+      /* Update custgroup_no for managed groups except those rejected by Masai
+      /****************************************************************************/
+      UPDATE :sessiontable1
+      SET     custgroup_no = INT2(IFNULL(agency_group,0))
+      WHERE   id_flag      = 'M'
+      AND     reject_code !=  17;
+   
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 415);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      logmess = 'Number of custgroup_no ' + '(' + 'M' + ')' + ' rows updated: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg(); 
+
+
+      UPDATE :sessiontable1  a
+      FROM   :sessiontable6  b
+      SET     custtype_no  = b.custype_no
+      WHERE   a.brn        = b.branch
+      AND     a.acc        = b.account_no;
+   
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 420);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      logmess = 'Number of custtype_no rows updated: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg(); 
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable1();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_sessiontable4() =
+{ 
+   IIint = CALLPROC drop_session_table (sessiontable4);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   DECLARE GLOBAL TEMPORARY TABLE :sessiontable4 AS
+   SELECT 
+   DISTINCT product_code, brn, acc
+   FROM    :sessiontable1
+   WHERE    product_code != ''
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 425);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable4();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_update_validation1() =
+{
+   UPDATE  :sessiontable1     s
+   SET      reject_code    =  40
+          , reject_reason  = 'ING-Agency ID Invalid Single'
+          , processed_date =  DATE('now')
+   WHERE    reject_code    =  0
+   AND      id_flag        = 'C'
+   AND NOT EXISTS (SELECT  *
+                   FROM    saccts_supplier_acctno  a
+                   WHERE   sequence_no          = :lv_sequence_no
+                   AND     s.agency_id          =  a.supplier_account_no);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 450);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_rej_agency_id1 = IIrowcount;
+
+   lv_errno = CALLPROC lp_create_worktable1();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_update_validation2() =
+{
+   UPDATE  :sessiontable1     s
+   SET      reject_code    =  41
+          , reject_reason  = 'ING-EAN Code 1 Not Found'
+          , processed_date =  DATE('now')
+   WHERE    reject_code    =  0
+   AND NOT EXISTS (SELECT  *
+                   FROM    ean_codes     e
+                   WHERE   e.ean_code =  s.ean_code
+                   AND     seq_no     =  1);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 460);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_rej_ean1 = IIrowcount;
+
+   lv_errno = CALLPROC lp_create_worktable1();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_update_validation3() =
+{
+   UPDATE  :sessiontable1     s
+   SET      reject_code    =  42
+          , reject_reason  = 'ING-EAN Code 2 Not Found'
+          , processed_date =  DATE('now')
+   WHERE    reject_code    =  0
+   AND NOT EXISTS (SELECT  *
+                   FROM    op_products                 op,
+                           ean_codes                   ean,
+                           manufacturer_supplier_codes man
+                    WHERE  ean.ean_code             =  s.ean_code
+                    AND    ean.seq_no               =  1
+                    AND    man.agency_supplier      = :lv_agency_supplier
+                    AND    ean.product_code         =  op.product_code
+                    AND    op.supplier_code         =  man.supplier_code);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 470);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_rej_ean2 = IIrowcount;
+
+   lv_errno = CALLPROC lp_create_worktable1();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_mark_duplicate_recs() =
+{
+   IIint = CALLPROC drop_session_table (sessiontable2);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   DECLARE GLOBAL TEMPORARY TABLE :sessiontable2 AS
+   SELECT   brnacc
+          , agency_cust_grp_id
+          , ean_code 
+          , COUNT(*)      AS cnt
+   FROM    :sessiontable1
+   WHERE    reject_code   = 0
+   GROUP BY brnacc
+          , agency_cust_grp_id
+          , ean_code
+   HAVING   COUNT(*) > 1
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 480);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable2();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   UPDATE     :sessiontable1     s
+   SET         quota_status   = 'D'
+             , reject_code    =  43
+             , reject_reason  = 'ING-Duplicate Allocation'
+             , processed_date =  DATE('now')
+   WHERE       reject_code    =  0
+   AND EXISTS (SELECT *
+               FROM  :sessiontable2          d 
+               WHERE  s.brnacc             = d.brnacc
+               AND    s.agency_cust_grp_id = d.agency_cust_grp_id
+               AND    s.ean_code           = d.ean_code);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 490);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_rej_dupl = IIrowcount;
+
+   lv_errno = CALLPROC lp_create_worktable1();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_update_validation4() =
+{
+   UPDATE  :sessiontable1     s
+   SET      reject_code    =  44
+          , reject_reason  = 'ING-Non-Trading Account'
+          , processed_date =  DATE('now')
+   WHERE    reject_code    =  0
+   AND EXISTS (SELECT  *
+               FROM    sales_accts     a
+               WHERE   pricing_group = 9999
+               AND     due_for_del   = 'Y'
+               AND     s.brnacc      = CONCAT(a.branch,a.account_no));
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 500);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_rej_nontrade = IIrowcount;
+
+   CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+
+   lv_errno = CALLPROC lp_create_worktable1();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_insert_rejects() =
+{
+   INSERT INTO agency_allocations_rejects
+          ( agency_supplier
+          , brnacc
+          , agency_cust_grp_id
+          , agency_id
+          , agency_group
+          , id_flag
+          , ean_code
+          , product_code
+          , daily_allocation
+          , monthly_allocation
+          , deletion_flag
+          , line_no
+          , load_date
+          , processed_flag
+          , processed_date
+          , original_file_name
+          , reject_code
+          , reject_reason
+          )
+   SELECT   agency_supplier
+          , brnacc
+          , agency_cust_grp_id
+          , agency_id
+          , agency_group 
+          , id_flag
+          , ean_code
+          , product_code
+          , daily_allocation
+          , monthly_allocation
+          , deletion_flag
+          , line_no
+          , load_date
+          , processed_flag
+          , DATE('now') 
+          , original_file_name
+          , reject_code
+          , reject_reason
+   FROM    :sessiontable1
+   WHERE    original_file_name = :lv_curr_filename
+   AND      reject_code BETWEEN 40 AND 44;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 510);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   UPDATE agency_allocations_rejects
+   SET    agency_group               = ''
+   WHERE  agency_group               = '0'
+   AND    original_file_name         = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 520);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   DELETE 
+   FROM        agency_allocations              a
+   WHERE       original_file_name           = :lv_curr_filename
+   AND         processed_flag               =  0
+   AND EXISTS (SELECT 1 
+               FROM  :sessiontable1            s
+               WHERE  s.reject_code            BETWEEN 40 AND 44
+               AND    a.agency_cust_grp_id  =  s.agency_cust_grp_id
+               AND    a.product_code        =  s.product_code);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 530);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   SELECT lv_rej_cnt = COUNT(*)
+   FROM   agency_allocations_rejects
+   WHERE  original_file_name = :lv_curr_filename;
+  
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 540);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_ok_cnt = lv_tot_cnt - lv_rej_cnt;
+}
+
+
+PROCEDURE lp_create_sessiontable5() =
+{ 
+   IIint = CALLPROC drop_session_table (sessiontable5);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   DECLARE GLOBAL TEMPORARY TABLE :sessiontable5 AS
+   SELECT *
+   FROM   product_quotas_view p
+   WHERE  quota_type     IN ('A','G')
+   AND    EXISTS (
+   SELECT *
+   FROM  :sessiontable4       s
+   WHERE  s.product_code   =  p.product_code
+   AND    s.brn            =  p.branch
+   AND    s.acc            =  p.account_no)
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 430);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   logmess = 'Create temp table of allocations: ' + VARCHAR(IIrowcount);
+   CALLPROC lp_write_log_msg(); 
+
+   UPDATE :sessiontable5   s5
+   FROM   :sessiontable6   s6
+   SET     custgroup_no  = s6.custgroup_no,
+           custtype_no   = s6.custype_no
+   WHERE   s5.branch     = s6.branch
+   AND     s5.account_no = s6.account_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 440);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable5a();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_set_quota_status_c() =
+{
+   lv_alloc_cnt_c = 0;
+
+   /* (UPDATE)                    */
+   UPDATE :sessiontable1          s
+   FROM   :sessiontable5          q
+   SET     quota_status        = 'U'
+   WHERE   s.deletion_flag     = ''
+   AND     s.reject_code       =  0
+   AND     s.id_flag           = 'C'
+   AND     q.quota_type        = 'A'
+   AND     q.branch            = s.brn
+   AND     q.account_no        = s.acc
+   AND     q.product_code      = s.product_code
+   AND     q.custgroup_no      = s.custgroup_no
+   AND     q.custtype_no       = s.custtype_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 550);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_alloc_cnt_c = IIrowcount;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'Number of Customer UPDATES marked as U: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg();
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable1a();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+
+   /* (UPDATE EXPIRED)            */
+   UPDATE :sessiontable1          s
+   FROM   :sessiontable5          q
+   SET     quota_status        = 'UX'
+   WHERE   s.deletion_flag     = 'X'
+   AND     s.reject_code       =  0
+   AND     s.id_flag           = 'C'
+   AND     q.quota_type        = 'A'
+   AND     q.branch            = s.brn
+   AND     q.account_no        = s.acc
+   AND     q.product_code      = s.product_code
+   AND     q.custgroup_no      = s.custgroup_no
+   AND     q.custtype_no       = s.custtype_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 560);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_alloc_cnt_c = lv_alloc_cnt_c + IIrowcount;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'Number of Customer UPDATES (Expired) marked as UX: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg();
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable1b();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+
+   /* (INSERT)                    */
+   UPDATE :sessiontable1   s
+   SET     quota_status  = 'I'
+   WHERE   reject_code   = 0
+   AND     deletion_flag = ''
+   AND     id_flag       = 'C' 
+   AND NOT EXISTS ( SELECT *
+                    FROM  :sessiontable5         q
+                    WHERE  q.product_code      = s.product_code
+                    AND    q.branch            = s.brn
+                    AND    q.account_no        = s.acc
+                    AND    q.custgroup_no      = s.custgroup_no
+                    AND    q.custtype_no       = s.custtype_no);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 570);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_alloc_cnt_c = lv_alloc_cnt_c + IIrowcount;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'Number of Customer INSERTS marked as I: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg();
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable1c();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+
+   /* (INSERT EXPIRED)            */
+   UPDATE :sessiontable1   s
+   SET     quota_status  = 'IX'
+   WHERE   reject_code   = 0
+   AND     deletion_flag = 'X'
+   AND     id_flag       = 'C' 
+   AND NOT EXISTS ( SELECT *
+                    FROM  :sessiontable5         q
+                    WHERE  q.product_code      = s.product_code
+                    AND    q.branch            = s.brn
+                    AND    q.account_no        = s.acc
+                    AND    q.custgroup_no      = s.custgroup_no
+                    AND    q.custtype_no       = s.custtype_no);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 580);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_alloc_cnt_c = lv_alloc_cnt_c + IIrowcount;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'Number of Customer INSERTS (Expired) marked as IX: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg();
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable1d();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+}
+
+
+PROCEDURE lp_update_quota_c() =
+{
+   UPDATE :sessiontable5         q
+   FROM   :sessiontable1         s
+   SET     start_date          = :lv_start_date_new
+         , end_date            = ''
+         , day_quota           = s.daily_allocation
+         , month_quota         = INT4 (monthly_allocation)
+         , month_enable        = 'Y'
+         , audit_time          = DATE('now')
+         , audit_branch        = TRIM(:gv_branch_id)
+         , audit_user          = UPPER(:lv_agency_name) + '-UPD'
+   WHERE  s.reject_code        =  0
+   AND    s.deletion_flag      = ''
+   AND    s.id_flag            = 'C'
+   AND    q.quota_type         = 'A'
+   AND    q.branch             = s.brn
+   AND    q.account_no         = s.acc
+   AND    q.product_code       = s.product_code
+   AND    q.custgroup_no       = s.custgroup_no
+   AND    q.custtype_no        = s.custtype_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 590);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   
+   logmess = 'Number of Customer Allocation row UPDATES          : ' + VARCHAR(IIrowcount);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable5b();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_update_exp_quota_c() =
+{
+   UPDATE :sessiontable5         q
+   FROM   :sessiontable1         s
+   SET     end_date            = :lv_end_date_new
+         , day_quota           = s.daily_allocation
+         , month_quota         = INT4 (monthly_allocation)
+         , month_enable        = 'N'
+         , audit_time          = DATE('now')
+         , audit_branch        = TRIM(:gv_branch_id)
+         , audit_user          = UPPER(:lv_agency_name) + '-UPD'
+   WHERE   s.reject_code       =  0
+   AND     s.deletion_flag     = 'X'
+   AND     s.id_flag           = 'C'
+   AND     q.quota_type        = 'A'
+   AND     q.branch            = s.brn
+   AND     q.account_no        = s.acc
+   AND     q.product_code      = s.product_code
+   AND     q.custgroup_no      = s.custgroup_no
+   AND     q.custtype_no       = s.custtype_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 600);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   logmess = 'Number of Customer Allocation row UPDATES ' + '(' + 'Expired' + ')' + ': ' + VARCHAR(IIrowcount);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable5c();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_insert_quota_c() =
+{
+   INSERT INTO :sessiontable5
+        ( product_code,
+          quota_type,
+          start_date,
+          end_date,
+          custtype_no,
+          custgroup_no,
+          branch,
+          account_no,
+          quota_record_type,
+          day_enable,
+          week_enable,
+          month_enable,
+          day_quota,
+          day_adjustment,
+          week_quota,
+          week_adjustment,
+          month_quota,
+          month_adjustment,
+          week_start_day,
+          audit_branch,
+          audit_user,
+          audit_time
+        )
+   SELECT product_code
+        , quota_type           = 'A'
+        , start_date           = :lv_start_date_new
+        , end_date             = ''
+        , custtype_no          = INT2(IFNULL(custtype_no,0))
+        , custgroup_no         = INT2(IFNULL(custgroup_no,0))
+        , branch               = IFNULL((brn),'')
+        , account_no           = IFNULL((acc),'')
+        , quota_record_type    = '2'
+        , day_enable
+        , week_enable          = 'N'
+        , month_enable         = 'Y'
+        , day_quota            = INT4(IFNULL(daily_allocation,0))
+        , day_adjustment       = 0
+        , week_quota           = 0
+        , week_adjustment      = 0
+        , month_quota          = INT4(monthly_allocation)
+        , month_adjustment     = 0
+        , week_start_day       = ''
+        , audit_branch         = TRIM(:gv_branch_id)
+        , audit_user           = UPPER(:lv_agency_name) + '-INS'
+        , audit_time           = DATE('now')
+   FROM  :sessiontable1
+   WHERE  reject_code          =  0
+   AND    deletion_flag        = ''
+   AND    daily_allocation     = ''
+   AND    quota_status         = 'I';
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 610);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   logmess = 'Number of Customer Allocation row INSERTS          : ' + VARCHAR(IIrowcount);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable5d();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_insert_exp_quota_c() =
+{
+   INSERT INTO :sessiontable5
+        ( product_code,
+          quota_type,
+          start_date,
+          end_date,
+          custtype_no,
+          custgroup_no,
+          branch,
+          account_no,
+          quota_record_type,
+          day_enable,
+          week_enable,
+          month_enable,
+          day_quota,
+          day_adjustment,
+          week_quota,
+          week_adjustment,
+          month_quota,
+          month_adjustment,
+          week_start_day,
+          audit_branch,
+          audit_user,
+          audit_time
+        )
+   SELECT product_code
+        , quota_type           = 'A'
+        , start_date           = :lv_end_date_new
+        , end_date             = :lv_end_date_new
+        , custtype_no          = INT2(IFNULL(custtype_no,0))
+        , custgroup_no         = INT2(IFNULL(custgroup_no,0))
+        , branch               = IFNULL((brn),'')
+        , account_no           = IFNULL((acc),'')
+        , quota_record_type    = '2'
+        , day_enable
+        , week_enable          = 'N'
+        , month_enable         = 'N'
+        , day_quota            = INT4(IFNULL(daily_allocation,0))
+        , day_adjustment       = 0
+        , week_quota           = 0
+        , week_adjustment      = 0
+        , month_quota          = INT4(monthly_allocation)
+        , month_adjustment     = 0
+        , week_start_day       = ''
+        , audit_branch         = TRIM(:gv_branch_id)
+        , audit_user           = UPPER(:lv_agency_name) + '-INS'
+        , audit_time           = DATE('now')
+   FROM  :sessiontable1
+   WHERE  reject_code          = 0
+   AND    deletion_flag        = 'X'
+   AND    daily_allocation     =  ''
+   AND    quota_status         = 'IX';
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 620);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   logmess = 'Number of Customer Allocation row INSERTS ' + '(' + 'Expired' + ')' + ': ' + VARCHAR(IIrowcount);
+   CALLPROC lp_write_log_msg();
+
+   CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+
+   lv_errno = CALLPROC lp_create_worktable5e();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_refresh_quotas_c(
+) =
+DECLARE
+   lv_branch  = VARCHAR(4) NOT NULL;
+   tot_c_cnt  = INTEGER(4) NOT NULL;
+{
+   lv_errno = CALLPROC lp_create_worktable4();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable5f();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_alloc_cnt_c > 0
+   THEN
+
+      tot_c_cnt = 0;
+
+      /* DELETES */
+      loop_cnt = 1;
+
+      WHILE loop_cnt <= branch_cnt
+      DO
+         lv_branch = TRIM(:branch_array[loop_cnt].c4_var);
+
+         DELETE
+         FROM   product_quotas     p
+         WHERE  start_date     >= '01/12/2017'
+         AND   (end_date       >  DATE('today')
+         OR     end_date        = '')
+         AND    branch          = :lv_branch
+         AND    quota_type      = 'A'
+         AND    EXISTS (
+         SELECT *
+         FROM  :sessiontable4      s
+         WHERE  s.product_code  =  p.product_code
+         AND    s.brn           =  p.branch
+         AND    s.acc           =  p.account_no);
+      
+         ret_code = CALLPROC lp_check_ingres_error(proc_no = 630);
+         IF ret_code != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+   
+         logmess = 'Number of ' + TRIM(:lv_branch) + ' Customer Allocations Deleted        : ' + VARCHAR(IIrowcount);
+         CALLPROC lp_write_log_msg();
+
+         tot_c_cnt = tot_c_cnt + IIrowcount;
+
+         loop_cnt  = loop_cnt + 1;
+
+      ENDWHILE;
+   
+      logmess = 'Number of Customer Allocations Deleted ' + '(' + 'Total' + ')' + '     : ' + VARCHAR(tot_c_cnt);
+      CALLPROC lp_write_log_msg();
+   
+      CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile);  
+
+      tot_c_cnt = 0;
+
+      /* INSERTS */
+      loop_cnt = 1;
+
+      WHILE loop_cnt <= branch_cnt
+      DO
+         lv_branch = TRIM(:branch_array[loop_cnt].c4_var);
+
+         INSERT INTO product_quotas
+         SELECT *
+         FROM  :sessiontable5
+         WHERE  branch        = :lv_branch
+         AND    quota_type    = 'A';
+   
+         ret_code = CALLPROC lp_check_ingres_error(proc_no = 640);
+         IF ret_code != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+
+         logmess = 'Number of ' + TRIM(:lv_branch) + ' Customer Allocations Inserted       : ' + VARCHAR(IIrowcount);
+         CALLPROC lp_write_log_msg();
+
+         tot_c_cnt = tot_c_cnt + IIrowcount;
+
+         loop_cnt  = loop_cnt + 1;
+
+      ENDWHILE;
+
+      logmess = 'Number of Customer Allocations Inserted ' + '(' + 'Total' + ')' + '    : ' + VARCHAR(tot_c_cnt);
+      CALLPROC lp_write_log_msg();
+
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable5g();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_set_quota_status_m() =
+{
+   lv_alloc_cnt_m = 0;
+
+   /* (UPDATE)                    */
+   UPDATE :sessiontable1          s
+   FROM   :sessiontable5          q
+   SET     quota_status        = 'U'
+   WHERE   s.deletion_flag     = ''
+   AND     s.reject_code       =  0
+   AND     s.id_flag           = 'M'
+   AND     q.quota_type        = 'G'
+   AND     q.branch            = s.brn
+   AND     q.account_no        = s.acc
+   AND     q.product_code      = s.product_code
+   AND     q.custgroup_no      = s.custgroup_no
+   AND     q.custtype_no       = s.custtype_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 650);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_alloc_cnt_m  = IIrowcount;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'Number of Managed UPDATES marked as U: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg();
+   ENDIF;
+
+   /* (UPDATE EXPIRED)            */
+   UPDATE :sessiontable1          s
+   FROM   :sessiontable5          q
+   SET     quota_status        = 'UX'
+   WHERE   s.deletion_flag     = 'X'
+   AND     s.reject_code       =  0
+   AND     s.id_flag           = 'M'
+   AND     q.quota_type        = 'G'
+   AND     q.branch            = s.brn
+   AND     q.account_no        = s.acc
+   AND     q.product_code      = s.product_code
+   AND     q.custgroup_no      = s.custgroup_no
+   AND     q.custtype_no       = s.custtype_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 660);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_alloc_cnt_m  = lv_alloc_cnt_m + IIrowcount;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'Number of Managed UPDATES (Expired) marked as UX: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg();
+   ENDIF;
+
+   /* (INSERT)                    */
+   UPDATE :sessiontable1   s
+   FROM   :sessiontable5   q
+   SET     quota_status  = 'I'
+   WHERE   reject_code   = 0
+   AND     deletion_flag = ''
+   AND     id_flag       = 'M' 
+   AND NOT EXISTS ( SELECT *
+                    FROM  :sessiontable5         q
+                    WHERE  q.product_code      = s.product_code
+                    AND    q.branch            = s.brn
+                    AND    q.account_no        = s.acc
+                    AND    q.custgroup_no      = s.custgroup_no
+                    AND    q.custtype_no       = s.custtype_no);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 670);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_alloc_cnt_m  = lv_alloc_cnt_m + IIrowcount;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'Number of Managed INSERTS marked as I: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg();
+   ENDIF;
+
+   /* (INSERT EXPIRED)            */
+   UPDATE :sessiontable1   s
+   FROM   :sessiontable5   q
+   SET     quota_status  = 'IX'
+   WHERE   reject_code   = 0
+   AND     deletion_flag = 'X'
+   AND     id_flag       = 'M' 
+   AND NOT EXISTS ( SELECT *
+                    FROM  :sessiontable5         q
+                    WHERE  q.product_code      = s.product_code
+                    AND    q.branch            = s.brn
+                    AND    q.account_no        = s.acc
+                    AND    q.custgroup_no      = s.custgroup_no
+                    AND    q.custtype_no       = s.custtype_no);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 680);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_alloc_cnt_m  = lv_alloc_cnt_m + IIrowcount;
+
+   IF lv_debug_flag > 1 THEN
+      logmess = 'Number of Managed INSERTS (Expired) marked as IX: ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg();
+   ENDIF;
+
+   CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+
+   lv_errno = CALLPROC lp_create_worktable1();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_update_quota_m() =
+{
+   UPDATE :sessiontable5         q
+   FROM   :sessiontable1         s
+   SET     start_date          = :lv_start_date_new
+         , end_date            = ''
+         , day_quota           = s.daily_allocation
+         , month_quota         = INT4 (monthly_allocation)
+         , month_enable        = 'Y'
+         , audit_time          = DATE('now')
+         , audit_branch        = TRIM(:gv_branch_id)
+         , audit_user          = UPPER(:lv_agency_name) + '-UPD'
+   WHERE   s.reject_code       =  0
+   AND     s.deletion_flag     = ''
+   AND     s.id_flag           = 'M'
+   AND     q.quota_type        = 'G'
+   AND     q.branch            = s.brn
+   AND     q.account_no        = s.acc
+   AND     q.product_code      = s.product_code
+   AND     q.custgroup_no      = s.custgroup_no
+   AND     q.custtype_no       = s.custtype_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 690);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   logmess = 'Number of Managed Allocation row UPDATES           : ' + VARCHAR(IIrowcount);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable5();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_update_exp_quota_m() =
+{
+   UPDATE :sessiontable5         q
+   FROM   :sessiontable1         s
+   SET     end_date            = :lv_end_date_new
+         , day_quota           = s.daily_allocation
+         , month_quota         = INT4 (monthly_allocation)
+         , month_enable        = 'N'
+         , audit_time          = DATE('now')
+         , audit_branch        = TRIM(:gv_branch_id)
+         , audit_user          = UPPER(:lv_agency_name) + '-UPD'
+   WHERE   s.reject_code       =  0
+   AND     s.deletion_flag     = 'X'
+   AND     s.id_flag           = 'M'
+   AND     q.quota_type        = 'G'
+   AND     q.branch            = s.brn
+   AND     q.account_no        = s.acc
+   AND     q.product_code      = s.product_code
+   AND     q.custgroup_no      = s.custgroup_no
+   AND     q.custtype_no       = s.custtype_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 700);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   logmess = 'Number of Managed Allocation row UPDATES (Expired) : ' + VARCHAR(IIrowcount);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable5();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_insert_quota_m() =
+{
+   INSERT INTO :sessiontable5
+        ( product_code,
+          quota_type,
+          start_date,
+          end_date,
+          custtype_no,
+          custgroup_no,
+          branch,
+          account_no,
+          quota_record_type,
+          day_enable,
+          week_enable,
+          month_enable,
+          day_quota,
+          day_adjustment,
+          week_quota,
+          week_adjustment,
+          month_quota,
+          month_adjustment,
+          week_start_day,
+          audit_branch,
+          audit_user,
+          audit_time
+        )
+   SELECT product_code
+        , quota_type           = 'G'
+        , start_date           = :lv_start_date_new
+        , end_date             = ''
+        , custtype_no          = INT2(IFNULL(custtype_no,0))
+        , custgroup_no         = INT2(IFNULL(agency_group,0))
+        , branch               = IFNULL((brn),'')
+        , account_no           = IFNULL((acc),'')
+        , quota_record_type    = '2'
+        , day_enable
+        , week_enable          = 'N'
+        , month_enable         = 'Y'
+        , day_quota            = INT4(IFNULL(daily_allocation,0))
+        , day_adjustment       = 0
+        , week_quota           = 0
+        , week_adjustment      = 0
+        , month_quota          = INT4(monthly_allocation)
+        , month_adjustment     = 0
+        , week_start_day       = ''
+        , audit_branch         = TRIM(:gv_branch_id)
+        , audit_user           = UPPER(:lv_agency_name) + '-INS'
+        , audit_time           = DATE('now')
+   FROM  :sessiontable1
+   WHERE  reject_code          =  0
+   AND    deletion_flag        = ''
+   AND    id_flag              = 'M'
+   AND    quota_status         = 'I';
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 710);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   logmess = 'Number of Managed Allocation row INSERTS           : ' + VARCHAR(IIrowcount);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable5();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_insert_exp_quota_m() =
+{
+   INSERT INTO :sessiontable5
+        ( product_code,
+          quota_type,
+          start_date,
+          end_date,
+          custtype_no,
+          custgroup_no,
+          branch,
+          account_no,
+          quota_record_type,
+          day_enable,
+          week_enable,
+          month_enable,
+          day_quota,
+          day_adjustment,
+          week_quota,
+          week_adjustment,
+          month_quota,
+          month_adjustment,
+          week_start_day,
+          audit_branch,
+          audit_user,
+          audit_time
+        )
+   SELECT product_code
+        , quota_type           = 'G'
+        , start_date           = :lv_end_date_new
+        , end_date             = :lv_end_date_new
+        , custtype_no          = INT2(IFNULL(custtype_no,0))
+        , custgroup_no         = INT2(IFNULL(agency_group,0))
+        , branch               = IFNULL((brn),'')
+        , account_no           = IFNULL((acc),'')
+        , quota_record_type    = '2'
+        , day_enable
+        , week_enable          = 'N'
+        , month_enable         = 'N'
+        , day_quota            = INT4(IFNULL(daily_allocation,0))
+        , day_adjustment       = 0
+        , week_quota           = 0
+        , week_adjustment      = 0
+        , month_quota          = INT4(monthly_allocation)
+        , month_adjustment     = 0
+        , week_start_day       = ''
+        , audit_branch         = TRIM(:gv_branch_id)
+        , audit_user           = UPPER(:lv_agency_name) + '-INS'
+        , audit_time           = DATE('now')
+   FROM  :sessiontable1
+   WHERE  reject_code          =  0
+   AND    deletion_flag        = 'X'
+   AND    id_flag              = 'M'
+   AND    quota_status         = 'IX';
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 720);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   logmess = 'Number of Managed Allocation row INSERTS (Expired) : ' + VARCHAR(IIrowcount);
+   CALLPROC lp_write_log_msg();
+
+   lv_errno = CALLPROC lp_create_worktable5();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_refresh_quotas_m() =
+{
+   lv_errno = CALLPROC lp_create_worktable5();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_alloc_cnt_m > 0 
+   THEN
+      DELETE
+      FROM   product_quotas     p
+      WHERE  start_date     >= '01/12/2017'
+      AND   (end_date       >  DATE('today')
+      OR     end_date        = '')
+      AND    quota_type      = 'G'
+      AND    EXISTS (
+      SELECT *
+      FROM  :sessiontable4      s
+      WHERE  s.product_code  =  p.product_code
+      AND    s.brn           =  p.branch
+      AND    s.acc           =  p.account_no);
+   
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 730);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile);  
+
+      logmess = 'Number of Managed Allocations Deleted ' + '(' + 'Total' + ')' + '      : ' + VARCHAR(IIrowcount);
+      CALLPROC lp_write_log_msg();
+   
+      INSERT INTO product_quotas
+      SELECT *
+      FROM  :sessiontable5
+      WHERE  quota_type    = 'G';
+  
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 740);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      logmess = 'Number of Managed Allocations Inserted ' + '(' + 'Total' + ')' + '     : ' + VARCHAR(IIrowcount);                
+      CALLPROC lp_write_log_msg();
+   
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_err_file() =
+{
+   CALL SYSTEM '> ' + :gc_temp + TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.err1';
+}
+
+
+PROCEDURE lp_create_rej_file() =
+{
+   CALL SYSTEM 'touch ' + :gc_temp + TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.rej';
+}
+
+
+PROCEDURE lp_check_ingres_error (
+   proc_no      = INTEGER4      NOT NULL;
+)=
+DECLARE
+   lv_errorno   = INTEGER4      NOT NULL;
+   lv_errortext = VARCHAR (256) NOT NULL;
+   lv_rowcount  = INTEGER4      NOT NULL;
+{
+   INQUIRE_INGRES (lv_errorno = ERRORNO, lv_errortext = ERRORTEXT, lv_rowcount  = ROWCOUNT);
+
+   IF lv_errorno != 0 
+   THEN
+      ROLLBACK;
+      logmess = 'INGRES ERROR ' + trim(char(proc_no)) + ' - ERROR NO: ' + trim(char(lv_errorno)) + ' ERROR TEXT: ' + lv_errortext;
+      CALLPROC lp_write_log_msg();
+      CALLPROC lp_create_err_file();
+      CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(logmess) + '" >> ' + :gc_temp + TRIM(lv_agency_file) + '.' + TRIM(lv_filename) + '.err1';
+      RETURN gc_fail;
+   ENDIF;
+
+   IIrowcount = lv_rowcount;
+
+   RETURN gc_success;
+};
+
+
+PROCEDURE lp_write_log_msg() =
+{
+   CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(logmess) + '" >> ' + :gc_logs_curr + TRIM(logfile); 
+}
+
+
+PROCEDURE lp_write_out_msg() =
+{
+   CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(logmess) + '" >> ' + :gc_temp + TRIM(outfile); 
+}
+
+
+PROCEDURE lp_create_worktable1() =
+{
+   temp_tabname1 = '_cs_agency_sessiontab1';
+   
+   IIint = CALLPROC drop_session_table (temp_tabname1);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname1 AS
+   SELECT *
+   FROM   :sessiontable1;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 750);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable1a() =
+{  
+   IF lv_debug_flag > 0 THEN
+   temp_tabname1a = '_cs_agency_sessiontab1a';
+
+   IIint = CALLPROC drop_session_table (temp_tabname1a);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname1a AS
+   SELECT *
+   FROM   :sessiontable1;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 900);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable1b() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname1b = '_cs_agency_sessiontab1b';
+
+   IIint = CALLPROC drop_session_table (temp_tabname1b);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname1b AS
+   SELECT *
+   FROM   :sessiontable1;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 910);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable1c() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname1c = '_cs_agency_sessiontab1c';
+
+   IIint = CALLPROC drop_session_table (temp_tabname1c);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname1c AS
+   SELECT *
+   FROM   :sessiontable1;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 920);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable1d() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname1d = '_cs_agency_sessiontab1d';
+
+   IIint = CALLPROC drop_session_table (temp_tabname1d);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname1d AS
+   SELECT *
+   FROM   :sessiontable1;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 930);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable2() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname2 = '_cs_agency_sessiontab2';
+
+   IIint = CALLPROC drop_session_table (temp_tabname2);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname2 AS
+   SELECT *
+   FROM   :sessiontable1
+   WHERE   quota_status = 'D';
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 760);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable3a() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname3a = '_cs_agency_sessiontab3a';
+
+   IIint = CALLPROC drop_session_table (temp_tabname3a);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname3a AS
+   SELECT *
+   FROM   :sessiontable3;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 770);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable3b() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname3b = '_cs_agency_sessiontab3b';
+
+   IIint = CALLPROC drop_session_table (temp_tabname3b);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname3b AS
+   SELECT *
+   FROM   :sessiontable3;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 780);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable4() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname4 = '_cs_agency_sessiontab4';
+
+   IIint = CALLPROC drop_session_table (temp_tabname4);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname4 AS
+   SELECT *
+   FROM   :sessiontable4;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 790);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable5() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname5 = '_cs_agency_sessiontab5';
+
+   IIint = CALLPROC drop_session_table (temp_tabname5);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname5 AS
+   SELECT *
+   FROM   :sessiontable5;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 800);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+
+   /* Archive data for recovery purposes */
+   copy _cs_agency_sessiontab5 () into '/aahdb/archive/daily/current/agency_product_quotas_bak.' + :lv_timestamp;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 810);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable5a() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname5a = '_cs_agency_sessiontab5a';
+
+   IIint = CALLPROC drop_session_table (temp_tabname5a);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname5a AS
+   SELECT *
+   FROM   :sessiontable5;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 940);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable5b() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname5b = '_cs_agency_sessiontab5b';
+
+   IIint = CALLPROC drop_session_table (temp_tabname5b);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname5b AS
+   SELECT *
+   FROM   :sessiontable5;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 950);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable5c() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname5c = '_cs_agency_sessiontab5c';
+
+   IIint = CALLPROC drop_session_table (temp_tabname5c);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname5c AS
+   SELECT *
+   FROM   :sessiontable5;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 960);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable5d() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname5d = '_cs_agency_sessiontab5d';
+
+   IIint = CALLPROC drop_session_table (temp_tabname5d);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname5d AS
+   SELECT *
+   FROM   :sessiontable5;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 970);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable5e() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname5e = '_cs_agency_sessiontab5e';
+
+   IIint = CALLPROC drop_session_table (temp_tabname5e);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname5e AS
+   SELECT *
+   FROM   :sessiontable5;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 980);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable5f() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname5f = '_cs_agency_sessiontab5f';
+
+   IIint = CALLPROC drop_session_table (temp_tabname5f);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname5f AS
+   SELECT *
+   FROM   :sessiontable5;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 990);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable5g() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname5g = '_cs_agency_sessiontab5g';
+
+   IIint = CALLPROC drop_session_table (temp_tabname5g);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname5g AS
+   SELECT *
+   FROM   :sessiontable5;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 995);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable7a() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname7a = '_cs_agency_sessiontab7a';
+
+   IIint = CALLPROC drop_session_table (temp_tabname7a);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname7a AS
+   SELECT *
+   FROM   :sessiontable7;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 820);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable7b() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname7b = '_cs_agency_sessiontab7b';
+
+   IIint = CALLPROC drop_session_table (temp_tabname7b);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname7b AS
+   SELECT *
+   FROM   :sessiontable7;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 830);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable7c() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname7c = '_cs_agency_sessiontab7c';
+
+   IIint = CALLPROC drop_session_table (temp_tabname7c);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname7c AS
+   SELECT *
+   FROM   :sessiontable7;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 840);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable7d() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname7d = '_cs_agency_sessiontab7d';
+
+   IIint = CALLPROC drop_session_table (temp_tabname7d);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname7d AS
+   SELECT *
+   FROM   :sessiontable7;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 850);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable7e() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname7e = '_cs_agency_sessiontab7e';
+
+   IIint = CALLPROC drop_session_table (temp_tabname7e);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname7e AS
+   SELECT *
+   FROM   :sessiontable7;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 855);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable8a() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname8a = '_cs_agency_sessiontab8a';
+
+   IIint = CALLPROC drop_session_table (temp_tabname8a);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname8a AS
+   SELECT *
+   FROM   :sessiontable8;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 860);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable8b() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname8b = '_cs_agency_sessiontab8b';
+
+   IIint = CALLPROC drop_session_table (temp_tabname8b);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname8b AS
+   SELECT *
+   FROM   :sessiontable8;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 865);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable8c() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname8c = '_cs_agency_sessiontab8c';
+
+   IIint = CALLPROC drop_session_table (temp_tabname8c);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname8c AS
+   SELECT *
+   FROM   :sessiontable8;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 870);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable9a() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname9a = '_cs_agency_sessiontab9a';
+
+   IIint = CALLPROC drop_session_table (temp_tabname9a);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname9a AS
+   SELECT *
+   FROM   :sessiontable9;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 875);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_worktable9b() =
+{
+   IF lv_debug_flag > 0 THEN
+   temp_tabname9b = '_cs_agency_sessiontab9b';
+
+   IIint = CALLPROC drop_session_table (temp_tabname9b);
+   IF IIint != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname9b AS
+   SELECT *
+   FROM   :sessiontable9;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 880);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+   ENDIF;
+}

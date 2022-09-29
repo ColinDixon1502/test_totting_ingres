@@ -1,0 +1,1566 @@
+/*
+** Inventory Management System CONTROL development using INGRES
+** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+**
+** MODULE NAME:  advertising_invoices.osq
+**
+** PURPOSE:      Invoice screen of Advertising Frames
+**
+** VERSION:      1.0
+**
+** STATUS:       Development
+**
+** AUTHOR:       Dave Dawson  
+**
+** DATE:         18/11/94
+**
+** CHANGE DATE:  08/02/95
+**
+** CHANGES:      Autoskip after each option
+**               Make company number 2 characters
+**               F12 to clear screen then exit if selected again
+**
+**=============================================================================
+** DATE     | INITS | DESCRIPTION
+**----------+-------+----------------------------------------------------------
+** 13/06/06 | CD    | For branch 606R only, allow advertising information
+**          |       | to overlap. Use a sequence number to identify different
+**          |       | adverts where the dates overlap.
+**============================================================================= 
+**           
+** PARAMETERS:   None
+**
+*/
+
+INITIALIZE(
+	   IIoldbranch           = char(4),
+	   IIoldstamp            = char(16),
+	   InsertAmend           = char(1),
+	   IIrowcount            = integer(4)    not null,
+	   IIerrorno             = integer(4)    not null,
+	   hf_errtext            = char(256)     not null,
+	   IIbranch              = char(4),
+	   IIstamp               = char(16),
+	   IIint                 = integer(4),
+	   IIint1                = integer(4),
+	   IIchar                = char(20),
+	   IIchar1               = char(1),
+	   IItype                = char(3),
+	   IIgroup               = char(3),
+	   IImcsstamp            = char(16),
+	   IItstamp              = char(21),
+	   IIretdoc              = char(1),
+	   IIcheck               = char(1),
+	   IIexit                = char(1),
+)=
+	   
+DECLARE
+	   lv_num_rows_dup1      = INTEGER4      NOT NULL WITH DEFAULT;
+	   lv_num_rows_dup2      = INTEGER4      NOT NULL WITH DEFAULT;
+	   lv_num_rows_dup3      = INTEGER4      NOT NULL WITH DEFAULT;
+	   lv_same_start_date    = INTEGER4      NOT NULL WITH DEFAULT;
+	   lv_prompt             = VARCHAR(200)  NOT NULL WITH DEFAULT;
+	   h_advert              = type of table advert_messages;
+	   v_get_mess            = PROCEDURE RETURNING INTEGER; 
+	   v_sdate               = PROCEDURE RETURNING INTEGER;
+	   v_edate               = PROCEDURE RETURNING INTEGER;
+	   v_branch              = PROCEDURE RETURNING INTEGER;
+	   v_company             = PROCEDURE RETURNING INTEGER;
+	   v_group               = PROCEDURE RETURNING INTEGER;
+	   v_type                = PROCEDURE RETURNING INTEGER;
+	   v_message             = PROCEDURE RETURNING INTEGER;
+	   v_write_branch        = PROCEDURE RETURNING INTEGER;
+	   v_duplicate1          = PROCEDURE RETURNING INTEGER;
+	   v_duplicate2          = PROCEDURE RETURNING INTEGER;
+	   v_duplicate3          = PROCEDURE RETURNING INTEGER;
+	   v_duplicate4          = PROCEDURE RETURNING INTEGER;
+	   show_branch           = PROCEDURE RETURNING INTEGER;
+	   show_company          = PROCEDURE RETURNING INTEGER;
+	   show_group            = PROCEDURE RETURNING INTEGER;
+	   show_type             = PROCEDURE RETURNING INTEGER;
+	   remtp_check           = PROCEDURE RETURNING INTEGER;
+	   form_clear            = PROCEDURE RETURNING INTEGER; 
+	   v_check_for_duplicate = PROCEDURE RETURNING INTEGER;
+	   mcs_res               = integer;
+     timestamp             = DATE;
+{
+	   /*
+	   ** Set up global variables for testing purposes.
+	   */  
+	   IF gv_user_id = ''
+	      AND gv_branch_id = '' THEN
+	      gv_user_id = 'cdx';
+	      gv_branch_id = '606R';
+	   ENDIF;
+	   
+	   SET_FORMS FRS(TIMEOUT = :gc_timeout);
+	   SET_FORMS FRS(ACTIVATE(previousfield) = 1);
+
+	   IIint = v_get_mess(); 
+	   
+	   screen_date = 'now';
+
+	   /*
+	   ** The advert_seq field is only shown where the operator's
+	   ** branch is 606R.
+	   */ 
+	   IF gv_branch_id = '606R' THEN
+	      SET_FORMS FIELD '' (INVISIBLE(advert_seq)=0);
+	   ELSE
+	      SET_FORMS FIELD '' (INVISIBLE(advert_seq)=1);
+	   ENDIF;
+}             
+		  
+ON TIMEOUT = 
+{
+    CALLFRAME timeout_popup() 
+}
+
+AFTER FIELD 'start_date' =
+{           
+	   
+	   IF InsertAmend = 'I' THEN
+	   
+	      IIint = CALLPROC v_sdate;
+	
+	      IF IIint !=0 THEN 
+		 REDISPLAY;
+		 RESUME;
+	      ENDIF;
+	   
+	   ENDIF;
+	   
+	   IIexit = 'N';
+		      
+	   RESUME NEXT;
+}
+
+AFTER FIELD 'end_date' =
+{           
+	   IIint = CALLPROC v_edate;
+	   
+	   IF IIint !=0 THEN 
+	      REDISPLAY;
+	      RESUME;
+	   ENDIF;
+	   
+	   RESUME NEXT;
+}
+
+AFTER FIELD 'branch' =
+{
+	   IIint = CALLPROC v_branch;
+	   
+	   IF IIint = 0 THEN
+	      RESUME NEXT;
+	   ENDIF;
+	   
+	   IIint = CALLPROC show_branch; 
+	   
+	   IF IIint != 0 THEN
+	      RESUME FIELD branch;
+	   ENDIF;
+	   
+	   REDISPLAY;
+	   
+	   RESUME NEXT;
+}           
+	       
+AFTER FIELD 'company_no' = 
+{
+	  IIint = CALLPROC v_company;  
+	  
+	  IF IIint = 0 THEN 
+	     RESUME NEXT;
+	  ENDIF;
+	  
+	  IIint = CALLPROC show_company;
+	  
+	  REDISPLAY; 
+	  RESUME NEXT;
+}
+
+AFTER FIELD 'cust_type' = 
+{
+	  IIint = CALLPROC v_type;  
+	  
+	  IF IIint = 0 THEN 
+	     RESUME NEXT;
+	  ENDIF;
+	  
+	  IIint = CALLPROC show_type; 
+	  
+	  REDISPLAY; 
+	  RESUME NEXT;
+}
+
+AFTER FIELD 'cust_group' = 
+{
+	  IIint = CALLPROC v_group;  
+
+	  IF IIint = 0 THEN 
+	     RESUME NEXT;
+	  ENDIF;
+	  
+	  IF IIint = 2 THEN 
+	     REDISPLAY;
+	     RESUME FIELD cust_type;
+	  ENDIF;
+
+	  IIint = CALLPROC show_group; 
+	  
+	  REDISPLAY;
+}
+
+'Help', KEY FRSKEY1 =
+{
+    callproc help_proc(SUBJECT = 'Help on Invoice Advertising frame',
+	 file = :gc_help_dir+'advertising_invoices.hlp');
+}
+
+'Choices',KEY FRSKEY10 = 
+{
+	      IIchar = '';
+	      INQUIRE_FORMS FORM(IIchar = FIELD);
+	      
+	      IF IIchar = 'branch' THEN 
+		 IIint = CALLPROC show_branch;
+		 IF IIint != 0 THEN
+		    RESUME FIELD branch;
+		 ELSE
+		    RESUME FIELD cust_type;
+		 ENDIF;
+	      ELSEIF IIchar = 'company_no' THEN
+		 IIint = CALLPROC show_company;
+		 RESUME FIELD branch;
+	      ELSEIF IIchar = 'cust_type' THEN 
+		 IIint = CALLPROC show_type;
+		 RESUME FIELD cust_group;
+	      ELSEIF IIchar = 'cust_group' THEN
+		 IIint = CALLPROC show_group;
+		 RESUME FIELD advert_message;
+	      ELSE                      
+		 MESSAGE 'No choices available with this field' 
+		 WITH STYLE = POPUP;
+		 RESUME; 
+	      ENDIF;
+		    
+	      IF IIint !=0 THEN 
+		 REDISPLAY;
+		 RESUME;
+	      ENDIF;
+	 
+	      RESUME NEXT;
+	      
+	      COMMIT;
+}
+
+'SendAdvert',KEY FRSKEY4 =
+{
+      IIint = CALLPROC v_sdate;
+	  IF IIint !=0 THEN 
+	     REDISPLAY;
+	     RESUME FIELD start_date;
+	  ENDIF;
+
+      IIint = CALLPROC v_edate;
+	  IF IIint !=0 THEN 
+	     REDISPLAY;      
+	     RESUME FIELD end_date;
+	  ENDIF;
+		
+      IIint = CALLPROC v_branch; 
+	  IF IIint !=0 THEN 
+	     REDISPLAY;
+	     RESUME FIELD branch;
+	  ENDIF;
+	  
+      IIint = CALLPROC v_company;
+	  IF IIint !=0 THEN 
+	     REDISPLAY;
+	     RESUME FIELD company_no;
+	  ENDIF;
+ 
+      IIint = CALLPROC v_type;
+	  IF IIint !=0 THEN 
+	     REDISPLAY;
+	     RESUME FIELD cust_type;
+	  ENDIF;
+	 
+      IF :cust_type = 5 THEN
+	 IIretdoc = 'y';
+      ELSE
+	 IIretdoc = 'n';
+      ENDIF;
+
+      IIint = CALLPROC v_group;
+	  IF IIint !=0 THEN 
+	     REDISPLAY;
+	     RESUME FIELD cust_group;
+	  ENDIF;
+	  
+      Iiint = CALLPROC v_type;
+	  IF IIint !=0 THEN 
+	     REDISPLAY;
+	     RESUME FIELD cust_type;
+	  ENDIF;
+		   
+      IIint = CALLPROC v_message;  
+	  IF IIint !=0 THEN
+	     REDISPLAY;
+	     RESUME;
+	  ENDIF;
+
+      /*
+      ** If the input cust_type is 5, then checks need to be 
+      ** made and records created for cust types 1 and 3
+      */ 
+      IF IIretdoc = 'y' THEN 
+         cust_type = 1;
+      ENDIF;
+
+      IF :branch = '606R' THEN
+      
+         IIint = CALLPROC v_check_for_duplicate;
+         IF IIint = -2 THEN
+            RESUME FIELD start_date;
+         ENDIF;
+         IF IIint != 0 THEN
+            IIint1 = CALLFRAME advertising_popup(IIbranch= BYREF(:IIbranch),
+                                                 IIstamp=BYREF(:IIstamp));
+            REDISPLAY;
+            RESUME;
+         ENDIF;
+      ELSE
+         advert_seq = 0;
+         IIint = CALLPROC v_duplicate1;
+         IF IIint !=0 THEN
+            IIint1 = CALLFRAME advertising_popup(IIbranch=BYREF(:IIbranch),
+                                                 IIstamp=BYREF(:IIstamp));
+            REDISPLAY;
+            RESUME;
+         ENDIF;
+  
+         IF :branch != 'ALL'  AND :branch != '103G' AND
+            :branch != '401F' AND :branch != '903Y' THEN
+	   
+            IIint = CALLPROC v_duplicate2;
+            IF IIint !=0 THEN
+               IIint1 = CALLFRAME advertising_popup(IIbranch=BYREF(:IIbranch),
+                                                    IIstamp=BYREF(:IIstamp));
+               REDISPLAY;
+               RESUME;
+            ENDIF;
+      
+         ENDIF;    
+  
+         IF :branch = 'ALL' THEN 
+            IIint = CALLPROC v_duplicate3;
+ 
+            IF IIint !=0 THEN
+               IIint1 = CALLFRAME advertising_popup(IIbranch=BYREF(:IIbranch),
+                                                    IIstamp=BYREF(:IIstamp));
+               REDISPLAY;
+               RESUME;
+            ENDIF;
+         ENDIF;
+      ENDIF;
+
+      IIint = CALLPROC v_write_branch;
+      IF IIint !=0 THEN
+         REDISPLAY;
+         RESUME;
+      ENDIF;
+   
+      IF IIretdoc = 'y' THEN
+         SLEEP(2);
+         cust_type = 3;
+		   
+         IF :branch = '606R' THEN
+      
+            IIint = CALLPROC v_check_for_duplicate;
+            IF IIint = -2 THEN
+               RESUME FIELD start_date;
+            ENDIF;
+            IF IIint != 0 THEN
+               IIint1 = CALLFRAME advertising_popup(IIbranch= BYREF(:IIbranch),
+                                                    IIstamp=BYREF(:IIstamp));
+               REDISPLAY;
+               RESUME;
+            ENDIF; 
+         ELSE 
+            advert_seq = 0;
+            IIint = CALLPROC v_duplicate1;
+            IF IIint !=0 THEN
+               IIint1 = CALLFRAME advertising_popup(IIbranch=BYREF(:IIbranch),
+                                                    IIstamp=BYREF(:IIstamp));
+               REDISPLAY;
+               RESUME;
+            ENDIF;
+
+            IF :branch != 'ALL'  AND :branch != '103G' AND
+               :branch != '401F' AND :branch != '903Y' THEN
+   
+               IIint = CALLPROC v_duplicate2;
+               IF IIint !=0 THEN
+                  IIint1 = CALLFRAME advertising_popup(IIbranch=BYREF(:IIbranch),
+                                                       IIstamp=BYREF(:IIstamp));
+                  REDISPLAY;
+                  RESUME;
+               ENDIF;
+      
+            ENDIF;    
+  
+            IF :branch = 'ALL' THEN 
+               IIint = CALLPROC v_duplicate3;
+  
+               IF IIint !=0 THEN
+                  IIint1 = CALLFRAME advertising_popup(IIbranch=BYREF(:IIbranch),
+                                                       IIstamp=BYREF(:IIstamp)); 
+                  REDISPLAY;
+                  RESUME;
+               ENDIF;
+            ENDIF;
+         ENDIF;
+
+         IIint = CALLPROC v_write_branch;
+         IF IIint !=0 THEN
+            REDISPLAY;
+            RESUME;
+         ENDIF;
+
+         cust_type = 5;
+
+      ENDIF;          
+	  
+      MESSAGE :IItstamp + '     ADVERT WRITTEN SUCCESSFULLY  ' 
+         WITH STYLE = POPUP;
+      REDISPLAY;
+ 
+      RESUME FIELD start_date;
+  
+      screen_date = 'now';
+}          
+
+'End', key frskey3 = 
+{
+       IF InsertAmend = 'A' THEN 
+	  RETURN;
+       ENDIF;
+       
+       IF ( start_date IS NOT NULL ) 
+	  AND ( start_date !='' ) THEN
+	  IIexit = 'N';
+       ENDIF;
+       
+       IF IIexit = 'Y' THEN
+	  RETURN;
+       ELSE 
+	  IIint = CALLPROC form_clear;
+	  RESUME FIELD start_date;
+       ENDIF; 
+}
+
+PROCEDURE v_sdate()= 
+{         
+	  IF ( start_date = '' ) OR ( start_date IS NULL ) THEN
+	     start_date = DATE('TODAY');
+	     REDISPLAY;
+	     RETURN 0;
+	  ENDIF;
+
+	  IF :start_date < DATE('TODAY') THEN
+	     MESSAGE 'Start Date must be today or greater !' 
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+	  
+	  IF interval('YEAR',:start_date - DATE('TODAY')) > 1 THEN
+	     MESSAGE 'Start Date must be less than 1 year from today' 
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+
+	  RETURN 0;
+};        
+      
+PROCEDURE v_edate()= 
+{         
+	  IF end_date = '' THEN
+	     MESSAGE 'End Date is mandatory' 
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+	  
+	  IF end_date < start_date THEN
+	     MESSAGE 'End date must be greater than Start Date' 
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+	 
+	  IF end_date = start_date THEN
+	     MESSAGE 'End date must be greater than Start Date' 
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+	  
+	  IF interval('YEAR',:end_date - DATE('TODAY')) > 1 THEN
+	     MESSAGE 'End Date must be less than 1 year from today' 
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+
+	  RETURN 0;
+};              
+	     
+PROCEDURE v_branch()=
+{
+	  IF branch = '' THEN 
+	     branch = 'ALL';
+	  ENDIF;
+		     
+	  IF :branch = 'ALL' THEN
+	     branch_name = 'All Except 103G 401F and 903Y';
+	     RETURN 0;
+	  ENDIF;
+		    
+	  SELECT branch = branch_id,
+		 branch_name = name 
+	    FROM branch
+	   WHERE branch_id = :branch;
+	   
+	   INQUIRE_INGRES (IIerrorno = ERRORNO,
+			   hf_errtext = ERRORTEXT,
+			   IIrowcount = ROWCOUNT);
+		      
+	   IF IIerrorno !=0 THEN
+	      ROLLBACK;
+	      MESSAGE '-01- INGRES error in select branch' 
+	      WITH STYLE = POPUP;
+	      RETURN 1;
+	   ENDIF;
+	   
+	   COMMIT;
+	  
+	   IF IIrowcount < 1 THEN
+	      MESSAGE 'Invalid Branch Code Entered' 
+	      WITH STYLE = POPUP;
+	      RETURN 1;
+	   ENDIF;
+	   
+	   IIint = CALLPROC remtp_check;
+	   
+	   IF IIint != 0 THEN
+	      RETURN 1;
+	   ENDIF;
+	   
+	   RETURN 0;
+};
+	   
+PROCEDURE v_company()=
+{
+	  IF :company_no = '' THEN 
+	     RETURN 1; 
+	  ENDIF;
+	  
+	  SELECT company_no = code,
+		 company_name = description
+	    FROM company_decode
+	   WHERE code = :company_no;
+	   
+	   INQUIRE_INGRES (IIerrorno = ERRORNO,
+			   hf_errtext = ERRORTEXT,
+			   IIrowcount = ROWCOUNT);
+		      
+	   IF IIerrorno !=0 THEN
+	      ROLLBACK;
+	      MESSAGE '-01- INGRES error in select company'
+	      WITH STYLE = POPUP;
+	      RETURN 1;
+	   ENDIF;
+	   
+	   COMMIT;
+	  
+	   IF IIrowcount < 1 THEN
+	      MESSAGE 'Invalid Company Number Entered' 
+	      WITH STYLE = POPUP;
+	      CLEAR FIELD company_no;
+	      RETURN 1;
+	   ENDIF;
+	  
+	  RETURN 0;
+};              
+
+PROCEDURE v_type()= 
+{
+	  IF :cust_type = '' THEN
+	     cust_type = 0;
+	     type_name = 'All Customer Types';
+	     RETURN 0;
+	  ENDIF;
+	  
+	  SELECT cust_type = ad_cust_type,    
+		 type_name = ad_cust_name
+	    FROM advert_customers
+	   WHERE ad_cust_type = :cust_type;
+	   
+	   INQUIRE_INGRES (IIerrorno = ERRORNO,
+			   hf_errtext = ERRORTEXT,
+			   IIrowcount = ROWCOUNT);
+		      
+	   IF IIerrorno !=0 THEN
+	      ROLLBACK;
+	      MESSAGE '-01- INGRES error in select customer' 
+	      WITH STYLE = POPUP;
+	      RETURN 1;
+	   ENDIF;
+	   
+	   COMMIT;
+	  
+	   IF IIrowcount < 1 THEN
+	      MESSAGE 'Invalid Customer Type Entered' 
+	      WITH STYLE = POPUP;
+	      CLEAR FIELD cust_type;
+	      RETURN 1;
+	   ENDIF;
+	  
+	  RETURN 0;
+};
+	      
+PROCEDURE v_group()=
+{
+	  IF :cust_group = '' THEN 
+	     cust_group = 0;
+	     group_name = 'All Customer Groups';
+	     RETURN 0;
+	  ENDIF;
+	  
+	  SELECT cust_group = custgroup_no,  
+		 group_name = custgroup_name
+	    FROM cust_groups
+	   WHERE custgroup_no = :cust_group;
+	   
+	   INQUIRE_INGRES (IIerrorno = ERRORNO,
+			   hf_errtext = ERRORTEXT,
+			   IIrowcount = ROWCOUNT);
+		      
+	   IF IIerrorno !=0 THEN
+	      ROLLBACK;
+	      MESSAGE '-01- INGRES error in select group' 
+	      WITH STYLE = POPUP;
+	      RETURN 1;
+	   ENDIF;
+	   
+	   COMMIT;
+   
+	   IF IIrowcount < 1 THEN
+	      MESSAGE 'Invalid Customer Group Number Entered' 
+	      WITH STYLE = POPUP;
+	      CLEAR FIELD cust_group;
+	      RETURN 1;
+	   ENDIF;
+ 
+	   IF cust_type != 0 THEN
+	      IF cust_group != 0 THEN 
+	      MESSAGE 'You cannot enter a Customer Type and Group' 
+	      WITH STYLE = POPUP;
+	      RETURN 2;
+	      ENDIF;
+	   ENDIF;
+	   
+	   RETURN 0;           
+};
+   
+PROCEDURE v_message()=
+{
+	  IF :advert_message = '' THEN
+	     MESSAGE 'Enter a message for the advert' 
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+
+	  IIcheck = 'y';
+
+	  IF :advert_message LIKE '%~%' THEN
+	     IIcheck = '~'; 
+	  ENDIF;
+  
+	  IF :advert_message LIKE '%!%' THEN
+	     IIcheck = '!'; 
+	  ENDIF;
+ 
+	  IF :advert_message LIKE '%"%' THEN
+	     IIcheck = '"'; 
+	  ENDIF;
+	  
+	  IF :advert_message LIKE '%#%' THEN
+	     IIcheck = '#'; 
+	  ENDIF;
+	  
+	  IF :advert_message LIKE '%$%' THEN
+	     IIcheck = '$'; 
+	  ENDIF;
+	  
+	  IF :advert_message LIKE '%^%' THEN
+	     IIcheck = '^'; 
+	  ENDIF;
+	  
+	  IF :advert_message LIKE '%~%' THEN
+	     IIcheck = '~'; 
+	  ENDIF;
+	  
+	  IF :advert_message LIKE '%{%' THEN
+	     IIcheck = '{'; 
+	  ENDIF;
+	  
+	  IF :advert_message LIKE '%}%' THEN
+	     IIcheck = '}'; 
+	  ENDIF;
+	  
+	  IF :advert_message LIKE '%[%' THEN
+	     IIcheck = '['; 
+	  ENDIF;
+  
+	  IF :advert_message LIKE '%]%' THEN
+	     IIcheck = ']'; 
+	  ENDIF;
+ 
+	  IF :advert_message LIKE '%@%' THEN
+	     IIcheck = '@'; 
+	  ENDIF;
+	  
+	  IF :advert_message LIKE '%|%' THEN
+	     IIcheck = '|'; 
+	  ENDIF;
+
+	  IF :advert_message LIKE '%\%' THEN
+	     IIcheck = '|'; 
+	  ENDIF;
+
+	  IF :IIcheck != 'y' THEN
+	     MESSAGE 'Invalid character in message ' + :IIcheck 
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+	  
+	  RETURN 0;
+};          
+
+PROCEDURE v_write_branch()= 
+{
+/*        CHECK MESSAGES ARE OK TO SEND      */
+
+   IF InsertAmend = 'A' THEN
+      DELETE FROM advert_messages
+       WHERE advert_branch = :IIoldbranch
+	 AND advert_timestamp = :IIoldstamp;          
+	  
+      INQUIRE_INGRES (IIerrorno = ERRORNO,
+		      hf_errtext = ERRORTEXT,
+		      IIrowcount = ROWCOUNT);
+		      
+      IF IIerrorno !=0 THEN
+	 ROLLBACK;
+	 MESSAGE '-01- INGRES error amending message' 
+	    WITH STYLE = POPUP;
+	 RETURN 1;
+      ENDIF;
+	  
+      mcs_res = CALLPROC open_isam();
+      mcs_res = CALLPROC mcs_adverts_out('D',
+					 :IIoldbranch,
+					 varchar(:IIoldstamp),
+					 :gv_branch_id,
+					 :gv_user_id);
+      IF mcs_res !=0 THEN 
+	 MESSAGE 'ERROR MCS returned ' + TRIM(CHAR(:mcs_res))
+	    WITH STYLE = POPUP;
+      ENDIF;
+      mcs_res = CALLPROC close_isam();
+	       
+   ENDIF;
+	  
+   IItstamp = DATE('NOW');
+	  
+   IImcsstamp = CONCAT(LEFT(TRIM(:IItstamp),6),
+		   CONCAT(LEFT(RIGHT(TRIM(:IItstamp),11),2),
+		   RIGHT(TRIM(:IItstamp),8)));
+	  
+   INSERT INTO advert_messages (advert_branch,advert_timestamp,
+				advert_action,advert_type,start_date,
+				end_date,company_no,cust_type,
+				cust_group,branch_id,user_id,
+				advert_message,advert_seq)
+   VALUES (:branch,varchar(:IImcsstamp),
+	   'I','I',:start_date,
+	   :end_date,:company_no,:cust_type,
+	   :cust_group,:gv_branch_id,:gv_user_id,
+	   :advert_message,:advert_seq) ;
+		 
+   INQUIRE_INGRES (IIerrorno = ERRORNO,
+		   hf_errtext = ERRORTEXT,
+		   IIrowcount = ROWCOUNT);
+		      
+   IF IIerrorno !=0 THEN
+      ROLLBACK;
+      MESSAGE '-01- INGRES error in Write message' 
+	 WITH STYLE = POPUP;
+      RETURN 1;
+   ENDIF;
+	   
+   COMMIT;
+	   
+   /* SEND TO MESSAGE CONTROL */
+	   
+   IF :branch = 'ALL' THEN 
+      h_advert = SELECT * 
+		   FROM advert_messages 
+		  WHERE advert_branch LIKE '%ALL%'
+		    AND advert_timestamp = :IImcsstamp;
+   ELSE
+      h_advert = SELECT * 
+		   FROM advert_messages 
+		  WHERE advert_branch = :branch
+		    AND advert_timestamp = :IImcsstamp;
+   ENDIF;
+	
+/*   
+   MESSAGE 'timestamp = ' + :IImcsstamp
+       WITH STYLE = POPUP;
+*/
+	   
+   mcs_res = callproc open_isam();   
+	    
+   if (mcs_res != 0) then
+      message 'OPEN ISAM FAILURE - ' + varchar(:mcs_res) 
+	 with style = popup;
+   endif;
+	    
+   mcs_res = callproc mcs_adverts_out('I',
+				      :h_advert.advert_branch,
+				      varchar(:IImcsstamp),
+				      :gv_branch_id,
+				      :gv_user_id);
+				
+   IF mcs_res != 0 THEN
+      message 'ERROR : MCS returned '+trim(char(:mcs_res))
+	 with style = popup;
+ /*ELSE
+      message 'SEND TO MCS OK ! ' with style = popup;*/
+   ENDIF;
+	    
+   mcs_res = callproc close_isam();      
+
+   RETURN 0;
+};
+
+PROCEDURE v_duplicate1() = 
+{
+	  /* Test for same branch on 'ALL' '103G' '401F' '903Y' */
+	  /*
+	  ** Test for overlapping details using the input branch.
+	  */           
+	  IF :cust_type > 0 THEN 
+ 
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp  
+		FROM advert_messages          
+	       WHERE advert_branch   = :branch
+		 AND ((company_no    = :company_no)
+		  OR  (company_no     = 99))
+		 AND advert_type     = 'I'
+		 AND cust_type       = :cust_type
+		 AND (((:start_date >= start_date)
+		 AND   (:start_date <= end_date))
+		  OR  ((:end_date   >= start_date)
+		 AND   (:end_date   <= end_date)));
+		       
+	  ELSEIF :cust_group > 0 THEN 
+	   
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp  
+		FROM advert_messages          
+	       WHERE advert_branch   = :branch
+		 AND ((company_no    = :company_no)
+		  OR  (company_no    = 99))
+		 AND advert_type     = 'I'
+		 AND cust_group      = :cust_group
+		 AND (((:start_date >= start_date)
+		 AND   (:start_date <= end_date))
+		  OR  ((:end_date   >= start_date)
+		 AND   (:end_date   <= end_date)));
+	  
+	  ELSE 
+	   
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp  
+		FROM advert_messages          
+	       WHERE advert_branch   = :branch
+		 AND ((company_no    = :company_no)
+		  OR  (company_no    = 99))
+		 AND advert_type     = 'I'
+		 AND cust_type       = 0
+		 AND cust_group      = 0
+		 AND (((:start_date >= start_date)
+		 AND   (:start_date <= end_date))
+		  OR  ((:end_date   >= start_date)
+		 AND   (:end_date   <= end_date)));
+	  
+	  ENDIF;
+		    
+	  INQUIRE_INGRES (IIerrorno = ERRORNO,
+			 hf_errtext = ERRORTEXT,
+			 IIrowcount = ROWCOUNT);
+		      
+	  IF IIerrorno !=0 THEN
+	     ROLLBACK;
+	     MESSAGE '-01- INGRES error in Duplication Check'  
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+		    
+	  COMMIT;
+
+	  IF IIrowcount < 1 THEN
+	     RETURN 0;
+	  ENDIF;   
+
+	  IF ( IIrowcount = 1 )         AND
+	     ( InsertAmend = 'A' )      AND
+	     ( IIstamp = IIoldstamp )   THEN
+	       RETURN 0;
+	  ENDIF;  
+
+    IIint = CALLPROC v_duplicate4;
+
+    IF IIint != 0 THEN
+        RETURN 1;
+    ENDIF;
+
+	  RETURN 0;
+		  
+}
+
+PROCEDURE v_duplicate2()= 
+{
+	  /* Test for Pharmaceutical Branch Input and 'ALL' on file */
+	  /*
+	  ** Test for overlapping details at all branches where a
+	  ** branch number has been input.
+	  */            
+	  IF :cust_type > 0 THEN 
+		 
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp
+	       FROM advert_messages          
+	      WHERE advert_branch   = 'ALL'
+		AND  ((company_no   = :company_no)
+		 OR   (company_no   = 99))
+		AND advert_type     = 'I'
+		AND cust_type       = :cust_type
+		AND (((:start_date >= start_date) 
+		AND   (:start_date <= end_date))
+		 OR  ((:end_date   >= start_date)
+		AND   (:end_date   <= end_date)));
+
+	  ELSEIF :cust_group > 0 THEN 
+		 
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp
+	       FROM advert_messages          
+	      WHERE advert_branch   = 'ALL'
+		AND  ((company_no   = :company_no)
+		 OR   (company_no   = 99))
+		AND advert_type     = 'I'
+		AND cust_group      = :cust_group
+		AND (((:start_date >= start_date) 
+		AND   (:start_date <= end_date))
+		 OR  ((:end_date   >= start_date)
+		AND   (:end_date   <= end_date)));
+	  
+	  ELSE 
+	   
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp  
+		FROM advert_messages          
+	       WHERE advert_branch   = 'ALL'
+		 AND  ((company_no   = :company_no)
+		  OR   (company_no   = 99))
+		 AND advert_type     = 'I'
+		 AND cust_type       = 0 
+		 AND cust_group      = 0
+		 AND (((:start_date >= start_date)
+		 AND   (:start_date <= end_date))
+		  OR  ((:end_date   >= start_date)
+		 AND   (:end_date   <= end_date)));
+
+	  ENDIF;
+	  
+	  INQUIRE_INGRES (IIerrorno = ERRORNO,
+			 hf_errtext = ERRORTEXT,
+			 IIrowcount = ROWCOUNT);
+		      
+	  IF IIerrorno !=0 THEN
+	     ROLLBACK;
+	     MESSAGE '-01- INGRES error in Duplication Check' 
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+		    
+	  COMMIT;
+	  
+	  IF IIrowcount < 1 THEN 
+	     RETURN 0;
+	  ENDIF;
+	  
+	  IF ( IIrowcount = 1 )         AND
+	     ( InsertAmend = 'A' )      AND
+	     ( IIstamp = IIoldstamp )   THEN 
+	       RETURN 0;
+	  ENDIF;  
+
+    IIint = CALLPROC v_duplicate4;
+
+    IF IIint != 0 THEN
+        RETURN 1;
+    ENDIF;
+
+	  RETURN 0;
+
+} 
+
+PROCEDURE v_duplicate3()=
+{
+	  /* Test for 'ALL' Input and Pharmaceutical Branch on file */
+	  /*
+	  ** Test for overlapping details at specific branches where
+	  ** ALL branches input.
+	  */           
+	  IF :cust_type  >  0 THEN 
+	  
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp
+		FROM advert_messages          
+	       WHERE ((advert_branch != '103G')
+		 AND  (advert_branch != '401F')
+		 AND  (advert_branch != '903Y')
+		 AND  (advert_branch != '606R'))
+		 AND  ((company_no    = :company_no)
+		  OR   (company_no    = 99))
+		 AND advert_type      = 'I'
+		 AND cust_type        = :cust_type
+		 AND (((:start_date  >= start_date) 
+		 AND   (:start_date  <= end_date))
+		  OR  ((:end_date    >= start_date)
+		 AND   (:end_date    <= end_date)));
+			
+	  ELSEIF :cust_group  >  0 THEN 
+	  
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp
+		FROM advert_messages          
+	       WHERE ((advert_branch != '103G')
+		 AND  (advert_branch != '401F')
+		 AND  (advert_branch != '903Y')
+		 AND  (advert_branch != '606R'))
+		 AND  ((company_no    = :company_no)
+		  OR   (company_no    = 99))
+		 AND advert_type      = 'I'
+		 AND cust_group       = :cust_group
+		 AND (((:start_date  >= start_date) 
+		 AND   (:start_date  <= end_date))
+		  OR  ((:end_date    >= start_date)
+		 AND   (:end_date    <= end_date)));
+			
+	  ELSE 
+	   
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp  
+		FROM advert_messages          
+	       WHERE ((advert_branch != '103G')
+		 AND  (advert_branch != '401F')
+		 AND  (advert_branch != '903Y')
+		 AND  (advert_branch != '606R'))
+/*      WHERE advert_branch = :branch   */
+		 AND  ((company_no   = :company_no)
+		  OR   (company_no   = 99))
+		 AND advert_type     = 'I'
+		 AND cust_type       = 0 
+		 AND cust_group      = 0
+		 AND (((:start_date >= start_date)
+		 AND   (:start_date <= end_date))
+		  OR  ((:end_date   >= start_date)
+		 AND   (:end_date   <= end_date)));
+	  
+	  ENDIF;
+  
+	  INQUIRE_INGRES (IIerrorno = ERRORNO,
+			 hf_errtext = ERRORTEXT,
+			 IIrowcount = ROWCOUNT);
+		      
+	  IF IIerrorno !=0 THEN
+	     ROLLBACK;
+	     MESSAGE '-01- INGRES error in Duplication Check' 
+	     WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+	  
+	  COMMIT;
+	  
+	  IF IIrowcount < 1 THEN
+	     RETURN 0;
+	  ENDIF;
+	  
+	  IF ( IIrowcount = 1 )         AND
+	     ( InsertAmend = 'A' )      AND
+	     ( IIstamp = IIoldstamp )   THEN 
+	       RETURN 0;
+	  ENDIF;  
+
+    IIint = CALLPROC v_duplicate4;
+
+    IF IIint != 0 THEN
+        RETURN 1;
+    ENDIF;
+
+	  RETURN 0;
+	   
+}
+
+PROCEDURE v_duplicate4() =
+{
+	  IF :cust_type > 0 THEN 
+
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp  
+		FROM advert_messages          
+	       WHERE advert_branch      = :branch
+		 AND  ((company_no      = :company_no)
+		  OR   (company_no      = 99))
+		 AND advert_type        = 'I'
+		 AND cust_type          = :cust_type 
+		 AND (((:start_date    >= start_date)
+		 AND   (:start_date    <= end_date))
+		  OR  ((:end_date      >= start_date)
+		 AND   (:end_date      <= end_date)));
+	      
+	  ELSEIF :cust_group > 0 THEN 
+	      
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp  
+		FROM advert_messages          
+	       WHERE advert_branch      = :branch
+		 AND  ((company_no      = :company_no)
+		  OR   (company_no      = 99))
+		 AND advert_type        = 'I'
+		 AND cust_group         = :cust_group
+		 AND (((:start_date    >= start_date)
+		 AND   (:start_date    <= end_date))
+		  OR  ((:end_date      >= start_date)
+		 AND   (:end_date      <= end_date)));
+	     
+	  ELSE
+	     
+	      SELECT IIbranch = advert_branch,
+		     IIstamp = advert_timestamp  
+		FROM advert_messages          
+	       WHERE advert_branch      = :branch
+		 AND  ((company_no      = :company_no)
+		  OR   (company_no      = 99))
+		 AND advert_type        = 'I'
+		 AND cust_type          = 0
+		 AND cust_group         = 0 
+		 AND (((:start_date    >= start_date)
+		 AND   (:start_date    <= end_date))
+		  OR  ((:end_date      >= start_date)
+		 AND   (:end_date      <= end_date)));
+	   
+	  ENDIF;
+	     
+	  INQUIRE_INGRES (IIerrorno = ERRORNO,
+			 hf_errtext = ERRORTEXT,
+			 IIrowcount = ROWCOUNT);
+		      
+	  IF IIerrorno !=0 THEN
+	     ROLLBACK;
+	     MESSAGE '-01- INGRES error in Duplication Check'  
+		WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+		    
+	  COMMIT;
+
+	  IF :cust_type > 0 THEN
+	      MESSAGE 'Advert would cause duplication at '
+		    + :IIbranch 
+		    + ' for customer type '
+		    + varchar(:cust_type) 
+		 WITH STYLE = POPUP; 
+	       RETURN 1;
+	  ELSEIF :cust_group > 0 THEN 
+	      MESSAGE 'Advert would cause duplication at '
+		    + :IIbranch 
+		    + ' for customer group '
+		    + varchar(:cust_group) 
+		 WITH STYLE = POPUP; 
+	       RETURN 1;
+	  ELSE
+	      MESSAGE 'Advert would cause duplication at '
+		    + :IIbranch 
+		    + ' for all customer types and groups '
+		 WITH STYLE = POPUP; 
+	       RETURN 1;
+	  ENDIF;
+	  
+	  RETURN 0;
+}
+
+PROCEDURE v_check_for_duplicate() =
+{
+   SELECT IIbranch = advert_branch,
+          IIstamp = advert_timestamp  
+     FROM advert_messages          
+    WHERE advert_branch          = '606R'
+      AND (   (   company_no     = :company_no
+               OR company_no     = 99)
+           OR (   :company_no    = 99
+               AND company_no   != 99))
+      AND advert_type            = 'I'
+      AND (   (    :start_date  >= start_date
+               AND :start_date  <= end_date)
+           OR (    :end_date    >= start_date
+               AND :end_date    <= end_date)
+           OR (    :start_date   < start_date
+               AND :end_date     > end_date)
+           OR (    :start_date   > start_date
+               AND :end_date     < end_date));
+
+   INQUIRE_INGRES (IIerrorno = ERRORNO,
+                   hf_errtext = ERRORTEXT,
+                   IIrowcount = ROWCOUNT);
+		      
+   IF IIerrorno !=0 THEN
+      ROLLBACK;
+      MESSAGE '-01- INGRES error in Check For Duplicate'  
+         WITH STYLE = POPUP;
+      RETURN 1;
+   ENDIF;
+
+   COMMIT;
+
+   IF IIrowcount = 0 THEN
+      advert_seq = 0;
+      RETURN 0;
+   ENDIF;
+   
+   IF cust_type > 0 THEN
+      lv_prompt = SQUEEZE('Advert will cause duplication at '          
+                + IFNULL(:IIbranch, '')
+                + ' for customer type ' 
+                + VARCHAR(:cust_type)
+                + '. Do you want to create a duplicate '
+                + 'advert? [Y/N]');
+   ELSEIF cust_group > 0 THEN
+      lv_prompt = SQUEEZE('Advert will cause duplication at '          
+                + IFNULL(:IIbranch, '')
+                + ' for customer group ' 
+                + VARCHAR(:cust_group)
+                + '. Do you want to create a duplicate '
+                + 'advert? [Y/N]');
+   ELSE
+      lv_prompt = SQUEEZE('Advert will cause duplication at '          
+                + IFNULL(:IIbranch, '')
+                + ' for all customer types and groups' 
+                + '. Do you want to create a duplicate '
+                + 'advert? [Y/N]');
+   ENDIF;
+	  
+   IIchar1 = '';
+
+   WHILE UPPERCASE(IIchar1) != 'Y'
+      AND UPPERCASE(IIchar1) != 'N'
+   DO
+      IIchar1 = PROMPT :lv_prompt
+   WITH STYLE = POPUP;
+   ENDWHILE;
+     
+   IIchar1 = UPPERCASE(IIchar1);
+
+   IF IIchar1 = 'N' THEN
+      RETURN 1;
+   ENDIF;
+   
+   /*
+   ** Identify the maximum value of advert_seq 
+   ** currently in use for the period of the advert.
+   */
+   advert_seq = 0;
+		       
+   SELECT IFNULL(MAX(advert_seq), 0) AS advert_seq
+     FROM advert_messages          
+    WHERE advert_branch          = '606R'
+      AND (   (   company_no     = :company_no
+               OR company_no     = 99)
+           OR (   :company_no    = 99
+               AND company_no   != 99))
+      AND advert_type            = 'I'
+      AND (   (    :start_date  >= start_date
+               AND :start_date  <= end_date)
+           OR (    :end_date    >= start_date
+               AND :end_date    <= end_date)
+           OR (    :start_date   < start_date
+               AND :end_date     > end_date)
+           OR (    :start_date   > start_date
+               AND :end_date     < end_date));
+
+   INQUIRE_INGRES (IIerrorno = ERRORNO,
+                   hf_errtext = ERRORTEXT,
+                   IIrowcount = ROWCOUNT);
+		      
+   IF IIerrorno !=0 THEN
+      ROLLBACK;
+      MESSAGE '-05- INGRES error in Check For Duplicate'  
+         WITH STYLE = POPUP;
+      RETURN 1;
+   ENDIF;
+		    
+   COMMIT;
+
+   advert_seq = advert_seq + 1;
+
+   RETURN 0;
+}
+
+PROCEDURE show_branch() =
+{
+	  CALLPROC mapst;
+	  IIint = CALLFRAME LOOK_UP
+	  (II_QUERY=SELECT branch_id,
+			   name
+		      FROM branch
+		     WHERE branch_id LIKE '_0__';
+	       branch_id = BYREF(:branch),
+		    name = BYREF(:branch_name),
+	       II_FIELD1 = 'branch_id',
+	       II_FIELD2 = 'name',
+	       II_FIELD_TITLE1 = 'Branch',
+	       II_FIELD_TITLE2 = 'Name',
+	       II_ROWS = 14,
+	       II_STARTROW = 5,
+	       II_STARTCOLUMN = 50);
+	   CALLPROC mapend;
+		      
+	   INQUIRE_INGRES (IIerrorno = ERRORNO,
+			   hf_errtext = ERRORTEXT,
+			   IIrowcount = ROWCOUNT);
+		      
+	   IF IIerrorno !=0 THEN
+	      ROLLBACK;
+	      RETURN 1;
+	   ENDIF;
+	   
+	   COMMIT;
+   
+	   IF IIrowcount < 1 THEN
+	      RETURN 1;
+	   ENDIF;
+
+	   IIint = CALLPROC remtp_check;
+	   
+	   IF IIint != 0 THEN
+	      RETURN 1;
+	   ENDIF;
+	   
+	   RETURN 0;
+		     
+};
+
+PROCEDURE show_company()=
+{
+	  CALLPROC mapst;
+	  IIint = CALLFRAME LOOK_UP
+	  (II_QUERY=SELECT code, description
+		      FROM company_decode;
+	      code = BYREF(:company_no),
+	      description = BYREF(:company_name),      
+	      II_FIELD1 = 'code',
+	      II_FIELD2 = 'description',
+	      II_FIELD_TITLE1 = 'Code',
+	      II_FIELD_TITLE2 = 'Name');
+	   CALLPROC mapend;
+	   
+	   INQUIRE_INGRES (IIerrorno = ERRORNO,
+			   hf_errtext = ERRORTEXT,
+			   IIrowcount = ROWCOUNT);
+		      
+	   IF IIerrorno !=0 THEN
+	      ROLLBACK;
+	      RETURN 1;
+	   ENDIF;
+	   
+	   COMMIT;
+   
+	   IF IIrowcount < 1 THEN
+	      RETURN 1;
+	   ENDIF;
+};
+
+PROCEDURE show_type()=
+{
+	  CALLPROC mapst;
+	  IIint = CALLFRAME LOOK_UP
+	  (II_QUERY=SELECT ad_cust_type,ad_cust_name
+		      FROM advert_customers;
+	    ad_cust_type = BYREF(:cust_type),
+	    ad_cust_name = BYREF(:type_name),
+	       II_FIELD1 = 'ad_cust_type',
+	       II_FIELD2 = 'ad_cust_name',
+	 II_FIELD_TITLE1 = 'Code',
+	 II_FIELD_TITLE2 = 'Name',
+		 II_ROWS = 6);
+		 
+	   CALLPROC mapend;
+	   INQUIRE_INGRES (IIerrorno = ERRORNO,
+			   hf_errtext = ERRORTEXT,
+			   IIrowcount = ROWCOUNT);
+		      
+	   IF IIerrorno !=0 THEN
+	      ROLLBACK;
+	      RETURN 1;
+	   ENDIF;
+	   
+	   COMMIT;
+   
+	   IF IIrowcount < 1 THEN
+	      RETURN 1;
+	   ENDIF;
+};
+
+PROCEDURE show_group()=
+{
+		   CALLPROC mapst;
+		   IIint = CALLFRAME LOOK_UP
+		  (II_QUERY=SELECT custgroup_no,
+				    custgroup_name 
+			       FROM cust_groups;
+		    custgroup_no    = BYREF(:cust_group),
+		    custgroup_name  = BYREF(:group_name), 
+		    II_FIELD1       = 'custgroup_no',
+		    II_FIELD2       = 'custgroup_name',
+		    II_FIELD_TITLE1 = 'Group',
+		    II_FIELD_TITLE2 = 'Customer',
+		    II_ROWS         = 17,
+		    II_STARTROW     = 2,
+		    II_STARTCOLUMN  = 30);
+		    CALLPROC mapend;
+	   INQUIRE_INGRES (IIerrorno = ERRORNO,
+			   hf_errtext = ERRORTEXT,
+			   IIrowcount = ROWCOUNT);
+		      
+	   IF IIerrorno !=0 THEN
+	      ROLLBACK;
+	      RETURN 1;
+	   ENDIF;
+	   
+	   COMMIT;
+   
+	   IF IIrowcount < 1 THEN
+	      RETURN 1;
+	   ENDIF;
+};
+
+PROCEDURE remtp_check()=
+{
+	   IF :branch = '101C' OR :branch = '106M' OR :branch = '201D' OR
+	      :branch = '204J' OR :branch = '305M' OR :branch = '402H' OR
+	      :branch = '405N' OR :branch = '406P' OR :branch = '501G' OR
+	      :branch = '502X' OR :branch = '504M' OR :branch = '606R' OR 
+	      :branch = '602J' OR :branch = '703M' OR :branch = '706S' OR
+	      :branch = '808A' OR :branch = '908B' OR
+	      :branch = 'ALL'  THEN
+	      RETURN 0;
+	   ENDIF;
+	   
+	   MESSAGE 'Branch must be a REMTP branch' 
+	      WITH STYLE = POPUP;
+
+	   RETURN 1; 
+};
+
+PROCEDURE v_get_mess()=
+{
+	      SELECT :start_date      = start_date,
+		     :end_date        = end_date,
+		     :company_no      = company_no,
+		     :branch          = advert_branch,
+		     :cust_type       = cust_type,
+		     :cust_group      = cust_group,
+		     :advert_message  = advert_message,
+		     :advert_seq      = advert_seq
+		FROM advert_messages          
+	       WHERE advert_branch    = :IIoldbranch 
+		 AND advert_timestamp = :IIoldstamp
+		 AND advert_type      = 'I';
+
+	   INQUIRE_INGRES (IIerrorno = ERRORNO,
+			   hf_errtext = ERRORTEXT,
+			   IIrowcount = ROWCOUNT);
+		      
+	   IF IIrowcount < 1 THEN
+	      InsertAmend = 'I'; 
+	      RETURN 0;
+	   ELSE 
+	      InsertAmend = 'A';
+	   ENDIF;
+	   
+	   SELECT :branch_name = name 
+	     FROM branch
+	    WHERE branch_id = :branch;
+	   
+	   SELECT :company_name = description 
+	     FROM company_decode
+	    WHERE code = :company_no;
+	    
+	   SELECT :type_name = ad_cust_name 
+	     FROM advert_customers
+	    WHERE ad_cust_type = :cust_type;
+	    
+	   SELECT :group_name = custgroup_name 
+	     FROM cust_groups
+	    WHERE custgroup_no = :cust_group;
+	   
+	   IF :branch = 'ALL' THEN 
+	      branch_name = 'ALL EXCEPT 103G 401F 903Y';
+	   ENDIF;
+	   
+	   IF :cust_type = 0 THEN 
+	      type_name = 'ALL CUSTOMER TYPES';
+	   ENDIF;
+	   
+	   IF :cust_group = 0 THEN
+	      group_name = 'ALL CUSTOMER GROUPS';
+	   ENDIF;
+	   
+	   COMMIT;
+	   
+	   RETURN 0;
+}
+
+PROCEDURE form_clear()=
+{
+	  CLEAR FIELD advert_seq;
+	  CLEAR FIELD start_date;
+	  CLEAR FIELD end_date;
+	  CLEAR FIELD branch;
+	  CLEAR FIELD branch_name;
+	  CLEAR FIELD company_no;
+	  CLEAR FIELD company_name;
+	  CLEAR FIELD cust_type;
+	  CLEAR FIELD type_name;
+	  CLEAR FIELD cust_group;
+	  CLEAR FIELD group_name;
+	  CLEAR FIELD advert_message;   
+	  IIexit = 'Y';
+	  RETURN 0;
+};
+

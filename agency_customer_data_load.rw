@@ -1,0 +1,97 @@
+/*
+**
+**  Report Name: agency_customer_data_load
+**
+**         Date: 03/07/2017
+**
+**       Author: Irfan Salim
+**
+*/
+.NAME agency_customer_data_load
+.PW 500
+.NOFIRSTFF
+.NOFORMFEED
+.PL 0
+
+.DECLARE
+   IIreport_number = integer
+
+.SETUP
+   SET LOCKMODE SESSION WHERE READLOCK = NOLOCK ,MAXLOCKS = 300 ;
+
+.QUERY
+
+  SELECT line_no,
+         brnacc,
+         agency_id,
+         mkr_status,
+         agency_type,
+         agency_group,
+         reject_reason,
+         original_file_name
+    FROM session.agency_customer_data
+
+.SORT
+         original_file_name : a,
+         line_no : a
+         reject_reason : a,
+
+.BREAK original_file_name
+
+.HEADER	report
+	.NOFIRSTFF 
+	.NOFORMFEED 
+	.PL 0
+	.TAB 0
+	.PR 'Line'
+	.TAB 7
+	.PR 'Account'
+	.TAB 22
+	.PR 'AgencyID'
+	.TAB 32
+	.PR 'Type'
+	.TAB 38
+	.PR 'Group'
+	.TAB 45
+	.PR 'RTB'
+	.TAB 50
+	.PR 'Reject Reason'
+	.TAB 95
+	.PR 'File Name'
+	.NL 
+
+.DETAIL
+	.TAB 0
+	.PR line_no("----n")
+	.TAB 6
+	.PR ' '
+	.TAB 7
+	.PR trim(brnacc)
+	.TAB 21
+	.PR ' '
+	.TAB 22
+	.PR trim(agency_id)
+	.TAB 31
+	.PR ' '
+	.TAB 32
+	.PR trim(agency_type)
+	.TAB 38
+	.PR ' '
+	.TAB 39
+	.PR trim(agency_group)
+	.TAB 45
+	.PR ' '
+	.TAB 46
+	.PR trim(mkr_status)
+	.TAB 49
+	.PR ' '
+	.TAB 50
+	.PR trim(reject_reason)
+	.TAB 85
+	.PR ' '
+	.TAB 95
+	.PR trim(original_file_name)
+	.NL 1
+
+.FOOTER	original_file_name
+	.NL 

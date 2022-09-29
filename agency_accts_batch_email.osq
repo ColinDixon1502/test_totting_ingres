@@ -1,0 +1,863 @@
+/*********************************************************************/
+/* Source:     agency_accts_batch_email.osq                          */
+/*                                                                   */
+/* Proc Name:  agency_accts_batch_email                              */
+/*                                                                   */
+/* Purpose:    This is called from shell script of the same name and */
+/*             will select from the agency_acct_branch_incl table    */
+/*             all agency branches. It will then loop through each   */
+/*             agency and call the following 4 separate procedures : */
+/*                                                                   */
+/*             1.agency_accts_changed.osq                            */
+/*             Write account changes to a file for each agency to    */
+/*             include title and header fields for each column.      */
+/*                                                                   */
+/*             2.agency_accts_moved.osq                              */
+/*             Append moved account details to a file for each       */
+/*             agency to include title and header fields for         */
+/*             each column.                                          */
+/*                                                                   */
+/*             3.agency_accts_closed.osq                             */
+/*             Append closed account details to a file for each      */
+/*             agency to include title and header fields for         */
+/*             each column.                                          */
+/*                                                                   */
+/*             4. agency_accts_rel_changes.osq                       */
+/*             Write account hierarchy changes to a file - new       */
+/*             and updated hierarchies are included. In the case     */
+/*             of the latter the before and after hierarchies are    */
+/*             shown.                                                */
+/*                                                                   */ 
+/*             Filename : agency_accts_attach_xx_ddmmyy_hhmmss       */
+/*             (xx = agency_supplier)                                */
+/*             (ddmmyy = date)                                       */
+/*                                                                   */
+/*             5.agency_accts_send_email.osq                         */
+/*             Email the files to correct email.                     */
+/*             (One file per agency).                                */
+/*                                                                   */
+/* Author:     I Salim                                               */
+/*                                                                   */
+/* Date:       24/07/2014                                            */
+/*                                                                   */
+/* Parameters: None                                                  */
+/*                                                                   */
+/* RETURN Val: 0 - Email sent                                        */
+/*             1 - Error                                             */
+/*********************************************************************/
+/*  Version | Date     | Coded | Description of changes made         */
+/***********|**********|*******|**************************************/
+/*  1.0     | 24.07.14 | ISS   | Original Code for GSK SAP Project   */
+/***********|**********|*******|**************************************/
+/*  2.0     | 07.10.14 | ISS   | Backup following tables before      */
+/*          |          |       | overwriting:                        */
+/*          |          |       | a) sales_accts_last,                */
+/*          |          |       | b) sales_accts_extra_last,          */
+/*          |          |       | c) sales_accts_relationship_last    */
+/*          |          |       | Backup tables are [tablename]_bk.   */
+/***********|**********|*******|**************************************/
+PROCEDURE  agency_accts_batch_email ()=
+DECLARE
+ 
+    mv_debug                   = INTEGER(4)    NOT NULL WITH DEFAULT;
+ 
+    mv_retcode                 = INTEGER4      NOT NULL,  
+    mv_ing_result              = INTEGER4      NOT NULL WITH DEFAULT;
+    mv_file_attach             = CHAR(128)     NOT NULL WITH DEFAULT;      
+    mv_file_data_body          = CHAR(128)     NOT NULL WITH DEFAULT;      
+
+    mv_error_file_created      = CHAR(1)       NOT NULL WITH DEFAULT,         
+    mv_run_date                = DATE          NOT NULL WITH DEFAULT;                
+    mv_change_date             = DATE          NOT NULL WITH DEFAULT;                
+    mv_system_cmd              = VARCHAR(1000) NOT NULL WITH DEFAULT,
+    mv_branch_rows             = INTEGER2      NOT NULL, 
+    mv_session_rows            = INTEGER2      NOT NULL, 
+    mv_row                     = INTEGER2      NOT NULL, 
+    mv_total_change_count      = INTEGER4      NOT NULL WITH DEFAULT, 
+    mv_closed_count            = INTEGER4      NOT NULL WITH DEFAULT, 
+    mv_changed_count           = INTEGER4      NOT NULL WITH DEFAULT, 
+    mv_moved_count             = INTEGER4      NOT NULL WITH DEFAULT, 
+    mv_hierarchy_count         = INTEGER4      NOT NULL WITH DEFAULT, 
+    mv_state                   = INTEGER2      NOT NULL,
+    mv_millidatetime           = CHAR(30)      NOT NULL WITH DEFAULT,
+    mv_filedate                = CHAR(20)      NOT NULL WITH DEFAULT,
+    mv_sessiontable            = CHAR(100)     NOT NULL WITH DEFAULT;  
+    mv_char_pos                = INTEGER4;
+    mv_temp_string             = CHAR(500);   
+    mv_audit_text              = CHAR(200);   
+
+    /* Agency Branch Table  */
+    mv_agency_supplier         = INTEGER(4)    NOT NULL WITH DEFAULT,
+
+    ma_agency_acct_branch_incl = ARRAY OF TYPE OF TABLE agency_acct_branch_incl;
+    ma_acct_change_audit       = ARRAY OF TYPE OF TABLE acct_change_audit;
+    ma_agency_supplier_list    = ARRAY OF TYPE OF TABLE agency_notification;
+ 
+    /******************************************************/
+    /** LOCAL PROCEDURES                                 **/
+    /******************************************************/
+    lp_initialise              = PROCEDURE RETURNING INTEGER4 NOT NULL; 
+    lp_ing_error_check         = PROCEDURE RETURNING INTEGER2 NOT NULL;
+    lp_create_error_file       = PROCEDURE RETURNING NONE;       
+    lp_get_agencies            = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_create_data_email_body  = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_create_none_email_body  = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_backup_changed_data     = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_backup_changed_rel_data = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_update_changed_data     = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_acct_change_audit_update= PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_update_changed_rel_data = PROCEDURE RETURNING INTEGER4 NOT NULL;
+    lp_log_message             = PROCEDURE RETURNING NONE;
+ 
+/**************************************************************************/
+/*   Start of Code                                                        */
+/**************************************************************************/  
+{    
+    mv_retcode = gc_success;
+ 
+    mv_retcode = lp_initialise();
+    IF (mv_retcode != gc_success)
+    THEN 
+      CALLPROC lp_log_message(
+                lpv_audit_text = 'Error: Initialising');
+       CALLPROC lp_create_error_file();
+       RETURN gc_fail;
+    ENDIF;
+
+    /******************************************/
+    /* Fetch Agency Supplier Branches         */
+    /******************************************/
+    mv_retcode = lp_get_agencies ();
+    IF (mv_retcode != gc_success)
+    THEN
+       CALLPROC lp_log_message(
+                lpv_audit_text = 'Error: Getting Agencies');
+       CALLPROC lp_create_error_file();
+       RETURN gc_fail;
+    ENDIF;
+
+    /***********************************************/
+    /* Call procedure to identify qualifying       */
+    /* fields in sales_accts and sales_accts_extra */
+    /* sales_accts_extra that have changed since   */
+    /* previous run. Write to  separate files for  */
+    /* each agency supplier with heading "Changed  */
+    /* Accounts."                                  */
+    /***********************************************/
+
+    UNLOADTABLE ma_agency_supplier_list (mv_row = _RECORD, mv_state = _STATE ) 
+    {
+      mv_changed_count   = 0;
+      mv_closed_count    = 0;
+      mv_moved_count     = 0;
+      mv_hierarchy_count = 0;
+     
+      mv_millidatetime = TRIM(getmillidatetime());
+      mv_filedate      = LEFT(mv_millidatetime,20);
+      mv_char_pos = LOCATE(mv_filedate,'-');
+
+      WHILE (mv_char_pos) <= SIZE(mv_filedate)
+      DO
+        mv_temp_string = TRIM(LEFT(mv_filedate,mv_char_pos-1)) + '_' +
+                         SHIFT(mv_filedate,-mv_char_pos);
+
+        mv_filedate    = IFNULL(mv_temp_string,'');
+
+        mv_char_pos    = LOCATE(mv_filedate,'-');
+      ENDWHILE;
+ 
+      mv_agency_supplier = ma_agency_supplier_list.agency_supplier;
+
+      mv_file_attach   = gc_temp + 'agency_accts_attach_' 
+                       + TRIM(VARCHAR(mv_agency_supplier)) + '_' +
+                       TRIM(mv_filedate) + '.csv';
+
+      mv_file_data_body = :gc_temp + 'agency_accts_data_body_'
+                     + TRIM(VARCHAR(mv_agency_supplier)) + '_' +
+                       TRIM(mv_filedate) + '.txt';
+
+      CALLPROC lp_log_message(
+                lpv_audit_text = 'Attach File  = ' + mv_file_attach);
+
+      CALLPROC lp_log_message(
+                lpv_audit_text = 'Starting Agency Account Changed Extract: ' 
+                                 + CHAR(mv_agency_supplier) );
+
+      mv_retcode = CALLPROC agency_accts_changed (
+                          pv_agency_supplier = :mv_agency_supplier,
+                          pv_file_attach     = :mv_file_attach,
+                          pv_chg_cnt         = BYREF(:mv_changed_count));
+
+      IF mv_retcode != 0
+      THEN
+         ROLLBACK;
+         CALLPROC lp_log_message(
+                lpv_audit_text = 'Error: Agency Account Changed Extract FAILED');
+         CALLPROC lp_create_error_file();
+         RETURN gc_fail;
+      ENDIF;
+
+      CALLPROC lp_log_message(
+                lpv_audit_text = 'Starting Agency Account Moved Extract: ' 
+                                 + TRIM(VARCHAR(mv_agency_supplier)) );
+
+      mv_retcode = CALLPROC agency_accts_moved (
+                            pv_agency_supplier = :mv_agency_supplier,
+                            pv_file_attach     = :mv_file_attach,
+                            pv_chg_cnt         = BYREF(:mv_moved_count));
+
+      IF mv_retcode != 0
+      THEN
+         ROLLBACK;
+         CALLPROC lp_log_message(
+                lpv_audit_text = 'Error: Agency Acount Moved Extract FAILED');
+         CALLPROC lp_create_error_file();
+         RETURN gc_fail;
+      ENDIF;
+
+      CALLPROC lp_log_message(
+                lpv_audit_text = 'Starting Agency Account Closed Extract: ' 
+                                 + TRIM(VARCHAR(mv_agency_supplier)) );
+
+ 
+      mv_retcode = CALLPROC agency_accts_closed (
+                                       pv_agency_supplier = :mv_agency_supplier,
+                                       pv_file_attach     = :mv_file_attach,
+                                       pv_chg_cnt         = BYREF(:mv_closed_count));
+      IF mv_retcode != 0
+      THEN
+         ROLLBACK;
+         CALLPROC lp_log_message(
+                lpv_audit_text = 'Error: Agency Account Closed Extract FAILED');
+         CALLPROC lp_create_error_file();
+         RETURN gc_fail;
+      ENDIF;
+
+      CALLPROC lp_log_message(
+                lpv_audit_text = 'Starting Agency Relationship Changes Extract: ' + CHAR(mv_agency_supplier) );
+
+      mv_retcode = CALLPROC agency_accts_rel_changes (
+                          pv_agency_supplier = :mv_agency_supplier,
+                          pv_file_attach     = :mv_file_attach,
+                          pv_chg_cnt         = BYREF(:mv_hierarchy_count));
+
+      IF mv_retcode != 0
+      THEN
+         ROLLBACK;
+         CALLPROC lp_log_message(
+                lpv_audit_text = 'Error: Agency Relationship Changes Extract FAILED');
+         CALLPROC lp_create_error_file();
+         RETURN gc_fail;
+      ENDIF;
+
+      mv_total_change_count = mv_changed_count + mv_closed_count + mv_moved_count + mv_hierarchy_count;
+
+      IF mv_debug = 1    
+      THEN
+         MESSAGE 'Frame = agency_accts_batch_email.osq'                   + X'0A' +  
+                 'SELECT FROM ' + :mv_sessiontable                        + X'0A' +
+                 'Agency            = ' + VARCHAR(:mv_agency_supplier)    + X'0A' +
+                 'Changes           = ' + VARCHAR(:mv_total_change_count) + X'0A' +
+                 'mv_file_attach    = ' + TRIM(:mv_file_attach)           + X'0A' +
+                 'mv_file_data_body = ' + TRIM(:mv_file_data_body) 
+         WITH STYLE = POPUP;        
+      ENDIF;
+
+      /************************************************************************/
+      /* Pass change count into agency_accts_send_email along with agency no. */
+      /* If count is 0 then send email to say there are no changes.           */
+      /* If count is > 0 then send email to say there are changes and include */
+      /* a csv file listing all changes as an attachment.                     */
+      /************************************************************************/
+
+      IF (mv_total_change_count > 0)
+      THEN
+          mv_retcode = lp_create_data_email_body ();
+      ELSE
+          mv_retcode = lp_create_none_email_body ();
+      ENDIF;
+
+      IF (mv_retcode != gc_success)
+      THEN
+           CALLPROC lp_log_message(
+                   lpv_audit_text = 'Error: Creating Data Email Body');
+           CALLPROC lp_create_error_file();
+           RETURN gc_fail;
+      ENDIF;
+
+      IF (mv_total_change_count > 0)
+      THEN
+         mv_system_cmd    = 'cp ' + mv_file_attach +
+                             ' /aahdb/archive/monthly/current/';
+         CALL SYSTEM :mv_system_cmd;
+      ENDIF;
+      
+      CALLPROC lp_log_message(
+                lpv_audit_text = 'Start sending Agency Account Updates ' 
+                                 + TRIM(VARCHAR(mv_agency_supplier)) );
+
+      mv_retcode = CALLPROC agency_accts_send_email (
+                                         pv_agency_supplier = :mv_agency_supplier,
+                                         pv_chg_cnt         = :mv_total_change_count,
+                                         pv_attach_file     = :mv_file_attach,
+                                         pv_data_body_file  = :mv_file_data_body,
+                                         pv_interface_name  = 'CUS03');
+      IF mv_retcode != 0
+      THEN
+         ROLLBACK;
+         CALLPROC lp_log_message(
+                lpv_audit_text = 'Error: Agency Acount Sending of Email FAILED');
+      ENDIF;
+    };
+
+    /* End Looping through Agency Suppliers                                 */
+    /* If emails successfully sent then update so they don't come out again */
+
+     mv_retcode = lp_backup_changed_data();
+     IF mv_retcode != 0
+     THEN
+        ROLLBACK;
+        CALLPROC lp_log_message(
+               lpv_audit_text = 'Error: Update of Last Backup Sales Data FAILED');
+        CALLPROC lp_create_error_file();
+        RETURN gc_fail;
+     ENDIF;
+
+     mv_retcode = lp_backup_changed_rel_data();
+     IF mv_retcode != 0
+     THEN
+        ROLLBACK;
+        CALLPROC lp_log_message(
+               lpv_audit_text = 'Error: Backup of Last Sales Relationships Data FAILED');
+        CALLPROC lp_create_error_file();
+        RETURN gc_fail;
+     ENDIF;
+
+     mv_retcode = lp_update_changed_data();
+     IF mv_retcode != 0
+     THEN
+        ROLLBACK;
+        CALLPROC lp_log_message(
+               lpv_audit_text = 'Error: Update of Last Sales Data FAILED');
+        CALLPROC lp_create_error_file();
+        RETURN gc_fail;
+     ENDIF;
+
+     mv_retcode = lp_acct_change_audit_update();
+     IF mv_retcode != 0
+     THEN
+        ROLLBACK;
+        CALLPROC lp_log_message(
+               lpv_audit_text = 'Error: Account Change Audit Update FAILED');
+        CALLPROC lp_create_error_file();
+        RETURN gc_fail;
+     ENDIF;
+
+     mv_retcode = lp_update_changed_rel_data();
+     IF mv_retcode != 0
+     THEN
+        ROLLBACK;
+        CALLPROC lp_log_message(
+               lpv_audit_text = 'Error: Update of Last Sales Relationships Data FAILED');
+        CALLPROC lp_create_error_file();
+        RETURN gc_fail;
+     ENDIF;
+
+    /*********************************************/
+    /* Drop session tables                       */
+    /*********************************************/
+    COMMIT;
+    mv_retcode = CALLPROC drop_session_table(:mv_sessiontable);
+    COMMIT;
+    CALLPROC lp_log_message(
+                lpv_audit_text = '             ENDING             ');
+} 
+
+/*****************************************************************/
+/** Procedure To set some initial values and conditions         **/
+/*****************************************************************/
+PROCEDURE lp_initialise () =
+DECLARE 
+    lv_ing_result   = INTEGER4 NOT NULL WITH DEFAULT;
+    lv_retcode      = INTEGER4 NOT NULL WITH DEFAULT; 
+    lv_char_pos     = INTEGER4;
+    lv_temp_string  = CHAR(500);
+{
+    lv_retcode      = gc_success;
+
+    mv_debug   = 0; /* 1: Show debugging popups       */
+                    /* 0: Don't show debugging popups */   
+
+   CALLPROC lp_log_message( lpv_audit_text = '            STARTING             ');
+
+    mv_error_file_created = gc_no;
+
+    mv_run_date      = DATE('today') - '1 day';   
+
+    mv_change_date   = DATE('today') - '10 days';   
+
+    lv_retcode       = CALLPROC ARRAYCLEAR(ma_agency_acct_branch_incl);
+
+    /*
+     * Create a session table to hold the agency_suppliers/count
+     */
+    mv_millidatetime = TRIM(getmillidatetime());
+    mv_filedate      = LEFT(mv_millidatetime,20);
+    lv_char_pos      = LOCATE(mv_filedate,'-');
+
+    WHILE (lv_char_pos) <= SIZE(mv_filedate)
+    DO
+      lv_temp_string = TRIM(LEFT(mv_filedate,lv_char_pos-1)) + '_' +
+                       SHIFT(mv_filedate,-lv_char_pos);
+
+      mv_filedate    = IFNULL(lv_temp_string,'');
+
+      lv_char_pos    = LOCATE(mv_filedate,'-');
+    ENDWHILE;
+
+    mv_sessiontable  = 'session.agencies_' + :mv_filedate; 
+
+    CALLPROC lp_log_message(
+                lpv_audit_text = 'Session Table = ' + mv_sessiontable);
+
+    lv_retcode       = CALLPROC drop_session_table(:mv_sessiontable);
+
+    DECLARE GLOBAL TEMPORARY TABLE :mv_sessiontable
+        (agency_supplier INTEGER4 NOT NULL WITH DEFAULT)
+    ON COMMIT PRESERVE ROWS WITH NORECOVERY;
+       
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'lp_initialise ',
+                              lpv_sql_desc  = 'Creating ' + :mv_sessiontable);
+
+    IF (lv_ing_result != 0)
+    THEN
+       CALLPROC lp_log_message(
+                lpv_audit_text = 'Error Creating ' + :mv_sessiontable );
+       RETURN gc_fail;
+    ENDIF;
+
+    INSERT INTO :mv_sessiontable (
+    agency_supplier)
+    SELECT DISTINCT agency_supplier
+    FROM agency_acct_branch_incl;
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'lp_initialise ',
+                              lpv_sql_desc  = 'Inserting ' + :mv_sessiontable);
+
+    IF (lv_ing_result != 0)
+    THEN
+       CALLPROC lp_log_message(
+                lpv_audit_text = 'Error Inserting ' + :mv_sessiontable);
+       RETURN gc_fail;
+    ENDIF;
+
+    lv_retcode = CALLPROC ARRAYCLEAR(ma_agency_supplier_list);
+
+    ma_agency_supplier_list = SELECT agency_supplier AS agency_supplier
+                          FROM :mv_sessiontable;
+
+    INQUIRE_INGRES (mv_session_rows = ROWCOUNT); 
+  
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Agency Sup Cnts Array ',
+                              lpv_sql_desc  = 'Array ' + :mv_sessiontable);
+
+    IF (lv_ing_result != 0)
+    THEN
+       CALLPROC lp_log_message(
+                lpv_audit_text = 'Error array select FAILED ' + :mv_sessiontable);             
+       CALLPROC lp_create_error_file();
+       RETURN gc_fail;
+    ENDIF;
+
+
+    COMMIT;
+
+    RETURN(lv_retcode);
+}
+
+/*****************************************************************/
+/** Procedure To get agencies **/
+/*****************************************************************/
+PROCEDURE lp_get_agencies() =
+DECLARE 
+    lv_ing_result   = INTEGER4 NOT NULL WITH DEFAULT;
+    lv_retcode      = INTEGER4 NOT NULL WITH DEFAULT; 
+{
+    lv_retcode      = gc_success;
+
+    ma_agency_acct_branch_incl  = 
+    SELECT   * 
+    FROM     agency_acct_branch_incl
+    ORDER BY agency_supplier, branch_id;
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'lp_get_agencies ',
+                              lpv_sql_desc  = 'Reading agency_acct_branch_incl table');
+ 
+    IF (lv_ing_result != 0)
+    THEN
+       IF mv_debug = 1
+       THEN
+           MESSAGE 'Debug Error select agency_acct_branch_incl ' WITH STYLE=POPUP;
+       ENDIF;
+
+       CALLPROC lp_log_message(
+                lpv_audit_text = 'Error select agency_acct_branch_incl table');
+                                
+       RETURN gc_fail;
+    ENDIF;
+
+    INQUIRE_INGRES (mv_branch_rows = ROWCOUNT);
+
+    RETURN (lv_retcode);
+}
+
+/*****************************************************************/
+/** Procedure to create email body text for changes             **/
+/*****************************************************************/
+PROCEDURE lp_create_data_email_body() =
+{
+    mv_system_cmd    = 'echo "Hello,\n\nPlease find Overnight Email Report for '
+      + 'Account Changes on ' + '[' + TRIM(CHAR(:mv_run_date)) + '].'
+      + '" > ' + TRIM(:mv_file_data_body );    
+    CALL SYSTEM :mv_system_cmd;
+}
+
+/*****************************************************************/
+/** Procedure to create email body text for no changes          **/
+/*****************************************************************/
+PROCEDURE lp_create_none_email_body() =
+{
+    mv_system_cmd    = 'echo "Hello,\n\nThere are no Overnight Account Changes '
+      + 'for ' + '[' + TRIM(CHAR(:mv_run_date)) + '].'
+      + '" > ' + TRIM(:mv_file_data_body );    
+    CALL SYSTEM :mv_system_cmd;
+}
+
+/*****************************************************************/
+/** Error handling                                              **/
+/*****************************************************************/
+PROCEDURE lp_ing_error_check(lpv_procedure    = CHAR(60),
+                             lpv_sql_desc     = CHAR(60)) =
+DECLARE
+    lv_source_location = CHAR(68);
+    lv_retcode         = INTEGER4 NOT NULL WITH DEFAULT; 
+{
+    lv_retcode         = gc_success;
+
+    lv_source_location = 'Module :agency_accts_batch_email' +
+                         'Procedure :' + lpv_procedure;
+
+    /* cBatch  cDebug  0 = False/Off  1 = True/On  */
+    lv_retcode = CALLPROC ingdb_error_check(
+                              cModuleName     = 'agency_accts_batch_email',
+                              cProcedureName  = IFNULL(lpv_procedure,''),
+                              cSQLdescription = IFNULL(lpv_sql_desc,''),
+                              cBatch          = 1,
+                              cDebug          = 1,
+                              cLogFile        = 'agency_accts_batch_email.log');
+    RETURN (lv_retcode);
+}
+
+/************************************************************************
+* Procedure to create error file.
+* The errorfile is checked for by the calling shell script.
+*************************************************************************/
+PROCEDURE lp_create_error_file() =
+{
+    IF (mv_error_file_created = gc_no)
+    THEN
+        CALL SYSTEM 'touch ' + :gc_temp + 'agency_accts_batch_email.error';
+        mv_error_file_created = gc_yes;
+    ENDIF;
+
+    RETURN;
+}
+
+/*****************************************************************/
+/** Procedure to Log error messages to a log file               **/
+/*****************************************************************/
+PROCEDURE lp_log_message( lpv_audit_text = varchar(256)) =
+DECLARE date_time = VARCHAR(20) NOT NULL,
+{
+    date_time = VARCHAR(DATE('now'));
+    lpv_audit_text = date_time + ' - ' + IFNULL(lpv_audit_text,'Null message');
+
+    CALL SYSTEM 'echo ' + '"' + VARCHAR(lpv_audit_text) + '\n' + '\c' + '"' +
+                ' >> /aahdb/logs/current/agency_accts_main.log';
+    RETURN;
+}
+
+/*******************************************************
+* Procedure to tidy-up the changed account data
+*******************************************************/
+PROCEDURE lp_update_changed_data()=
+DECLARE
+    lv_ing_result     = INTEGER4 NOT NULL WITH DEFAULT; 
+    lv_retcode        = INTEGER4 NOT NULL WITH DEFAULT;     
+{
+    lv_retcode = gc_success;
+
+    /* Delete the LAST dataset...*/
+    DELETE FROM sales_accts_last;
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Delete from sales_accts_last');
+
+    IF (lv_ing_result != 0 AND lv_ing_result != 1) 
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text = 'Error: Delete sales accounts last FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    DELETE FROM sales_accts_extra_last;
+  
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Delete from sales_accts_extra_last');
+
+    IF (lv_ing_result != 0 AND lv_ing_result != 1) 
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text = 'Error: Delete sales extra last FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    /* Copy in CURRENT dataset...*/
+    INSERT INTO sales_accts_last
+    SELECT * FROM sales_accts ;
+  
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Insert into sales_accts_last');
+
+    IF (lv_ing_result != 0)
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text= 'Error: Insert sales accounts last FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    INSERT INTO sales_accts_extra_last
+    SELECT * FROM sales_accts_extra ;
+ 
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Insert into sales_accts_extra_last');
+
+    IF (lv_ing_result != 0)
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text= 'Error: insert sale extra last FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to back-up the changed account data
+*******************************************************/
+PROCEDURE lp_backup_changed_data()=
+DECLARE
+    lv_ing_result     = INTEGER4 NOT NULL WITH DEFAULT; 
+    lv_retcode        = INTEGER4 NOT NULL WITH DEFAULT;     
+{
+    lv_retcode = gc_success;
+
+    /* Delete the LAST BACKUP dataset...*/
+    DELETE FROM sales_accts_last_bk;
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Delete from sales_accts_last_bk');
+
+    IF (lv_ing_result != 0 AND lv_ing_result != 1) 
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text= 'Error: delete sales last bak FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    /* Backup the LAST dataset...*/
+    INSERT INTO sales_accts_last_bk
+    SELECT * FROM sales_accts_last;
+ 
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Insert into sales_accts_last_bk');
+
+    IF (lv_ing_result != 0)
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text= 'Error: insert sales last bak FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    /* Delete the LAST BACKUP dataset...*/
+    DELETE FROM sales_accts_extra_last_bk;
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Delete from sales_accts_extra_last_bk');
+
+    IF (lv_ing_result != 0 AND lv_ing_result != 1) 
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text= 'Error: delete sales extra last bak FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    /* Backup the LAST dataset...*/
+    INSERT INTO sales_accts_extra_last_bk
+    SELECT * FROM sales_accts_extra_last;
+ 
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Insert into sales_accts_extra_last_bk');
+
+    IF (lv_ing_result != 0)
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text= 'Error: insert sales extra last bak FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to back-up the changed account hierarchy   *
+* (relationship) data.                                 *
+********************************************************/
+PROCEDURE lp_backup_changed_rel_data()=
+DECLARE
+    lv_ing_result     = INTEGER4 NOT NULL WITH DEFAULT; 
+    lv_retcode        = INTEGER4 NOT NULL WITH DEFAULT;     
+{
+    lv_retcode = gc_success;
+
+    /* Delete the LAST BACKUP dataset...*/
+    DELETE FROM sales_accts_relationship_last_bk;
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Delete from sales_accts_relationship_last_bk');
+
+    IF (lv_ing_result != 0 AND lv_ing_result != 1) 
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text= 'Error: delete sales relationship last bak FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    /* Backup the LAST dataset...*/
+    INSERT INTO sales_accts_relationship_last_bk
+    SELECT * FROM sales_accts_relationship_last;
+ 
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Insert into sales_accts_relationship_last_bk');
+
+    IF (lv_ing_result != 0)
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text= 'Error: insert sales relationship last bak FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/*****************************************************************/
+/** Procedure to update status of acct_change_audit record      **/
+/*****************************************************************/
+PROCEDURE lp_acct_change_audit_update() =
+DECLARE
+    lv_ing_result     = INTEGER4 NOT NULL WITH DEFAULT; 
+    lv_retcode        = INTEGER4 NOT NULL WITH DEFAULT;     
+{
+    lv_retcode = gc_success;
+
+    UPDATE     acct_change_audit
+    SET        record_status   = 'DONE'
+    WHERE      record_status   = 'READY'
+    AND       (action          = 'CLOSE'
+    OR         action          = 'MOVE');
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'lp_record_status_update',
+                              lpv_sql_desc  = 'Updating acct_change_audit');
+    IF (lv_ing_result != 0 AND
+        lv_ing_result != 1)
+    THEN
+       IF mv_debug = 1
+       THEN
+           MESSAGE 'Debug Error update acct_change_audit ' WITH STYLE=POPUP;
+       ENDIF;
+
+       CALLPROC lp_log_message(
+                lpv_audit_text = 'Error: Update acct_change_audit');
+       RETURN gc_fail;
+    ENDIF;
+
+    DELETE 
+    FROM   acct_change_audit
+    WHERE  record_status  = 'DONE'
+    AND    change_date   <=  DATE('today') - '10 days';
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Delete from acct_change_audit');
+
+    IF (lv_ing_result != 0 )
+    THEN
+       IF (lv_ing_result != 1) /* Ignore 0 rowcount */
+       THEN
+          CALLPROC lp_log_message(
+                   lpv_audit_text = 'Error: Delete from acct_change_audit'  +
+                                   ' Change Date: ' + VARCHAR(:mv_change_date));
+          CALLPROC lp_create_error_file();
+          RETURN gc_fail;
+       ENDIF;
+    ENDIF;
+
+ 
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to tidy-up the changed account hierarchy   *
+* (relationship) data.                                 *
+********************************************************/
+PROCEDURE lp_update_changed_rel_data()=
+DECLARE
+    lv_ing_result     = INTEGER4 NOT NULL WITH DEFAULT; 
+    lv_retcode        = INTEGER4 NOT NULL WITH DEFAULT;     
+{
+    lv_retcode = gc_success;
+
+    /* Delete the LAST dataset...*/
+    DELETE FROM sales_accts_relationship_last;
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Delete from sales_accts_relationship_last');
+
+    IF (lv_ing_result != 0 AND lv_ing_result != 1)
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text = 'Error: Delete from sales_accounts_relationships last FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    /* Copy in CURRENT dataset...*/
+    INSERT INTO sales_accts_relationship_last
+    SELECT * FROM sales_accts_relationship;
+
+    lv_ing_result  = CALLPROC lp_ing_error_check (
+                              lpv_procedure = 'Main ',
+                              lpv_sql_desc  = 'Insert into sales_accts_relationship_last');
+
+    IF (lv_ing_result != 0)
+    THEN
+        CALLPROC lp_log_message(lpv_audit_text= 'Error: Insert into sales_accounts_relationships last FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    RETURN gc_success;
+}

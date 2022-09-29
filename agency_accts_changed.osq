@@ -1,0 +1,1045 @@
+/***********************************************************
+*  Procedure      - agency_accts_changed.osq
+*  Author         - P Nagra
+*
+*  Date           - 24-Jul-2014
+*
+*  Project        - GSK SAP
+*
+*  Purpose        - Creates reports (1 per agency_supplier)
+*                   highlighting changes in a Sales Account 
+*                   record
+*
+*  Description    - If a change has been made to particular
+*                   Sales Account details (since yesterday)
+*                   then include the account within the report
+*
+*  Called From    - agency_accts_batch_email.osq
+*  Parameters IN  - agency_supplier, file_name, change count
+*  Parameters OUT - change count 
+*
+************************************************************
+* Ver | Date     |Coded| Description
+***** |**********|*****|************************************
+* 1.0 |21/11/2013| PSN | Original Version
+*-----|----------|-----|------------------------------------
+* 2.0 |08/10/2014| ISS | 1.Ignore commas within text fields
+*     |          |     | 2.Include second_cust_type column in 
+*     |          |     |   report.
+***********************************************************/
+PROCEDURE agency_accts_changed
+(
+    pv_agency_supplier     = INTEGER(4)    NOT NULL WITH DEFAULT;
+    pv_file_attach         = VARCHAR(250)  NOT NULL WITH DEFAULT;
+    pv_chg_cnt             = INTEGER(4)    NOT NULL WITH DEFAULT;        
+)=
+
+DECLARE
+/***********************************************************
+** INGRES ERROR HANDLING VARIABLES
+***********************************************************/
+
+    IIerrorno              = INTEGER       NOT NULL WITH DEFAULT,
+    IIrowcount             = INTEGER       NOT NULL WITH DEFAULT,
+    IIerrortext            = VARCHAR (256) NOT NULL WITH DEFAULT,
+
+/***********************************************************
+** PROCEDURE SPECIFIC VARIABLES
+***********************************************************/
+
+    IIchar                 = VARCHAR(32)   NOT NULL WITH DEFAULT,
+    IIint                  = INTEGER       NOT NULL WITH DEFAULT,
+
+    mv_debug               = CHAR(1)       NOT NULL WITH DEFAULT,
+    mv_count               = INTEGER(4)    NOT NULL WITH DEFAULT,
+    mv_cnt_amount          = INTEGER(4)    NOT NULL WITH DEFAULT,
+    mv_curr_row            = INTEGER(4)    NOT NULL WITH DEFAULT,
+    mv_change              = CHAR(1)       NOT NULL WITH DEFAULT,
+    mv_command_line        = VARCHAR(100)  NOT NULL WITH DEFAULT,
+    mv_system_cmd          = VARCHAR(1000) NOT NULL WITH DEFAULT,
+
+    ma_accts_curr          = ARRAY OF agency_accts;
+    ma_accts_last          = ARRAY OF agency_accts;
+
+/***********************************************************
+** LOCAL PROCEDURES
+***********************************************************/
+
+    lp_display_message     = PROCEDURE RETURNING NONE;
+    lp_create_sess_tbl     = PROCEDURE RETURNING INTEGER;
+    lp_process_data        = PROCEDURE RETURNING INTEGER;
+    lp_tidy_data           = PROCEDURE RETURNING INTEGER;
+    lp_get_last            = PROCEDURE RETURNING INTEGER;
+    lp_sales_accts         = PROCEDURE RETURNING INTEGER;
+    lp_sales_accts_extra   = PROCEDURE RETURNING INTEGER;
+    lp_write_acc           = PROCEDURE RETURNING INTEGER;
+    lp_create_changed_hdr  = PROCEDURE RETURNING INTEGER4 NOT NULL;
+
+
+/***********************************************************
+** MAIN PROCEDURE - agency_accts_changed
+***********************************************************/
+{
+    IIint = gc_success;
+
+    CALLPROC lp_display_message(lpv_message = 'Process STARTED...');
+
+    mv_debug = gc_no;
+
+    pv_chg_cnt = 0;
+
+    IF (mv_debug = gc_yes)
+    THEN
+       /* Decipher command line parameters...*/
+       mv_command_line = CommandLineParameters();
+       pv_agency_supplier = INT4(LEFT(mv_command_line, 1));
+    ENDIF;
+
+    CALLPROC lp_display_message(lpv_message =
+                'Processing Agency Accts Changed for Agency Supplier ID: '
+                       + VARCHAR(pv_agency_supplier));
+
+    /* Create the driver session table...*/
+    IF (lp_create_sess_tbl (lpv_count = BYREF(mv_count)) != gc_success)
+    THEN
+       CALLPROC lp_display_message(lpv_message = 'Session Table creation failed');
+       RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    /* Continue if rows to process...*/
+    IF (mv_count != 0)
+    THEN
+       /* Perform main processing...*/
+       IF (lp_process_data () != gc_success)  
+       THEN
+          CALLPROC lp_display_message(lpv_message = 'Failed in main processing');
+          IF (lp_tidy_data () != gc_success)
+          THEN
+             CALLPROC lp_display_message(lpv_message = 'Failed in tidy-up routine');
+             RETURN gc_fail;
+          ENDIF;
+          RETURN gc_fail;
+       ENDIF;
+
+       /* Tidy up...*/
+       IF (lp_tidy_data () != gc_success)
+       THEN
+          CALLPROC lp_display_message(lpv_message = 'Failed in tidy-up routine');
+          RETURN gc_fail;
+       ENDIF;
+    ENDIF;
+
+    CALLPROC lp_display_message(lpv_message = 'Total CHANGED records for Agency Supplier : '
+                                             + VARCHAR(pv_agency_supplier) + ' is '
+                                             + VARCHAR(pv_chg_cnt));
+    CALLPROC lp_display_message(lpv_message = 'Process COMPLETED');
+
+    RETURN gc_success;
+}
+
+/***********************************************************
+* Procedure to display message
+***********************************************************/
+PROCEDURE lp_display_message
+(
+    lpv_message = VARCHAR(120) 
+)=
+DECLARE date_time = VARCHAR(20) NOT NULL,
+{
+    date_time = VARCHAR(DATE('now'));
+    lpv_message = date_time + ' - ' + IFNULL(lpv_message,'Null message');
+
+    CALL SYSTEM 'echo ' + '"' + VARCHAR(lpv_message) + '\n' + '\c' + '"' +
+                ' >> /aahdb/logs/current/agency_accts_changed.log';
+    RETURN;
+}
+/***********************************************************
+* Procedure to create session driver table
+***********************************************************/
+PROCEDURE lp_create_sess_tbl 
+(
+    lpv_count = INTEGER(4) NOT NULL WITH DEFAULT,
+)=
+{
+    IIint = CALLPROC drop_session_table('SESSION.agency_accts_current');
+
+    COMMIT;
+
+    /* 
+     * Create a session table for the sales_accts/sales_accts_extra
+     * where the branch is in agency_acct_branch_incl
+     */
+    DECLARE GLOBAL TEMPORARY TABLE SESSION.agency_accts_current
+    AS
+        SELECT a.branch,
+               a.account_no,
+               a.addr_line1,
+               a.addr_line2,
+               a.addr_line3,
+               a.addr_line4,
+               a.post_code,
+               a.udi_name,
+               a.tel_no,
+               a.cheque_name,
+               a.custype_no,
+               a.second_cust_type,
+               a.custgroup_no,
+               a.rha_no,
+               a.rebate_code,
+               a.pricing_group,
+               a.nhs_div_no,
+               a.netted_disc,
+               a.due_for_del,
+               a.credit_risk,
+               a.credit_limit,
+               a.ana_1,
+               a.vat_mkr,
+               c.vat_status,
+               a.stop_warn,
+               a.trans_acc_branch,
+               a.trans_acc_no,
+               b.vat_no,
+               b.fax_no,
+               b.email,
+               b.terms_code_1,
+               b.terms_type_1,
+               b.terms_date_1,
+               b.terms_pcnt_1,
+               b.linking_branch,
+               b.linking_account_no,
+               b.buying_group
+        FROM sales_accts a JOIN sales_accts_extra b
+        ON     a.branch     = b.branch
+        AND    a.account_no = b.account_no
+        LEFT JOIN saccts_vat_status c
+        ON     a.vat_mkr    = c.vat_mkr
+        WHERE  a.branch IN (SELECT branch_id
+                            FROM   agency_acct_branch_incl
+                            WHERE  agency_supplier = :pv_agency_supplier)
+                            AND   (udi_name NOT LIKE '%(MND)%')
+    ON COMMIT PRESERVE ROWS WITH NORECOVERY;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        MESSAGE '-15- INGRES error in DECLARE table ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    IF (mv_debug = gc_yes)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Driver tbl rowcount is ' + varchar(IIrowcount));
+    ENDIF;
+
+    /*
+     * Now insert accounts which are NON-Trading (9999) and their branch DOES NOT exist
+     * in agency_acct_branch_incl AND they are 'Head Office OR Top Link' AND they are NOT
+     * Delivery accounts
+     */
+    INSERT INTO SESSION.agency_accts_current
+    SELECT a.branch,
+           a.account_no,
+           a.addr_line1,
+           a.addr_line2,
+           a.addr_line3,
+           a.addr_line4,
+           a.post_code,
+           a.udi_name,
+           a.tel_no,
+           a.cheque_name,
+           a.custype_no,
+           a.second_cust_type,
+           a.custgroup_no,
+           a.rha_no,
+           a.rebate_code,
+           a.pricing_group,
+           a.nhs_div_no,
+           a.netted_disc,
+           a.due_for_del,
+           a.credit_risk,
+           a.credit_limit,
+           a.ana_1,
+           a.vat_mkr,
+           c.vat_status,
+           a.stop_warn,
+           a.trans_acc_branch,
+           a.trans_acc_no,
+           b.vat_no,
+           b.fax_no,
+           b.email,
+           b.terms_code_1,
+           b.terms_type_1,
+           b.terms_date_1,
+           b.terms_pcnt_1,
+           b.linking_branch,
+           b.linking_account_no,
+           b.buying_group
+    FROM sales_accts a JOIN sales_accts_extra b
+    ON     a.branch     = b.branch
+    AND    a.account_no = b.account_no
+    LEFT JOIN saccts_vat_status c
+    ON     a.vat_mkr    = c.vat_mkr
+    WHERE (a.branch NOT IN (SELECT branch_id
+                            FROM agency_acct_branch_incl))
+    AND (pricing_group = 9999)
+    AND ((udi_name LIKE '%(H/O)%') OR (udi_name LIKE '%(TL)%'))
+    AND (udi_name NOT LIKE '%(DEL)%');
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        MESSAGE '-20- INGRES error in DELETE table ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    IF (mv_debug = gc_yes)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Driver tbl Insert count is ' + varchar(IIrowcount));
+    ENDIF;
+
+    /* Remove any Internal accounts from the driver table...*/
+    DELETE FROM SESSION.agency_accts_current a
+    WHERE EXISTS (SELECT 1 
+                  FROM internal_trans b
+                  WHERE a.branch = b.branch
+                  AND a.account_no = b.account_no);
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        MESSAGE '-25- INGRES error in DELETE table ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    IF (mv_debug = gc_yes)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Driver tbl Delete count is ' + varchar(IIrowcount));
+    ENDIF;
+
+    SELECT COUNT(*) AS lpv_count
+    FROM SESSION.agency_accts_current;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        MESSAGE '-28- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    IF (mv_debug = gc_yes)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 'Driver tbl Final count is ' + varchar(lpv_count));
+        mv_cnt_amount = (lpv_count / 8); 
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to perform main processing
+*******************************************************/
+PROCEDURE lp_process_data (
+)=
+DECLARE lv_done        = CHAR(1)     NOT NULL WITH DEFAULT,
+        lv_column_name = VARCHAR(20) NOT NULL WITH DEFAULT,
+        lv_counter     = INTEGER(4)  NOT NULL WITH DEFAULT,
+{
+    IIint = CALLPROC ARRAYCLEAR(ma_accts_curr);
+
+    /* Load the array from the driver table...*/
+    ma_accts_curr = SELECT *
+                    FROM SESSION.agency_accts_current;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        MESSAGE '-30- INGRES error in load array (1) ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    /* Process array...*/
+    UNLOADTABLE ma_accts_curr (mv_curr_row = _RECORD)
+    {
+        /* Load related row from LAST table...*/
+        IF (lp_get_last () != gc_success)
+        THEN
+            CALLPROC lp_display_message(lpv_message = 'Session Table creation failed');
+            RETURN gc_fail;
+        ENDIF;
+
+         /* Only if Account is not NEW...*/
+        IF (IIrowcount > 0)
+        THEN
+            lv_done = gc_no;
+            mv_change = gc_no;
+
+            /* Perform the checks for sales_accts fields...*/
+            SELECT column_name AS lv_column_name
+            FROM agency_supplier_template
+            WHERE table_name = 'sales_accts'
+            AND column_name != ''
+            AND agency_supplier = :pv_agency_supplier
+            {
+                IF (lp_sales_accts (lpv_column_name = lv_column_name) != gc_success)
+                THEN
+                    CALLPROC lp_display_message(lpv_message = 'Session Table creation failed');
+                    RETURN gc_fail;
+                ENDIF;
+
+                IF (mv_change = gc_yes)
+                THEN
+                    /* Write records to the file...*/
+                    IF (lp_write_acc () != gc_success)
+                    THEN
+                        CALLPROC lp_display_message(lpv_message = 'Write records failed');
+                        RETURN gc_fail;
+                    ENDIF;
+                    pv_chg_cnt = pv_chg_cnt + 1;
+                    lv_done = gc_yes;
+                    ENDLOOP;
+                ENDIF;
+
+            };
+
+            INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+            IF (IIerrorno != gc_success)
+            THEN
+                MESSAGE '-60- INGRES error in SELECT loop (1) ' + IIerrortext WITH STYLE = POPUP;
+                CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+                RETURN gc_fail;
+            ENDIF;
+    
+            IF (lv_done != gc_yes)
+            THEN
+                /* Perform the checks for sales_accts_extra fields...*/
+                SELECT column_name AS lv_column_name
+                FROM agency_supplier_template
+                WHERE table_name = 'sales_accts_extra'
+                AND column_name != ''
+                AND agency_supplier = :pv_agency_supplier
+                {
+                    /* Perform the checks for sales_accts fields...*/
+                    IF (lp_sales_accts_extra (lpv_column_name = lv_column_name) != gc_success)
+                    THEN
+                        CALLPROC lp_display_message(lpv_message = 'Session Table creation failed');
+                        RETURN gc_fail;
+                    ENDIF;
+        
+                    IF (mv_change = gc_yes)
+                    THEN
+                        /* Insert records into the changed table */
+                        IF (lp_write_acc () != gc_success)
+                        THEN
+                            CALLPROC lp_display_message(lpv_message = 'Write records failed');
+                            RETURN gc_fail;
+                        ENDIF;
+                        pv_chg_cnt = pv_chg_cnt + 1;
+                        ENDLOOP;
+                    ENDIF;
+                };
+
+                INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+                IF (IIerrorno != gc_success)
+                THEN
+                    MESSAGE '-65- INGRES error in SELECT loop (2) ' + IIerrortext WITH STYLE = POPUP;
+                    CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+                    RETURN gc_fail;
+                ENDIF;
+            ENDIF;
+        ENDIF;
+
+        IF (mv_debug = gc_yes)
+        THEN
+            IF (lv_counter = mv_cnt_amount)
+            THEN
+                CALLPROC lp_display_message(lpv_message = 'No of records processed so far: ' + 
+                                                          VARCHAR(lv_counter));
+                lv_counter = 0;
+            ENDIF;
+        ENDIF;
+    };
+
+    mv_system_cmd   = 'echo ' + ' ' + ' >> ' + :pv_file_attach;
+    CALL SYSTEM :mv_system_cmd;
+
+    COMMIT;
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to check Sales Accts columns
+*******************************************************/
+PROCEDURE lp_sales_accts 
+(
+    lpv_column_name = VARCHAR(32)  NOT NULL,
+)=
+{
+    IF lpv_column_name = 'branch'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].branch != ma_accts_last[1].branch)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'account_no'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].account_no != ma_accts_last[1].account_no)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'addr_line1'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].addr_line1 != ma_accts_last[1].addr_line1)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'addr_line2'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].addr_line2 != ma_accts_last[1].addr_line2)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'addr_line3'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].addr_line3 != ma_accts_last[1].addr_line3)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'addr_line4'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].addr_line4 != ma_accts_last[1].addr_line4)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'post_code'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].post_code != ma_accts_last[1].post_code)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'udi_name'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].udi_name != ma_accts_last[1].udi_name)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'tel_no'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].tel_no != ma_accts_last[1].tel_no)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'cheque_name'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].cheque_name != ma_accts_last[1].cheque_name)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'custype_no'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].custype_no != ma_accts_last[1].custype_no)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'second_cust_type'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].second_cust_type != ma_accts_last[1].second_cust_type)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'custgroup_no'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].custgroup_no != ma_accts_last[1].custgroup_no)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'rha_no'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].rha_no != ma_accts_last[1].rha_no)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'rebate_code'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].rebate_code != ma_accts_last[1].rebate_code)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'pricing_group'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].pricing_group != ma_accts_last[1].pricing_group)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'nhs_div_no'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].nhs_div_no != ma_accts_last[1].nhs_div_no)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'netted_disc'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].netted_disc != ma_accts_last[1].netted_disc)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'due_for_del'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].due_for_del != ma_accts_last[1].due_for_del)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'credit_risk'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].credit_risk != ma_accts_last[1].credit_risk)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'credit_limit'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].credit_limit != ma_accts_last[1].credit_limit)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'ana_1'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].ana_1 != ma_accts_last[1].ana_1)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'vat_mkr'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].vat_mkr != ma_accts_last[1].vat_mkr)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'stop_warn'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].stop_warn != ma_accts_last[1].stop_warn)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'trans_acc_branch'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].trans_acc_branch != ma_accts_last[1].trans_acc_branch)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'trans_acc_no'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].trans_acc_no != ma_accts_last[1].trans_acc_no)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to check Sales Accts Extra columns
+*******************************************************/
+PROCEDURE lp_sales_accts_extra 
+(
+    lpv_column_name = VARCHAR(32)  NOT NULL,
+)=
+{
+    IF lpv_column_name = 'vat_no'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].vat_no != ma_accts_last[1].vat_no)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'fax_no'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].fax_no != ma_accts_last[1].fax_no)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'email'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].email != ma_accts_last[1].email)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'terms_code_1'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].terms_code_1 != ma_accts_last[1].terms_code_1)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'terms_type_1'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].terms_type_1 != ma_accts_last[1].terms_type_1)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'terms_date_1'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].terms_date_1 != ma_accts_last[1].terms_date_1)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'terms_date_1'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].terms_date_1 != ma_accts_last[1].terms_date_1)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'terms_pcnt_1'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].terms_pcnt_1 != ma_accts_last[1].terms_pcnt_1)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'linking_branch'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].linking_branch != ma_accts_last[1].linking_branch)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'linking_account_no'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].linking_account_no != ma_accts_last[1].linking_account_no)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ELSEIF lpv_column_name = 'buying_group'
+    THEN
+        IF (ma_accts_curr[mv_curr_row].buying_group != ma_accts_last[1].buying_group)
+        THEN
+            mv_change = gc_yes;
+        ENDIF;
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to get LAST datarow
+*******************************************************/
+PROCEDURE lp_get_last ()=
+{
+    IIint = CALLPROC ARRAYCLEAR(ma_accts_last);
+
+    ma_accts_last = 
+        SELECT a.branch,
+               a.account_no,
+               a.addr_line1,
+               a.addr_line2,
+               a.addr_line3,
+               a.addr_line4,
+               a.post_code,
+               a.udi_name,
+               a.tel_no,
+               a.cheque_name,
+               a.custype_no,
+               a.second_cust_type,
+               a.custgroup_no,
+               a.rha_no,
+               a.rebate_code,
+               a.pricing_group,
+               a.nhs_div_no,
+               a.netted_disc,
+               a.due_for_del,
+               a.credit_risk,
+               a.credit_limit,
+               a.ana_1,
+               a.vat_mkr,
+               c.vat_status,
+               a.stop_warn,
+               a.trans_acc_branch,
+               a.trans_acc_no,
+               b.vat_no,
+               b.fax_no,
+               b.email,
+               b.terms_code_1,
+               b.terms_type_1,
+               b.terms_date_1,
+               b.terms_pcnt_1,
+               b.linking_branch,
+               b.linking_account_no,
+               b.buying_group
+        FROM   sales_accts_last a JOIN sales_accts_extra_last b
+        ON     a.branch     = b.branch
+        AND    a.account_no = b.account_no
+        LEFT JOIN saccts_vat_status c
+        ON     a.vat_mkr    = c.vat_mkr
+        WHERE  a.branch     = :ma_accts_curr[mv_curr_row].branch
+        AND    a.account_no = :ma_accts_curr[mv_curr_row].account_no;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        MESSAGE '-35- INGRES error in load array (2) ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to write account details to the file
+*******************************************************/
+PROCEDURE lp_write_acc (
+)=
+DECLARE lv_nco                  = VARCHAR(3)  NOT NULL WITH DEFAULT,
+        lv_gsk_channel          = VARCHAR(60) NOT NULL WITH DEFAULT,
+        lv_agency_supplier_code = VARCHAR(32) NOT NULL WITH DEFAULT,
+        lv_agency_supplier_desc = VARCHAR(32) NOT NULL WITH DEFAULT,
+        lv_stop_warn            = VARCHAR(10) NOT NULL WITH DEFAULT,
+        lv_vat_status           = VARCHAR(20) NOT NULL WITH DEFAULT,
+        lv_credit_risk_desc     = VARCHAR(32) NOT NULL WITH DEFAULT,
+        lv_retcode              = INTEGER4 NOT NULL WITH DEFAULT; 
+{
+    lv_retcode      = gc_success;
+
+    /* Setup the Before line...*/
+ 
+    IF (pv_chg_cnt = 0) 
+    THEN   
+       lv_retcode = lp_create_changed_hdr ();
+       IF (lv_retcode != gc_success)
+       THEN
+          CALLPROC lp_create_error_file();
+          RETURN gc_fail;
+       ENDIF;
+    ENDIF;
+
+    IF (ma_accts_last[1].second_cust_type = 12)
+    THEN
+        lv_nco = 'Yes';
+    ELSE
+        lv_nco = 'No';
+    ENDIF;
+
+    SELECT agency_supplier_code AS lv_agency_supplier_code,
+           agency_supplier_desc AS lv_agency_supplier_desc
+    FROM   agency_supplier_mapping
+    WHERE  agency_supplier = :pv_agency_supplier
+    AND    aah_code        = :ma_accts_last[1].custype_no
+    AND    mapping_type    = 'CUST';
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        MESSAGE '-70- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    lv_gsk_channel = CONCAT(CONCAT(CONCAT(CONCAT(TRIM(VARCHAR(pv_agency_supplier)), '-'), 
+                     TRIM(lv_agency_supplier_code)), '-'), TRIM(lv_agency_supplier_desc));
+
+    SELECT description AS lv_credit_risk_desc
+    FROM credit_risks
+    WHERE code = :ma_accts_last[1].credit_risk;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        MESSAGE '-75- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    IF (ma_accts_last[1].stop_warn = 'Y')
+    THEN
+        lv_stop_warn = 'Stop';
+    ELSE
+        lv_stop_warn = 'Free';
+    ENDIF;
+
+    IF ((ma_accts_last[1].vat_status = 'VAT to be paid') OR 
+        (ma_accts_last[1].vat_status = 'Internal'))
+    THEN
+        lv_vat_status = 'Standard';
+    ELSE
+        lv_vat_status = ma_accts_last[1].vat_status;
+    ENDIF;
+
+    /* Write the Before line...*/
+    mv_system_cmd = 'echo ' + '''' + 'Before' 
+      + ',' + '"' + CONCAT(TRIM(ma_accts_last[1].branch),
+                           TRIM(ma_accts_last[1].account_no))
+      + '"' + ',' + '"'  + TRIM(ma_accts_last[1].addr_line1)
+      + '"' + ',' + '"'  + TRIM(ma_accts_last[1].addr_line2)
+      + '"' + ',' + '"'  + TRIM(ma_accts_last[1].addr_line3)
+      + '"' + ',' + '"'  + TRIM(ma_accts_last[1].addr_line4)
+      + '"' + ',' + '"'  + TRIM(ma_accts_last[1].post_code)
+      + '"' + ',' + '"'  + TRIM(ma_accts_last[1].tel_no)
+      + '"' + ',' + '"'  + TRIM(ma_accts_last[1].email)
+      + '"' + ',' + '"'  + TRIM(VARCHAR(ma_accts_last[1].custype_no))
+      + '"' + ',' + '"'  + TRIM(VARCHAR(ma_accts_last[1].second_cust_type))
+      + '"' + ',' + '"'  + TRIM(lv_nco)
+      + '"' + ',' + '"'  + TRIM(VARCHAR(ma_accts_last[1].custgroup_no))
+      + '"' + ',' + '"'  + TRIM(lv_gsk_channel)
+      + '"' + ',' + '"'  + TRIM(lv_credit_risk_desc)
+      + '"' + ',' + '"'  + TRIM(lv_stop_warn) 
+      + '"' + ',' + '"'  + TRIM(lv_vat_status)
+      + '"' + ',' + '''' + ' >> ' + :pv_file_attach;
+
+    CALL SYSTEM :mv_system_cmd;
+
+    /* Setup the After line...*/
+    IF (ma_accts_curr[mv_curr_row].second_cust_type = 12)
+    THEN
+        lv_nco = 'Yes';
+    ELSE
+        lv_nco = 'No';
+    ENDIF;
+
+    SELECT agency_supplier_code AS lv_agency_supplier_code,
+           agency_supplier_desc AS lv_agency_supplier_desc
+    FROM agency_supplier_mapping
+    WHERE agency_supplier = :pv_agency_supplier
+    AND aah_code = :ma_accts_curr[mv_curr_row].custype_no
+    AND mapping_type = 'CUST';
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        MESSAGE '-70- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    lv_gsk_channel = CONCAT(CONCAT(CONCAT(CONCAT(TRIM(VARCHAR(pv_agency_supplier)), '-'), 
+                     TRIM(lv_agency_supplier_code)), '-'), TRIM(lv_agency_supplier_desc));
+
+    SELECT description AS lv_credit_risk_desc
+    FROM credit_risks
+    WHERE code = :ma_accts_curr[mv_curr_row].credit_risk;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        MESSAGE '-75- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_display_message(lpv_message = 'Process FAILED');
+        RETURN gc_fail;
+    ENDIF;
+
+    IF (ma_accts_curr[mv_curr_row].stop_warn = 'Y')
+    THEN
+        lv_stop_warn = 'Stop';
+    ELSE
+        lv_stop_warn = 'Free';
+    ENDIF;
+
+    IF ((ma_accts_curr[mv_curr_row].vat_status = 'VAT to be paid') OR
+        (ma_accts_curr[mv_curr_row].vat_status = 'Internal'))
+    THEN
+        lv_vat_status = 'Standard';
+    ELSE
+        lv_vat_status = ma_accts_curr[mv_curr_row].vat_status;
+    ENDIF;
+
+    /* Write the After line...*/
+    mv_system_cmd = 'echo ' + '''' + 'After' 
+      + ',' + '"' + CONCAT(TRIM(ma_accts_curr[mv_curr_row].branch),
+                           TRIM(ma_accts_curr[mv_curr_row].account_no))    
+      + '"' + ',' + '"'  + TRIM(ma_accts_curr[mv_curr_row].addr_line1)
+      + '"' + ',' + '"'  + TRIM(ma_accts_curr[mv_curr_row].addr_line2)
+      + '"' + ',' + '"'  + TRIM(ma_accts_curr[mv_curr_row].addr_line3)
+      + '"' + ',' + '"'  + TRIM(ma_accts_curr[mv_curr_row].addr_line4)
+      + '"' + ',' + '"'  + TRIM(ma_accts_curr[mv_curr_row].post_code)
+      + '"' + ',' + '"'  + TRIM(ma_accts_curr[mv_curr_row].tel_no)
+      + '"' + ',' + '"'  + TRIM(ma_accts_curr[mv_curr_row].email) 
+      + '"' + ',' + '"'  + TRIM(VARCHAR(ma_accts_curr[mv_curr_row].custype_no))
+      + '"' + ',' + '"'  + TRIM(VARCHAR(ma_accts_curr[mv_curr_row].second_cust_type))
+      + '"' + ',' + '"'  + TRIM(lv_nco)                                          
+      + '"' + ',' + '"'  + TRIM(VARCHAR(ma_accts_curr[mv_curr_row].custgroup_no))
+      + '"' + ',' + '"'  + TRIM(lv_gsk_channel)
+      + '"' + ',' + '"'  + TRIM(lv_credit_risk_desc)
+      + '"' + ',' + '"'  + TRIM(lv_stop_warn)
+      + '"' + ',' + '"'  + TRIM(lv_vat_status)
+      + '"' + ',' + '''' + ' >> ' + :pv_file_attach;
+
+    CALL SYSTEM :mv_system_cmd;
+ 
+    mv_system_cmd = 'echo ' + ' ' + ' >> ' + :pv_file_attach;
+    CALL SYSTEM :mv_system_cmd;
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to tidy-up the data
+*******************************************************/
+PROCEDURE lp_tidy_data ()=
+{
+    /*  Main tidy moved to calling process so it can be re run */
+    IIint = CALLPROC drop_session_table('SESSION.agency_accts_current');
+
+    COMMIT;
+
+    RETURN gc_success;
+}
+/*****************************************************************/
+/** Procedure to create comma separated <CHANGED> header file   **/
+/*****************************************************************/
+PROCEDURE lp_create_changed_hdr() =
+DECLARE 
+    lv_retcode      = INTEGER4 NOT NULL WITH DEFAULT; 
+{
+    lv_retcode      = gc_success;
+
+    mv_system_cmd          = 'echo ' + ' ' + '"' + 'Changed Accounts' + '"' 
+                        + ' >> ' + :pv_file_attach;
+    CALL SYSTEM :mv_system_cmd;
+
+    mv_system_cmd = 'echo ' + ' ' + '"' + '' + '"' +  ' >> ' + :pv_file_attach;
+    CALL SYSTEM :mv_system_cmd;
+
+    mv_system_cmd = 'echo ' + ' ' + '"' + 'Status,'        + '"' +
+                                    '"' + 'Account,'       + '"' +
+                                    '"' + 'Address 1,'     + '"' +
+                                    '"' + 'Address 2,'     + '"' +
+                                    '"' + 'Address 3,'     + '"' +
+                                    '"' + 'Address 4,'     + '"' +
+                                    '"' + 'Post Code,'     + '"' +
+                                    '"' + 'Tel No,'        + '"' +
+                                    '"' + 'Email,'         + '"' +
+                                    '"' + 'Cust Type,'     + '"' +
+                                    '"' + '2nd Cust Type,' + '"' +
+                                    '"' + 'NDD,'           + '"' +
+                                    '"' + 'Cust Group,'    + '"' +
+                                    '"' + 'GSK Channel,'   + '"' +
+                                    '"' + 'Credit Risk,'   + '"' +
+                                    '"' + 'Stop/Warn,'     + '"' +
+                                    '"' + 'VAT'            + '"' +
+                    ' >> ' + :pv_file_attach;
+    CALL SYSTEM :mv_system_cmd;
+
+    RETURN(lv_retcode);
+}
+
+

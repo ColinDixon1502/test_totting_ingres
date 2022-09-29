@@ -1,0 +1,72 @@
+/*
+**
+**  Report Name: agency_allocations_rejects_load
+**        
+**         Date: 06/10/2021
+**
+**       Author: Irfan Salim
+**
+*/
+.NAME agency_allocations_rejects_load
+.PW 500
+.NOFIRSTFF
+.NOFORMFEED
+.PL 0
+
+.DECLARE
+   IIreport_number = integer
+	 
+.SETUP
+   SET LOCKMODE SESSION WHERE READLOCK = NOLOCK ,MAXLOCKS = 300 ;
+
+.QUERY
+
+SELECT line_no,
+       agency_id,
+       agency_group,
+       id_flag,
+       ean_code,
+       daily_allocation,
+       monthly_allocation,
+       deletion_flag,
+       reject_reason
+FROM   session.agency_allocations
+WHERE  reject_code != 0
+
+.SORT
+       line_no : a
+       reject_reason : a,
+
+.HEADER report
+   .TAB  0   .PR 'Line'
+   .TAB  8   .PR 'AgencyID'
+   .TAB  19  .PR 'Group'
+   .TAB  26  .PR 'IdFlag'
+   .TAB  34  .PR 'EAN'
+   .TAB  50  .PR 'DlyAlloc'
+   .TAB  60  .PR 'MthAlloc'
+   .TAB  72  .PR 'DelFlag'
+   .TAB  81  .PR 'RejectReason'
+   .NL
+
+.DETAIL
+   .TAB  0   .PR line_no ("-----n")
+   .TAB  7   .PR ' '
+   .TAB  8   .PR trim(agency_id)
+   .TAB  18  .PR ' '
+   .TAB  19  .PR trim(agency_group)
+   .TAB  25  .PR ' '
+   .TAB  26  .PR trim(id_flag)
+   .TAB  33  .PR ' '
+   .TAB  34  .PR trim(ean_code)
+   .TAB  49  .PR ' '
+   .TAB  50  .PR trim(daily_allocation)
+   .TAB  59  .PR ' '
+   .TAB  60  .PR trim(monthly_allocation)
+   .TAB  71  .PR ' '
+   .TAB  72  .PR trim(deletion_flag)
+   .TAB  80  .PR ' '
+   .TAB  81  .PR trim(reject_reason)
+   .NL 1
+
+.FOOTER report

@@ -1,0 +1,1115 @@
+/****************************************************************************/
+/*  Procedure     - agency_customer_data_load                               */
+/*                                                                          */
+/*  Author        - I.Salim                                                 */
+/*                                                                          */
+/*  Date          - 03.07.17                                                */
+/*                                                                          */
+/*  Type          - Batch Procedure                                         */
+/*                                                                          */
+/*  Source        - agency_customer_data_load.osq                           */
+/*                                                                          */
+/*  Details       - Update values in the following tables from data loaded  */
+/*                  into agency_customer_data_load table by MASAI.          */
+/*                  - saccts_supplier_acctno.supplier_account (Agency ID)   */
+/*                  - saccts_supplier_acctno.tpo_phone_no (Agency Group ID) */
+/*                  - saccts_mkrs.mkr_status. (Agency RTB Flag)             */
+/*                  The agency no will be passed in from calling shell      */
+/*                  script. The sequence no used will be 41.                */
+/*                  Agency ID and Agency Group ID to be validated prior     */
+/*                  to updating Ingres tables.                              */
+/*                  The saccts_mkrs.mkr_status to be updated using          */
+/*                  agency_supplier.mkr_code before updating RemTP via MCS. */
+/*                  Handle processing of multiple files. A separate email   */
+/*                  to be generated for each file with filename in subject  */
+/*                  line.                                                   */
+/*                  MCS failure sending updated RTB flag to RemTP will      */
+/*                  be categorised as a catastrophic error and result in    */
+/*                  email notification being sent to Operations. All        */
+/*                  processing will terminate.                              */
+/*                                                                          */
+/*  Called From   - agency_customer_data_load.ksh                           */
+/*                                                                          */
+/*  Parameters IN - Agency Supplier                                         */
+/*                                                                          */
+/*  Useful        - Reject codes for data processed by Ingres:              */
+/*                  '30' Invalid AAH account for Agency ID/Group            */
+/*                                                                          */
+/*                - Rejected codes for data processed by MASAI:             */
+/*                  '1' Empty File                                          */
+/*                  '2' File corrupt - Invalid Footer                       */
+/*                  '3' AAH Account  - Missing                              */
+/*                  '4' Agency ID    - Missing                              */
+/*                  '5' Agency ID    - Invalid                              */
+/*                  '6' Right To Buy - Missing                              */
+/*                  '7' Right To Buy - Invalid                              */
+/*                  '8' Agency Group - Invalid                              */
+/*                                                                          */
+/*                - Logfile: agency_customer_data_load_xxxxx.log            */
+/*                  (xxxxx = agency supplier name)                          */
+/*                                                                          */
+/****************************************************************************/
+/*  Version | Date     | Coded | Description of changes made                */
+/***********|**********|*******|*********************************************/
+/*  1.0     | 03.07.17 | ISS   | Original code                              */
+/***********|**********|*******|*********************************************/
+/*  1.1     | 21.04.21 | ISS   | SR 1849565                                 */
+/*          |          |       | Incident was raised by agency alleging that*/
+/*          |          |       | RTB mkrs (W03) were not being applied in   */
+/*          |          |       | time to take effect the day after the file */
+/*          |          |       | is sent to Masai. The issue was to do with */
+/*          |          |       | the time of Ingres job being executed which*/
+/*          |          |       | calls this code and has since being brought*/
+/*          |          |       | forward. In order to aid in troubleshooting*/
+/*          |          |       | logfile will now show mkr status applied   */
+/*          |          |       | as requested by Sanofi first then show the */
+/*          |          |       | original mkr status in square brackets     */
+/*          |          |       | In order to capture the orignal mkr_status */
+/*          |          |       | a new field called <mkr_status_old> added  */
+/*          |          |       | to both tables as listed below:            */
+/*          |          |       | - agency_customer_data                     */
+/*          |          |       | - agency_customer_data_rejects             */
+/***********|**********|*******|*********************************************/
+
+PROCEDURE agency_customer_data_load(
+   pv_agency_supplier     = INTEGER(4)  NOT NULL WITH DEFAULT;
+   pv_filename            = VARCHAR(64) NOT NULL;
+)= 
+DECLARE
+
+/******************************************************/
+/* INGRES ERROR HANDLING VARIABLES                    */
+/******************************************************/
+   IIint                 = INTEGER(4)   NOT NULL,
+   IIrowcount            = INTEGER(4)   NOT NULL,
+   IIerrorno             = INTEGER(4)   NOT NULL,
+   IIerrtext             = CHAR(256)    NOT NULL,
+
+   lv_param_list         = VARCHAR(500) NOT NULL,
+   lv_report_name        = VARCHAR(76)  NOT NULL,
+   lv_reject_code        = INTEGER(4)   NOT NULL,     
+   lv_reject_reason      = CHAR(64)     NOT NULL,
+   array_rows            = INTEGER(4)   NOT NULL,   
+   lv_errno              = INTEGER(4)   NOT NULL,
+   temp_tabname          = VARCHAR(24)  NOT NULL,
+   temp_tabowner         = VARCHAR(32)  NOT NULL,
+   lv_mcs_flag           = INTEGER(1)   NOT NULL,
+   lv_mcs_flag_char      = CHAR(1)      NOT NULL, 
+   logfile               = VARCHAR(50),
+   outfile               = VARCHAR(64)  NOT NULL,
+   attachfile            = VARCHAR(64)  NOT NULL,
+   errfile               = VARCHAR(50),
+   logmess               = VARCHAR(256), 
+   errmess               = VARCHAR(100),
+ 
+   lv_row_no             = INTEGER(4)   NOT NULL,   
+   lv_error_cnt          = INTEGER(4),
+ 
+   lv_brnacc             = CHAR(13)     NOT NULL,
+   lv_brn                = CHAR(4)      NOT NULL,
+   lv_acc                = CHAR(9)      NOT NULL,
+   lv_agency_id          = CHAR(16),
+   lv_mkr_code           = CHAR(3)      NOT NULL,
+   lv_mkr_status_old_char= CHAR(1)      NOT NULL,
+   lv_mkr_status_char    = CHAR(1)      NOT NULL,
+   lv_mkr_status_int     = INTEGER(1)   NOT NULL,
+   lv_agency_type        = CHAR(4),
+   lv_load_date          = DATE,
+   lv_agency_group       = INTEGER(2),
+   lv_agency_group_char  = CHAR(12),
+   lv_line_no            = INTEGER(4),
+   lv_line_no_char       = CHAR(5),
+   ret_code              = INTEGER(4)   NOT NULL,
+   lv_agency_name        = VARCHAR(32)  NOT NULL,
+   lv_acc_sa_exists      = CHAR(1)      NOT NULL,
+   lv_acc_ssa_exists     = CHAR(1)      NOT NULL,
+   sessiontable          = VARCHAR(100) NOT NULL,
+   sessiontime           = CHAR(50)     NOT NULL;
+   millidatetime         = CHAR(30)     NOT NULL,
+   lv_master_cnt         = INTEGER4     NOT NULL;
+   lv_tot_cnt            = INTEGER4     NOT NULL;
+   lv_ok_cnt             = INTEGER4     NOT NULL;
+   lv_rej_cnt            = INTEGER4     NOT NULL;
+   lv_agency_supplier    = INTEGER(4)   NOT NULL WITH DEFAULT;
+   lv_param_string       = VARCHAR(100) NOT NULL,
+   lv_sequence_no        = INTEGER(4)   NOT NULL WITH DEFAULT;
+   lv_attach_file        = VARCHAR(100) NOT NULL,
+   lv_agency_file        = VARCHAR(50)  NOT NULL,
+   lv_processed_flag     = INTEGER(1)   NOT NULL,
+   lv_curr_filename      = CHAR(64)     NOT NULL, /* with extension         */
+   lv_filename           = CHAR(64)     NOT NULL, /* without extension      */
+   str                   = CHAR(200)            , /* to parse command line  */
+   i                     = INTEGER2             , /* to parse command line  */
+   lv_cnt1               = INTEGER4     NOT NULL;
+   lv_cnt2               = INTEGER4     NOT NULL;
+   lv_system_cmd         = VARCHAR(1000);
+   lv_continue           = INTEGER(1)   NOT NULL,
+ 
+   agency_cust_rec       = ARRAY OF TYPE OF TABLE agency_customer_data_rejects;
+   agency_cust_rec_rej   = ARRAY OF TYPE OF TABLE agency_customer_data_rejects;  
+ 
+/*******************************************************
+** LOCAL PROCEDURES
+*******************************************************/
+   lp_create_err_file    = PROCEDURE RETURNING NONE,
+   lp_create_rej_file    = PROCEDURE RETURNING NONE,
+   lp_write_log_msg      = PROCEDURE RETURNING NONE, 
+   lp_write_out_msg      = PROCEDURE RETURNING NONE, 
+   lp_align_line_no      = PROCEDURE RETURNING NONE,      
+   lp_create_worktable   = PROCEDURE RETURNING INTEGER,
+   lp_load_sessiontab    = PROCEDURE RETURNING INTEGER,
+   lp_update_sessiontab  = PROCEDURE RETURNING INTEGER,
+   lp_insert_record      = PROCEDURE RETURNING INTEGER,
+   lp_update_saccts_mkr  = PROCEDURE RETURNING INTEGER,
+   lp_send_to_remtp      = PROCEDURE RETURNING INTEGER,
+   lp_insert_rejects     = PROCEDURE RETURNING INTEGER,
+
+   lp_check_ingres_error = PROCEDURE RETURNING INTEGER;
+{
+   /* Get the passed in parameters... (Already validated in calling script) */
+   lv_param_string       = CALLPROC CommandLineParameters();
+   str                   = SQUEEZE(lv_param_string);
+
+   i = locate (str,' ');
+   pv_agency_supplier    = IFNULL(INT4(LEFT (str,i-1)),0);
+   str                   = SHIFT(str,-i); 
+   lv_agency_supplier    = pv_agency_supplier;
+
+   i = locate (str,' ');
+   pv_filename           = IFNULL(LEFT (str,i-1),'');
+   str                   = SHIFT(str,-i); 
+   lv_filename           = pv_filename;
+   lv_curr_filename      = TRIM(:lv_filename) + '.csv'; 
+
+   lv_agency_file        = 'agency_customer_data';
+
+   lv_sequence_no        = 41;
+
+   lv_mcs_flag           =  0;  /* '0' to switch mcs off                    */
+                                /* '1' to switch mcs on                     */
+
+   /* Work table         : _cs_agency_customer_data                         */
+
+   SELECT temp_tabowner  = dbmsinfo('username'); 
+
+   ret_code = CALLPROC lp_check_ingres_error (proc_no = 010);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* Get Agency Name and mkr_code                                          */
+   SELECT lv_agency_name  = supplier_name,
+          lv_mkr_code     = mkr_code
+   FROM   agency_supplier
+   WHERE  agency_supplier = :lv_agency_supplier;
+
+   ret_code = CALLPROC lp_check_ingres_error (proc_no = 020);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   logfile = TRIM(:lv_agency_file) + '_load_' + TRIM(LOWERCASE(lv_agency_name)) + '.log';
+
+   /* Read the MCS Flag                                                     */
+   SELECT lv_mcs_flag  = INT4(parameter_value)
+   FROM   application_parameters
+   WHERE  parameter_id = 'MAST_MCS';
+
+   ret_code = CALLPROC lp_check_ingres_error (proc_no = 030);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* No rows returned is also an error                                     */
+   IF IIrowcount = 0
+   THEN
+       logmess = 'INGRES ERROR - Cannot find MCS entry in application-parameters table. Exiting !!';
+       CALLPROC lp_write_log_msg();
+       CALLPROC lp_create_err_file();
+       CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(:logmess) + '" >> ' + :gc_temp + TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.err'; 
+       RETURN gc_fail;
+   ENDIF;
+
+   gv_branch_id = '409V';
+   gv_user_id   = 'cron';
+   gv_proc      = 'agencust';
+   
+   outfile      = TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.out';
+   attachfile   = TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.txt';
+
+   /************************************************************************/
+   /* Create/Load session table with data from both both permanent tables  */
+   /************************************************************************/
+   ret_code = CALLPROC lp_load_sessiontab();
+   IF lv_errno != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /************************************************************************/
+   /* Update reject_code and reject_reason in session table                */
+   /************************************************************************/
+   ret_code = CALLPROC lp_update_sessiontab();
+   IF lv_errno != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_errno = CALLPROC lp_create_worktable();
+   IF lv_errno != 0 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_report_name = TRIM(:lv_agency_file) + '_load';
+   lv_param_list  = '';
+   lv_attach_file = :gc_temp + TRIM(:attachfile);
+
+   /************************************************************************/
+   /* Load qualifying data from agency_customer_data for each file into    */
+   /* array. Pass in agency supplier and file name                         */
+   /************************************************************************/
+   lv_master_cnt = 0;
+
+   ret_code = arrayclear(agency_cust_rec); 
+
+   agency_cust_rec =
+     SELECT   *
+     FROM    :sessiontable
+     WHERE    processed_flag     =  0
+     AND      agency_supplier    = :lv_agency_supplier
+     AND      original_file_name = :lv_curr_filename
+     ORDER BY original_file_name, line_no ASC;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 040);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   array_rows    = ArrayAllRows(agency_cust_rec);
+   lv_row_no     = 0;
+   lv_master_cnt = array_rows;
+
+   IF lv_agency_supplier = 13
+   THEN
+      /* START OF PROCESSING SANOFI MASTER CUSTOMER DATA                    */
+
+      IF array_rows <= 0 
+      THEN
+         /* Data to process - NO */
+   
+      ELSE
+   
+         /* Data to process - YES */
+         
+         /* Before we open the while loop open the isam db                  */
+         lv_errno = open_isam(); 
+         IF lv_errno != gc_success
+         THEN
+            logmess = 'Error opening isam db';
+            CALLPROC lp_write_log_msg();
+            RETURN(lv_errno);
+         ENDIF;
+   
+         /* Process rows in array validating each row prior to either       */
+         /* rejecting it or using it to update the database.                */
+
+         IF lv_mcs_flag = 0 
+         THEN 
+            lv_mcs_flag_char = 'N';
+         ELSE
+            lv_mcs_flag_char = 'Y';
+         ENDIF;
+
+         logmess = 'MCS flag set to ' + lv_mcs_flag_char;
+         CALLPROC lp_write_log_msg();
+      
+         logmess = 'Processing Master Customer Data ...';
+         CALLPROC lp_write_log_msg();
+
+         WHILE lv_row_no           < array_rows 
+         DO
+            lv_processed_flag      = 1;
+            lv_error_cnt           = 0;
+            lv_row_no              = lv_row_no + 1;
+            lv_continue            = gc_success;
+       
+            lv_brnacc              = IFNULL(agency_cust_rec[lv_row_no].brnacc,''); 
+            lv_reject_code         = agency_cust_rec[lv_row_no].reject_code;
+            lv_agency_id           = agency_cust_rec[lv_row_no].agency_id;
+            lv_mkr_status_old_char = IFNULL(agency_cust_rec[lv_row_no].mkr_status_old,'');
+            lv_mkr_status_char     = IFNULL(agency_cust_rec[lv_row_no].mkr_status,'');
+            lv_agency_type         = agency_cust_rec[lv_row_no].agency_type;
+            lv_agency_group_char   = IFNULL(agency_cust_rec[lv_row_no].agency_group,''); 
+            lv_line_no             = agency_cust_rec[lv_row_no].line_no;
+            lv_load_date           = agency_cust_rec[lv_row_no].load_date;
+
+            lv_brn                 = LEFT(:lv_brnacc,4);
+            lv_acc                 = RIGHT(:lv_brnacc,9);
+
+            /* mkr_status in file is sent as 'Y' or 'N' but in Ingres DB is */
+            /* stored as an integer, either '1' or '0' so we need to ensure */
+            /* that we update saccts_mkr table correctly                    */
+
+            IF lv_mkr_status_char = 'Y'
+            THEN
+               lv_mkr_status_int  =  1;
+            ELSEIF 
+               lv_mkr_status_char = 'N'
+            THEN
+               lv_mkr_status_int  =  0;
+            ENDIF;
+
+            /****************************************************************/
+            /* Process Customer Master Data                                 */
+            /****************************************************************/
+            IF lv_reject_code = 0 
+            THEN      
+               /* Delete/Insert into saccts_supplier_acctno.                */
+               ret_code = CALLPROC lp_insert_record();
+               IF ret_code != gc_success
+               THEN
+                  logmess = 'Error with Delete/Insert into saccts_supplier_acctno';
+                  CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(:logmess) + '" >> ' + :gc_temp + TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.err'; 
+                  RETURN gc_fail;
+               ENDIF;
+                  
+               /* Update RTB mkr in saccts_mkr table                        */
+               ret_code = CALLPROC lp_update_saccts_mkr();
+               IF ret_code != gc_success
+               THEN
+                  logmess = 'Error updating RTB mkr in saccts_mkr table';
+                  CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(:logmess) + '" >> ' + :gc_temp + TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.err'; 
+                  RETURN gc_fail;
+               ENDIF;
+ 
+               CALLPROC lp_align_line_no();     
+
+               /* Send updated RTB mkr to RemTP                             */
+               ret_code = CALLPROC lp_send_to_remtp(pv_line_no_char = lv_line_no_char);
+               IF ret_code != gc_success
+               THEN
+                  RETURN gc_fail;
+               ENDIF;
+
+               /* Update staging table processed_flag to 1                  */
+               UPDATE agency_customer_data
+               SET    processed_flag     = :lv_processed_flag,
+                      processed_date     =  DATE('now'),
+                      mkr_status_old     = :lv_mkr_status_old_char
+               WHERE  agency_supplier    = :lv_agency_supplier 
+               AND    original_file_name = :lv_curr_filename
+               AND    line_no            = :lv_line_no;
+     
+               ret_code = CALLPROC lp_check_ingres_error(proc_no = 050);
+               IF ret_code != gc_success
+               THEN
+                  RETURN gc_fail;
+               ENDIF;
+
+               logmess = VARCHAR(lv_row_no)  + '/' + VARCHAR(array_rows) + 
+                         ' - Processed OK...'                            +  
+                         ' Line='      + VARCHAR(lv_line_no_char)        +
+                         ' Acc='       + TRIM(lv_brnacc)                 + 
+                         ' AgencyID='  + TRIM(lv_agency_id)              + 
+                         ' AgencyGrp=' + TRIM(lv_agency_group_char)      + 
+                         ' RTB='       + TRIM(lv_mkr_status_char)        +
+                         ' ['          + TRIM(lv_mkr_status_old_char)    + ']';
+               CALLPROC lp_write_log_msg();
+
+            ELSE
+
+               /* Insert Ingres rejects into rejects table and delete from  */
+               /* staging table                                             */
+               ret_code = CALLPROC lp_insert_rejects();
+               IF ret_code != gc_success
+               THEN
+                  logmess = 'Error inserting rejected sales_accts in rejects table';
+                  CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(:logmess) + '" >> ' + :gc_temp + TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.err'; 
+                  RETURN gc_fail;
+               ENDIF;
+
+            ENDIF;
+
+            COMMIT;
+
+         ENDWHILE;
+
+         /* N.B. close_isam always returns zero                             */
+         lv_errno = CALLPROC close_isam();
+
+      ENDIF;
+
+      COMMIT;
+
+      lv_errno = CALLPROC lp_create_worktable();
+      IF lv_errno != 0 
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      /* Get row count of all lines loaded into session table               */
+      SELECT lv_tot_cnt = COUNT(*)
+      FROM  :sessiontable
+      WHERE  original_file_name = :lv_curr_filename;
+        
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 060);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      IF lv_tot_cnt = 1 
+      THEN
+         SELECT lv_line_no         = line_no
+         FROM  :sessiontable
+         WHERE  original_file_name = :lv_curr_filename;
+           
+         ret_code = CALLPROC lp_check_ingres_error(proc_no = 090);
+         IF ret_code != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+
+      ENDIF;
+
+      IF lv_tot_cnt = 0
+      THEN
+         logmess = 'No Master Customer Data to process';
+         CALLPROC lp_write_log_msg();
+      ENDIF;
+
+      SELECT lv_rej_cnt = COUNT(*)
+      FROM  :sessiontable
+      WHERE  reject_reason     != 'OK'
+      AND    original_file_name = :lv_curr_filename; 
+        
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 100);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      IF lv_rej_cnt > 0
+      THEN
+         /*******************************************************************/
+         /* Ingres processing complete so report on errors. Load qualifying */
+         /* data from rejects table to array. Pass in agency agency no      */
+         /*******************************************************************/
+         ret_code = arrayclear(agency_cust_rec_rej); 
+
+         agency_cust_rec_rej =
+           SELECT   *
+           FROM     agency_customer_data_rejects
+           WHERE    processed_flag     =  0
+           AND      agency_supplier    = :lv_agency_supplier
+           AND      original_file_name = :lv_curr_filename 
+           ORDER BY original_file_name, line_no ASC;
+      
+         ret_code = CALLPROC lp_check_ingres_error(proc_no = 110);
+         IF ret_code != gc_success
+         THEN
+            RETURN gc_fail;
+         ENDIF;
+      
+         array_rows = ArrayAllRows(agency_cust_rec_rej);
+         lv_row_no  = 0;
+      
+         IF lv_agency_supplier = 13
+         THEN
+            IF array_rows <= 0
+            THEN
+               /* Rejected records to report on - NO                        */
+               logmess = 'No Master Customer Data rejects to process';
+               CALLPROC lp_write_log_msg();
+      
+            ELSE
+      
+               /* Go through all unprocessed errors and write details to an */
+               /* error file to be used to report all line errors to Agency.*/
+      
+               CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+
+               IF lv_master_cnt > 0 OR (lv_master_cnt = 0 AND lv_line_no != 0)
+               THEN
+                  CALL SYSTEM 'echo "' + '" >> ' + :gc_temp + TRIM(:outfile); 
+               ENDIF;
+
+               logmess = 'Reporting Master Customer Data Rejects ...';
+               CALLPROC lp_write_log_msg();
+
+               WHILE lv_row_no           < array_rows
+               DO
+                  lv_processed_flag      = 1;
+                  lv_row_no              = lv_row_no + 1;
+                  lv_brnacc              = IFNULL(agency_cust_rec_rej[lv_row_no].brnacc,'');
+                  lv_agency_id           = IFNULL(agency_cust_rec_rej[lv_row_no].agency_id,'');
+                  lv_mkr_status_old_char = IFNULL(agency_cust_rec_rej[lv_row_no].mkr_status_old,'');
+                  lv_mkr_status_char     = IFNULL(agency_cust_rec_rej[lv_row_no].mkr_status,'');
+                  lv_agency_type         = IFNULL(agency_cust_rec_rej[lv_row_no].agency_type,'');
+                  lv_agency_group_char   = IFNULL(agency_cust_rec_rej[lv_row_no].agency_group,'');
+                  lv_line_no             = agency_cust_rec_rej[lv_row_no].line_no;
+
+                  lv_reject_code         = agency_cust_rec_rej[lv_row_no].reject_code;
+                  lv_reject_reason       = IFNULL(agency_cust_rec_rej[lv_row_no].reject_reason,'');
+      
+                  CALLPROC lp_align_line_no();     
+                  
+                  logmess = 'Line='          + VARCHAR(lv_line_no_char)      +
+                            ' Acc='          + TRIM(lv_brnacc)               +
+                            ' AgencyID='     + TRIM(lv_agency_id)            +
+                            ' AgencyGrp='    + TRIM(lv_agency_group_char)    +
+                            ' RTB='          + TRIM(lv_mkr_status_char)      +
+                            ' ['             + TRIM(lv_mkr_status_old_char)  + ']' +
+                            ' RejectCode='   + TRIM(VARCHAR(lv_reject_code)) +
+                            ' RejectReason=' + TRIM(lv_reject_reason);
+                  CALLPROC lp_write_log_msg();
+
+
+                  IF lv_master_cnt > 0 OR (lv_master_cnt = 0 AND lv_line_no != 0)
+                  THEN
+                     CALLPROC lp_write_out_msg(); 
+                  ENDIF;
+   
+                  /* Update session table rejects processed flag to 1       */
+                  UPDATE :sessiontable
+                  SET     processed_flag     = :lv_processed_flag,
+                          processed_date     =  DATE('now')
+                  WHERE   agency_supplier    = :lv_agency_supplier 
+                  AND     original_file_name = :lv_curr_filename
+                  AND     line_no            = :lv_line_no;
+
+                  ret_code = CALLPROC lp_check_ingres_error(proc_no = 120);
+                  IF ret_code != gc_success
+                  THEN
+                     RETURN gc_fail;
+                  ENDIF;
+
+                  /* Update reject table processed_flag to 1                */
+                  UPDATE agency_customer_data_rejects
+                  SET    processed_flag     = :lv_processed_flag,
+                         processed_date     =  DATE('now')
+                  WHERE  agency_supplier    = :lv_agency_supplier 
+                  AND    original_file_name = :lv_curr_filename
+                  AND    line_no            = :lv_line_no;
+
+                  ret_code = CALLPROC lp_check_ingres_error(proc_no = 130);
+                  IF ret_code != gc_success
+                  THEN
+                     RETURN gc_fail;
+                  ENDIF;
+
+               ENDWHILE;
+      
+            ENDIF;
+   
+         ENDIF;
+   
+      ENDIF;
+
+      CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+
+      IF lv_master_cnt > 0 OR (lv_master_cnt = 0 AND lv_line_no != 0)
+      THEN
+         CALL SYSTEM 'echo "' + '" >> ' + :gc_temp + TRIM(:outfile); 
+      ENDIF;
+
+      /* Create working table to be used by calling script                  */
+      lv_errno = CALLPROC lp_create_worktable();
+      IF lv_errno != 0 
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      SELECT lv_ok_cnt = COUNT(*)
+      FROM  :sessiontable
+      WHERE  reject_reason      = 'OK'
+      AND    original_file_name = :lv_curr_filename; 
+        
+      ret_code = CALLPROC lp_check_ingres_error(proc_no = 140);
+      IF ret_code != gc_success
+      THEN
+         RETURN gc_fail;
+      ENDIF;
+    
+      logmess = 'OK Lines       : ' +  VARCHAR(lv_ok_cnt);
+      CALLPROC lp_write_log_msg(); 
+      IF lv_master_cnt > 0 OR (lv_master_cnt = 0 AND lv_line_no != 0)
+      THEN
+         CALLPROC lp_write_out_msg(); 
+      ENDIF;
+   
+      lv_rej_cnt = lv_tot_cnt - lv_ok_cnt;
+   
+      logmess = 'Rejected Lines : ' +  VARCHAR(lv_rej_cnt);
+      CALLPROC lp_write_log_msg(); 
+      IF lv_master_cnt > 0 OR (lv_master_cnt = 0 AND lv_line_no != 0)
+      THEN
+         CALLPROC lp_write_out_msg(); 
+      ENDIF;
+  
+      logmess = 'Total Lines    : ' + VARCHAR(lv_tot_cnt);
+      CALLPROC lp_write_log_msg(); 
+      IF lv_master_cnt > 0 OR (lv_master_cnt = 0 AND lv_line_no != 0)
+      THEN
+         CALLPROC lp_write_out_msg(); 
+      ENDIF;
+     
+      CALL SYSTEM 'echo "' + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+
+      /* Call report to generate text file of input file to attach to email */
+      /* Exception if reject table has 1 line with error code 1 or 2        */
+      IF lv_tot_cnt > 0
+      THEN
+         logmess = 'Generate input file as attachment';
+         CALLPROC lp_write_log_msg();
+
+          CALL REPORT (
+            report = :lv_report_name,
+            param  = :lv_param_list,
+            file   = :lv_attach_file);
+      ENDIF;
+
+   /* END OF PROCESSING SANOFI MASTER CUSTOMER DATA                         */
+
+   ELSE
+
+      /* START OF PROCESSING OF MASTER CUSTOMER DATA FOR ANOTHER AGENCY     */
+
+      /* Add next agency logic here                                         */     
+
+      /* END OF PROCESSING OF MASTER CUSTOMER DATA FOR ANOTHER AGENCY       */
+
+      logmess = 'Agency ' + VARCHAR(lv_agency_supplier) + ' (' + lv_agency_name + ') not included for master data load';
+      CALLPROC lp_write_log_msg(); 
+
+   ENDIF;
+}
+
+
+PROCEDURE lp_load_sessiontab() =
+{  
+   sessiontable  = 'session.agency_customer_data';
+   lv_tot_cnt    = 0;
+
+   IIint = CALLPROC drop_session_table (sessiontable);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   DECLARE GLOBAL TEMPORARY TABLE :sessiontable
+     ( agency_supplier      INTEGER2
+     , brnacc               CHAR(25) 
+     , agency_id            CHAR(25)
+     , mkr_status_old       CHAR(1)
+     , mkr_status           CHAR(8)
+     , agency_type          CHAR(12)
+     , agency_group         CHAR(25)
+     , line_no              INTEGER4
+     , load_date            DATE
+     , processed_flag       INTEGER1
+     , processed_date       DATE
+     , original_file_name   CHAR(50)
+     , reject_code          INTEGER2
+     , reject_reason        CHAR(64)
+     )
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 150);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* Load unprocessed data from Agency Customer Master Data table          */
+   INSERT INTO :sessiontable 
+          ( agency_supplier
+          , brnacc
+          , agency_id
+          , mkr_status_old
+          , mkr_status
+          , agency_type
+          , agency_group
+          , line_no
+          , load_date
+          , processed_flag
+          , processed_date
+          , original_file_name
+          , reject_code
+          , reject_reason
+          )
+   SELECT   agency_supplier
+          , brnacc
+          , agency_id
+          , mkr_status_old
+          , mkr_status
+          , agency_type
+          , agency_group
+          , line_no
+          , load_date
+          , processed_flag
+          , processed_date
+          , original_file_name
+          , 0
+          , 'OK'
+   FROM     agency_customer_data
+   WHERE    processed_flag     = 0
+   AND      agency_supplier    = :lv_agency_supplier
+   AND      original_file_name = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 160);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_cnt1 = IIrowcount;
+
+   /* Load unprocessed data from Agency Customer Master Reject Data table   */
+   INSERT INTO :sessiontable
+          ( agency_supplier
+          , brnacc
+          , agency_id
+          , mkr_status_old
+          , mkr_status
+          , agency_type
+          , agency_group
+          , line_no
+          , load_date
+          , processed_flag
+          , processed_date
+          , original_file_name
+          , reject_code
+          , reject_reason
+          )
+   SELECT   agency_supplier
+          , brnacc
+          , agency_id
+          , mkr_status_old
+          , mkr_status
+          , agency_type
+          , agency_group
+          , line_no
+          , DATE('now')
+          , processed_flag
+          , processed_date
+          , original_file_name
+          , reject_code
+          , reject_reason
+   FROM     agency_customer_data_rejects
+   WHERE    processed_flag     = 0
+   AND      agency_supplier    = :lv_agency_supplier
+   AND      original_file_name = :lv_curr_filename;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 170);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_cnt2 = IIrowcount;
+
+   /* Get combined row count                                                */
+   lv_tot_cnt = lv_cnt1 + lv_cnt2;
+}
+
+
+PROCEDURE lp_update_sessiontab() =
+{  
+   sessiontable  = 'session.agency_customer_data';
+
+   UPDATE  :sessiontable          a
+   FROM     saccts_mkrs           b
+   SET      mkr_status_old     =  CHAR(b.mkr_status)
+   WHERE    mkr_code           = 'W03'
+   AND      original_file_name = :lv_curr_filename
+   AND      a.brnacc           =  CONCAT(b.branch,b.account_no);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 180);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   UPDATE  :sessiontable
+   SET      mkr_status_old = 'N'
+   WHERE    mkr_status_old =  0;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 190);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   UPDATE  :sessiontable
+   SET      mkr_status_old = 'Y'
+   WHERE    mkr_status_old =  1;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 200);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   UPDATE  :sessiontable
+   SET      reject_code    =  30
+          , reject_reason  = 'ING-Invalid AAH Sales Account'
+          , processed_date =  DATE('now')
+   WHERE    reject_code    =  0
+   AND NOT EXISTS (SELECT  *
+                   FROM    sales_accts
+                   WHERE   CONCAT(branch,account_no) =  brnacc);
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 210);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_insert_record() =
+{
+   DELETE
+   FROM   saccts_supplier_acctno
+   WHERE  branch      =  LEFT(:lv_brnacc,4)
+   AND    account_no  =  RIGHT(:lv_brnacc,9)
+   AND    sequence_no = :lv_sequence_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 220);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   INSERT INTO saccts_supplier_acctno
+     ( branch
+     , account_no
+     , sequence_no
+     , supplier_reference
+     , supplier_account_no
+     , tpo_phone_no
+     , reply_indicator
+     )
+   VALUES
+     (  LEFT(:lv_brnacc,4)
+     ,  RIGHT(:lv_brnacc,9)
+     , :lv_sequence_no
+     , 'Sanofi'
+     , :lv_agency_id
+     , :lv_agency_group_char
+     ,  ''
+     );
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 230);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_update_saccts_mkr() =
+{
+   /* Update RTB mkr in saccts_mkrs table                 */
+   UPDATE saccts_mkrs
+   SET    mkr_status  = :lv_mkr_status_int
+   WHERE  branch      =  LEFT(:lv_brnacc,4)
+   AND    account_no  =  RIGHT(:lv_brnacc,9)
+   AND    mkr_code    = :lv_mkr_code;
+  
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 240);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_send_to_remtp(
+   pv_line_no_char = CHAR(5);
+)=
+{  pv_line_no_char = lv_line_no_char;
+
+   /* Send to RemTP */
+   IF lv_mcs_flag = 1
+   THEN
+      lv_errno = CALLPROC mcs_saccts_out(
+      'U',
+      :lv_brn,
+      :lv_acc,
+      :gv_branch_id,
+      :gv_user_id);
+   ENDIF;
+
+   /* If MCS fails capture details and exit program       */	
+   IF lv_errno != 0
+   THEN
+      logmess = VARCHAR(lv_row_no)  + '/' + VARCHAR(array_rows) + 
+                ' Error sending updated RTB mkr to RemTP !!! '  +  
+                ' Line='      + VARCHAR(pv_line_no_char)        +
+                ' Acc='       + TRIM(lv_brnacc);
+      CALLPROC lp_write_log_msg();
+      CALLPROC lp_create_err_file();
+      CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(:logmess) + '" >> ' + :gc_temp + TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.err'; 
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_insert_rejects() =
+{
+   INSERT INTO agency_customer_data_rejects
+          ( agency_supplier
+          , brnacc
+          , agency_id
+          , mkr_status
+          , agency_type
+          , agency_group
+          , line_no
+          , load_date
+          , processed_flag
+          , processed_date
+          , original_file_name
+          , reject_reason
+          , reject_code
+          )
+   SELECT   agency_supplier
+          , brnacc
+          , agency_id
+          , mkr_status
+          , agency_type
+          , agency_group
+          , line_no
+          , load_date
+          , processed_flag
+          , DATE('now')
+          , original_file_name
+          , reject_reason
+          , reject_code
+   FROM    :sessiontable
+   WHERE    original_file_name = :lv_curr_filename
+   AND      line_no            = :lv_line_no
+   AND      reject_code       >=  30;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 250);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   DELETE 
+   FROM   agency_customer_data
+   WHERE  original_file_name = :lv_curr_filename
+   AND    line_no            = :lv_line_no;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 260);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}
+
+
+PROCEDURE lp_align_line_no() =
+{
+   IF lv_line_no < 10
+   THEN
+      lv_line_no_char = '0000' + SQUEEZE(CHAR(:lv_line_no));
+   ELSEIF lv_line_no >= 10 AND lv_line_no < 100
+   THEN
+      lv_line_no_char = '000' + SQUEEZE(CHAR(:lv_line_no));
+   ELSEIF lv_line_no >= 100 AND lv_line_no < 1000
+   THEN
+      lv_line_no_char = '00' + SQUEEZE(CHAR(:lv_line_no));
+   ELSEIF lv_line_no >= 1000 AND lv_line_no < 10000
+   THEN
+      lv_line_no_char = '0' + SQUEEZE(CHAR(:lv_line_no));
+   ELSEIF lv_line_no >= 10000 AND lv_line_no < 100000
+   THEN
+      lv_line_no_char = SQUEEZE(CHAR(:lv_line_no));
+   ENDIF;
+}
+
+
+PROCEDURE lp_create_err_file() =
+{
+   CALL SYSTEM '> ' + :gc_temp + TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.err';
+}
+
+
+PROCEDURE lp_create_rej_file() =
+{
+   CALL SYSTEM 'touch ' + :gc_temp + TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.rej';
+}
+
+
+PROCEDURE lp_check_ingres_error (
+   proc_no      = INTEGER4      NOT NULL;
+)=
+DECLARE
+   lv_errorno   = INTEGER4      NOT NULL;
+   lv_errortext = VARCHAR (256) NOT NULL;
+   lv_rowcount  = INTEGER4      NOT NULL;
+{
+   INQUIRE_INGRES (lv_errorno = ERRORNO, lv_errortext = ERRORTEXT, lv_rowcount  = ROWCOUNT);
+
+   IF lv_errorno != 0 
+   THEN
+       ROLLBACK;
+       logmess = 'INGRES ERROR ' + trim(char(:proc_no)) + ' - ERROR NO: ' + trim(char(:lv_errorno)) + ' ERROR TEXT: ' + :lv_errortext;
+       CALLPROC lp_write_log_msg();
+       CALLPROC lp_create_err_file();
+       CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(:logmess) + '" >> ' + :gc_temp + TRIM(:lv_agency_file) + '.' + TRIM(:lv_filename) + '.err'; 
+       RETURN gc_fail;
+   ENDIF;
+
+   IIrowcount = lv_rowcount;
+
+   RETURN gc_success;
+};
+
+
+PROCEDURE lp_write_log_msg() =
+{
+   CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(:logmess) + '" >> ' + :gc_logs_curr + TRIM(:logfile); 
+}
+
+
+PROCEDURE lp_write_out_msg() =
+{
+   CALL SYSTEM 'echo "' + TRIM(CHAR(DATE('now'))) + ' - ' + TRIM(:logmess) + '" >> ' + :gc_temp + TRIM(:outfile); 
+}
+
+
+PROCEDURE lp_create_worktable() =
+{
+   temp_tabname = '_cs_agency_customer_data';
+   
+   IIint = CALLPROC drop_session_table (temp_tabname);
+   IF IIint != gc_success 
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   CREATE TABLE :temp_tabname AS
+   SELECT *
+   FROM   :sessiontable;
+
+   ret_code = CALLPROC lp_check_ingres_error(proc_no = 270);
+   IF ret_code != gc_success
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+}

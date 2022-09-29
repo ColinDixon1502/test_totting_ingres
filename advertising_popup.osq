@@ -1,0 +1,218 @@
+ /* 
+ ** FRAME   - Duplicate Adverts
+ ** AUTHOR  - Dawson
+ ** DATE    - 28/11/94
+ ** SOURCE  - advertising_popup.osq
+ */
+ 
+ INITIALIZE
+ (
+	   IIbranch    = char(4),
+	   IIstamp     = char(16),
+	   IIint       = integer(4),
+	   IIerrorno   = integer(4),
+	   IIenddate   = date 
+ )=
+ 
+ DECLARE
+	  v_IIcheck    = PROCEDURE RETURNING INTEGER;
+	  v_IIfillform = PROCEDURE RETURNING INTEGER;
+	  h_advert     = type of table advert_messages;
+	  mcs_res      = integer;
+{
+
+	  SET_FORMS FRS (ACTIVATE(previousfield) = 1);
+	  SET_FORMS FRS (timeout = :gc_timeout);
+	  
+	  IIint = CALLPROC v_IIfillform;
+	  
+	  IF IIint !=0 THEN
+	     ROLLBACK;
+	     MESSAGE 'INGRES error in SELECT'
+		WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+	  
+	  IIint = CALLPROC v_IIcheck;
+	  
+	  IF IIint !=0 THEN
+	     ROLLBACK;
+	     MESSAGE 'INGRES error in SELECT'
+		WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+	  
+	  IIenddate = end_date;
+	   
+	  COMMIT;
+	  
+	  SELECT :branch_name = name
+	    FROM branch
+	   WHERE branch_id = :branch;
+	   
+	  IIint = CALLPROC v_IIcheck;
+	  
+	  IF IIint !=0 THEN
+	     ROLLBACK;
+	     MESSAGE 'INGRES error in SELECT'
+		WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+
+	  IF :branch = 'ALL' THEN 
+	      branch_name = 'ALL EXCEPT 103G 401F 903Y';
+	  ENDIF;
+	  
+	  COMMIT;
+	  
+	  SELECT :company_name = description
+	    FROM company_decode
+	   WHERE code = :company_no;
+	   
+	  IIint = CALLPROC v_IIcheck;
+	  
+	  IF IIint !=0 THEN
+	     ROLLBACK;
+	     MESSAGE 'INGRES error in SELECT'
+		WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+
+	  COMMIT;
+ 
+	  SELECT :type_name = ad_cust_name
+	    FROM advert_customers
+	   WHERE ad_cust_type = :cust_type;
+	   
+	  IIint = CALLPROC v_IIcheck;
+	  
+	  IF IIint !=0 THEN
+	     ROLLBACK;
+	     MESSAGE 'INGRES error in SELECT'
+		WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+
+	  IF :cust_type = 0 THEN 
+	      type_name = 'ALL CUSTOMER TYPES';
+	  ENDIF;
+	  
+	  COMMIT;
+	  SELECT :group_name = custgroup_name
+	    FROM cust_groups
+	   WHERE custgroup_no = :cust_group;
+	   
+	  IIint = CALLPROC v_IIcheck;
+	  
+	  IF IIint !=0 THEN
+	     ROLLBACK;
+	     MESSAGE 'INGRES error in SELECT'
+		WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+
+	  IF :cust_group = 0 THEN 
+	      group_name = 'ALL CUSTOMER GROUPS';
+	  ENDIF;
+	  
+	  COMMIT;
+}
+
+ON TIMEOUT = 
+{
+	  CALLFRAME timeout_popup();
+}
+
+'Help', KEY FRSKEY1=
+{
+	    CALLPROC help_proc(
+		     SUBJECT='Help on Duplicate Advert Amendment',
+			FILE=:gc_help_dir+'advertising_popup.hlp');
+}
+
+'Amend', KEY FRSKEY4=
+{
+	  IF :end_date < :start_date THEN 
+	     ROLLBACK;
+	     MESSAGE ' End date cannot precede Start date'
+		WITH STYLE = POPUP;
+	 
+	     IIint = CALLPROC v_IIfillform;
+	     IF IIint !=0 THEN 
+		ROLLBACK;
+		MESSAGE 'INGRES error in SELECT'
+		WITH STYLE = POPUP;
+		RETURN 1;
+	     ENDIF;
+	  RESUME FIELD end_date;
+	  ENDIF;
+	  
+	  UPDATE advert_messages 
+	     SET end_date = :end_date,
+		 advert_action = 'A'
+	   WHERE advert_branch = :IIbranch 
+	     AND advert_timestamp = :IIstamp;
+	 
+	  IIint = CALLPROC v_IIcheck;
+	  
+	  IF IIint !=0 THEN
+	     ROLLBACK;
+	     MESSAGE 'INGRES error in SELECT'
+		WITH STYLE = POPUP;
+	     RETURN 1;
+	  ENDIF;
+
+	  COMMIT;
+	  
+	  h_advert = SELECT * 
+		       FROM advert_messages
+		      WHERE advert_branch = :IIbranch
+			AND advert_timestamp = :IIstamp;
+		   
+	  mcs_res = CALLPROC open_isam();
+	  
+	  mcs_res = CALLPROC mcs_adverts_out('U',:h_advert.advert_branch,
+					    varchar(:IIstamp),:gv_branch_id,
+					    :gv_user_id);
+	  
+	  IF mcs_res !=0 THEN
+	     MESSAGE 'ERROR : MCS returned ' + TRIM(CHAR(:mcs_res))
+		WITH STYLE = POPUP
+	  ENDIF;
+	  
+	  mcs_res = CALLPROC close_isam();
+	  
+	  RETURN 0;
+}
+
+'Exit', KEY FRSKEY3= 
+{
+   RETURN 1;
+}
+
+PROCEDURE v_IIfillform()=
+{
+	  SELECT :start_date     = start_date,
+		 :end_date       = end_date,
+		 :company_no     = company_no,
+		 :branch         = advert_branch,
+		 :cust_type      = cust_type,
+		 :cust_group     = cust_group,
+		 :advert_message = advert_message
+	    FROM advert_messages
+	   WHERE advert_branch    = :IIbranch 
+	     AND advert_timestamp = :IIstamp;
+}             
+       
+PROCEDURE v_IIcheck()=
+{
+	  INQUIRE_INGRES(IIerrorno = ERRORNO);
+	  
+	  IF IIerrorno !=0 THEN
+	     ROLLBACK;
+	     RETURN 1;
+	  ENDIF;
+	  
+	  RETURN 0;
+}
+

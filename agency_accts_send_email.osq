@@ -1,0 +1,271 @@
+/****************************************************************************/
+/* Source:      agency_accts_send_email.osq                                 */
+/*                                                                          */
+/* Proc Name:   agency_accts_send_email                                     */
+/*                                                                          */
+/* Purpose:     Send via emails details of new and amended acounts to GSK   */
+/*              initially but possibly other agency suppliers.              */
+/*              Details can be sent more or less immediately or via a       */
+/*              nightly process.                                            */
+/*                                                                          */
+/* Author:      Irfan Salim                                                 */
+/*                                                                          */
+/* Date:        28/07/2014                                                  */
+/*                                                                          */
+/* Parameters:  Agency supplier                                             */
+/*              File Name                                                   */
+/*                                                                          */
+/* Return Val:  0 - Email sent                                              */
+/*              1 - Error                                                   */
+/****************************************************************************/
+/*  Version | Date     | Coded | Description of changes made                */
+/***********|**********|*******|*********************************************/
+/*  1.0     | 28.07.14 | ISS   | Original Code for GSK SAP         Project  */
+/***********|**********|*******|*********************************************/
+PROCEDURE agency_accts_send_email(
+   pv_agency_supplier    = INTEGER(4)  NOT NULL WITH DEFAULT;   
+   pv_chg_cnt            = INTEGER(4)  NOT NULL WITH DEFAULT;   
+   pv_attach_file        = CHAR(128)   NOT NULL WITH DEFAULT;
+   pv_data_body_file     = CHAR(128)   NOT NULL WITH DEFAULT;
+   pv_interface_name     = VARCHAR(10) NOT NULL WITH DEFAULT;
+)=
+DECLARE
+
+   lv_debug            = INTEGER(4) NOT NULL WITH DEFAULT;
+
+   mv_agency_supplier  = INTEGER(4)    NOT NULL WITH DEFAULT,
+   mv_email_data_body  = VARCHAR(250)  NOT NULL WITH DEFAULT,
+   mv_email_none_body  = VARCHAR(250)  NOT NULL WITH DEFAULT,
+   mv_email_to         = VARCHAR(500)  NOT NULL WITH DEFAULT,
+   mv_retcode          = INTEGER4      NOT NULL,
+   mv_row_no           = INTEGER(4)    NOT NULL, 
+   mv_system_cmd       = VARCHAR(1000) NOT NULL WITH DEFAULT, 
+ 
+   ma_email_array      = ARRAY OF TYPE OF TABLE agency_interface_email;
+ 
+ 
+   /******************************************************/
+   /** LOCAL PROCEDURES                                 **/
+   /******************************************************/
+
+   lp_initialise               = PROCEDURE RETURNING INTEGER4 NOT NULL; 
+   lp_get_email_contacts       = PROCEDURE RETURNING INTEGER4 NOT NULL; 
+   lp_send_email               = PROCEDURE RETURNING INTEGER4 NOT NULL;
+   lp_ing_error_check          = PROCEDURE RETURNING INTEGER2 NOT NULL;          
+   lp_log_message              = PROCEDURE RETURNING NONE;
+
+/**************************************************************************/
+/*   Start of Code                                                        */
+/**************************************************************************/  
+{    
+   mv_retcode      = gc_success;
+
+   mv_retcode      = lp_initialise();
+   IF (mv_retcode != gc_success)
+   THEN 
+       RETURN gc_fail;
+   ENDIF;
+
+   /******************************************/
+   /* Fetch Email Contacts                   */
+   /* into mv_email_to  and mv_email_to_unix */
+   /******************************************/
+   mv_retcode = lp_get_email_contacts ();
+   IF (mv_retcode != gc_success)
+   THEN 
+      CALLPROC lp_log_message( lpv_audit_text =
+        'Email Failed - Initialisation ' +
+        ' Agency ' + char(pv_agency_supplier) +
+        ' File Name ' + pv_attach_file);
+      RETURN gc_fail;
+   ENDIF;
+
+   /******************************************/
+   /* Send email                             */
+   /******************************************/
+   mv_retcode = lp_send_email();
+   IF (mv_retcode != gc_success)
+   THEN 
+      CALLPROC lp_log_message( lpv_audit_text =
+        'Email Failed - Send ' +
+        ' Agency ' + char(pv_agency_supplier) +
+        ' File Name ' + pv_attach_file);
+      RETURN gc_fail;
+   ENDIF;
+
+   CALLPROC lp_log_message( lpv_audit_text =
+           'Email Sent ' + ' Agency ' +
+           char(pv_agency_supplier) +
+           ' File Name ' + pv_attach_file);
+   
+   RETURN(mv_retcode);
+}
+
+/*****************************************************************/
+/** Procedure To set some initial values and conditions         **/
+/*****************************************************************/
+PROCEDURE lp_initialise () =
+DECLARE 
+   lv_retcode    = INTEGER4 NOT NULL WITH DEFAULT
+{
+   lv_retcode           = gc_success;
+
+   lv_debug  = 0;
+   gv_boxid  = get_nodename();
+
+   IF (pv_agency_supplier IS NULL OR pv_agency_supplier = '')
+   THEN
+      CALLPROC lp_log_message( lpv_audit_text =
+           'Email Failed - No Agency Supplier ' +
+           ' Agency ' + char(pv_agency_supplier) +
+           ' File Name ' + pv_attach_file);
+      RETURN(gc_fail);
+   ENDIF;
+
+   IF (pv_interface_name IS NULL OR pv_interface_name = '')
+   THEN
+      CALLPROC lp_log_message( lpv_audit_text =
+           'Email Failed - No Interface Name ' +
+           ' Agency ' + char(pv_agency_supplier) +
+           ' File Name ' + pv_attach_file);
+      RETURN(gc_fail);
+   ENDIF;
+
+   lv_retcode = CALLPROC ARRAYCLEAR(ma_email_array); 
+
+   return(lv_retcode);
+}
+
+/*****************************************************************/
+/** Procedure To get the names for emails to be sent to and put **/
+/**  them into the field mv_email_to and mv_email_to_unix       **/
+/*****************************************************************/
+PROCEDURE lp_get_email_contacts() =
+DECLARE 
+  lv_retcode       = INTEGER4 NOT NULL WITH DEFAULT;
+  lv_ing_result    = INTEGER4 NOT NULL WITH DEFAULT;
+{
+   lv_retcode      = gc_success;
+
+   ma_email_array  = 
+   SELECT email = TRIM(email)
+   FROM 
+      agency_interface_email
+   WHERE 
+      agency_supplier = :pv_agency_supplier /* GSK */
+   AND   
+      interface_name  = :pv_interface_name
+   ORDER BY
+      email ASC;
+  
+   /**************************
+   ** Check For INGRES Error
+   ***************************/
+   lv_ing_result  = CALLPROC lp_ing_error_check (
+               lpv_procedure  = 'lp_get_email_contacts ',
+               lpv_sql_desc   = 'declare session table');
+
+   IF lv_ing_result   != 0
+   THEN
+      CALLPROC lp_log_message( lpv_audit_text =
+           'Error agency_interface_email table'  +
+           ' Agency ' + char(pv_agency_supplier) +
+           ' Interface Name ' + pv_interface_name );
+      IF (lv_debug = 1)
+      THEN
+         MESSAGE 'Error agency_interface_email table'  WITH STYLE = POPUP;
+      ENDIF;
+
+      RETURN gc_fail;
+   ENDIF;
+
+   mv_row_no = 1;
+   mv_email_to = '';
+   UNLOADTABLE ma_email_array
+   {
+      IF mv_row_no > 1
+      THEN
+         mv_email_to = mv_email_to + '; ';
+      ENDIF;
+      IF (gv_boxid = 'zeus')  
+      THEN
+         mv_email_to = mv_email_to + ma_email_array[:mv_row_no].email;
+         mv_row_no = mv_row_no + 1;
+      else
+         mv_email_to = 'gb-aah-supply-central-systems@celesio.co.uk';
+      ENDIF;
+   };
+
+   RETURN(lv_retcode);
+}
+
+/*****************************************************************/
+/** Send email                                                  **/
+/*****************************************************************/
+PROCEDURE lp_send_email() =
+DECLARE 
+    lv_retcode         = INTEGER4 NOT NULL WITH DEFAULT;
+{
+    mv_email_data_body = IFNULL(:pv_data_body_file,'');
+    mv_agency_supplier = IFNULL(:pv_agency_supplier,0);
+
+    IF (pv_chg_cnt = 0)
+    THEN
+       mv_system_cmd = 'mailx -r DoNotReply@celesio.co.uk -s '
+          + '''' + 'Agency Supplier: ' + TRIM(VCHAR(:mv_agency_supplier)) + ' ' 
+          + '- Overnight Account Changes Report ' + '''' + ' '
+          + TRIM(:mv_email_to) + ' < ' + TRIM(:mv_email_data_body);
+    ELSE
+       mv_system_cmd = 'uuencode ' + TRIM(:pv_attach_file) 
+          + ' ' + TRIM(:pv_attach_file)
+          + ' | /usr/bin/cat ' + TRIM(:mv_email_data_body) + ' - '
+          + ' | mailx -r DoNotReply@celesio.co.uk -s '
+          + '''' + 'Agency Supplier: ' + TRIM(VCHAR(:mv_agency_supplier)) + ' ' 
+          + '- Overnight Account Changes Report ' + '''' + ' '
+          + TRIM(:mv_email_to);
+    ENDIF;
+
+
+    CALL SYSTEM :mv_system_cmd;
+
+    RETURN(lv_retcode);
+}
+
+/*****************************************************************/
+/** Procedure to Log error messages to a log file               **/
+/*****************************************************************/
+procedure lp_log_message( lpv_audit_text = varchar(256)) =
+DECLARE date_time = VARCHAR(20) NOT NULL,
+{
+    date_time = VARCHAR(DATE('now'));
+    lpv_audit_text = date_time + ' - ' + IFNULL(lpv_audit_text,'Null message');
+
+    CALL SYSTEM 'echo ' + '"' + VARCHAR(lpv_audit_text) + '\n' + '\c' + '"' +
+                ' >> /aahdb/logs/current/agency_accts_send_email.log';
+    RETURN;
+}
+
+/*****************************************************************/
+/** Error handling                                              **/
+/*****************************************************************/
+PROCEDURE lp_ing_error_check(lpv_procedure    = CHAR(60),
+                             lpv_sql_desc     = CHAR(60)) =
+DECLARE
+    lv_retcode         = INTEGER4 NOT NULL WITH DEFAULT;
+    lv_source_location = CHAR(68);
+{
+    lv_retcode         = gc_success;
+
+    lv_source_location = 'Module :agency_accts_send_email' +
+                         'Procedure :' + lpv_procedure;
+
+    /* cBatch  cDebug  0 = False/Off  1 = True/On  */
+    lv_retcode = CALLPROC ingdb_error_check(
+                              cModuleName     = 'agency_accts_send_email',
+                              cProcedureName  = IFNULL(lpv_procedure,''),
+                              cSQLdescription = IFNULL(lpv_sql_desc,''),
+                              cBatch          = 1,
+                              cDebug          = 1,
+                              cLogFile        = 'agency_accts_send_email.log');
+    RETURN (lv_retcode);
+}
