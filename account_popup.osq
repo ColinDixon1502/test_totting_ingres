@@ -1,0 +1,63 @@
+/*
+** Inventory Management System CONTROL development using INGRES.
+** -------------------------------------------------------------
+**
+** SOURCE NAME: account_popup.osq
+** FRAME NAME:  account_popup
+** FORM NAME:   account_popup
+**
+** PURPOSE:     Pop up list of branches
+**
+** VERSION:     1.0
+**
+** STATUS:      Development
+**
+** AUTHOR:      S J Morris
+**
+** DATE:        28/09/94
+**
+** CHANGE DATE: N/A
+**
+** CHANGES:     The original version
+**
+** PARAMETERS:  None
+**
+*/
+
+initialize (branch = char(4),
+	    i_status = integer2 not null,       /* return status from Ingres */
+	    i_rcount = integer2 not null        /* count of rows from Ingres */
+	    ) =
+    begin
+	set_forms frs (timeout = :gc_timeout);
+	i_rcount = 0;
+	inittable tbl1 read;
+	tbl1 = select branch as branch,
+	       account_no as account,
+	       udi_name as udi_name
+	       from sales_accts
+	       where branch = :branch;
+	commit;
+    end;
+
+on timeout =
+{
+callframe timeout_popup();
+}
+
+'Help', KEY FRSKEY1 =
+begin
+    callproc help_proc(SUBJECT = 
+	       'Help on Choose Account popup frame',
+	       file = :gc_help_dir+'account_popup.hlp');
+end;
+
+'Select', key frskey4 =
+begin
+    return :tbl1.account;
+end;
+
+'End', key frskey3 = 
+begin
+    return 'XXXXXXXXX';
+end;

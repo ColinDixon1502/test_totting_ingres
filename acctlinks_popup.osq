@@ -1,0 +1,540 @@
+/******************************************************************************
+*  Frame  - Account Links Insert/Update Popup
+*  Author - A.Barratt.   
+*
+*  Date   - 11.10.94
+*  Type   - Online Frame
+*
+*  Source - acctlinks_popup.osq
+*  Form   - acctlinks_popup
+*
+*  Parameters expected - Mode (INSERT)
+*                        
+*
+*******************************************************************************
+*  Version | Date     | Coded | Description of changes made
+***********|**********|*******|************************************************
+*  1.0     | 11.10.94 | ab    | Original code
+*  1.1     | 21.04.95 | SJM   | MCS Added
+*  1.2     | 27/04/98 | PTC   | Added mapst, mapend to force Cancel(F12)
+*  1.3     | 08/10/02 | RKK   | For Work Request Number 21410 - Display a
+*          |          |       | warning if user is attempting to add a Direct
+*          |          |       | Debit account to a Top link Account.
+*  1.4     | 08/06/07 | PNC   | Send an email to agency suppliers when new
+*          |          |       | account is created.
+*  1.5     | 02/07/07 | PT    | Restrict emails to agency suppliers in agency_
+*          |          |       | supplier_mapping
+*  1.6     | 30/11/09 | MBT   | Mercury Defect ID 31 LYNX 2 - AZ 2009 
+*          |          |       | add old_value column.
+*******************************************************************************/
+INITIALIZE
+(
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+    IIrowcount  =  INTEGER(4) NOT NULL,
+    IIerrorno   =  INTEGER(4) NOT NULL,
+    hf_errtext  =  CHAR(256)  NOT NULL,
+
+/*******************************************************
+** FRAME SPECIFIC VARIABLES  
+*******************************************************/
+IIint       =  CHAR(4) NOT NULL, /* Holds procedure return values     */
+IIint1      =  INTEGER(4),
+IIchar1     =  CHAR(1)    NOT NULL, /* General single character variable */
+IIchar      =  CHAR(20)   NOT NULL, /* General purpose char variable     */
+var_pay     =  CHAR(4) NOT NULL,
+max_code    =  INTEGER(2) NOT NULL, /* Current maximum code              */
+dummy       =  FLOAT(8) ,           /* dummy variable used for retrieving */
+start_session = INTEGER(4),  /* holds original session before connecting */
+count_marker  = INTEGER(4),
+
+/* PNC changes 08/06/07 */
+v_temp_table_name      = VARCHAR(32) NOT NULL WITH DEFAULT,
+h_retval               = INTEGER4 NOT NULL WITH DEFAULT,
+v_top_level_account_no = VARCHAR(9) NOT NULL WITH DEFAULT,
+h_custype_no           = INTEGER4 NOT NULL WITH DEFAULT
+
+)=
+DECLARE
+    mcs_res = integer;
+{
+    /******************************************************
+    ** Initialise form field values and set to query mode
+    *******************************************************/
+
+    SET_FORMS FRS (ACTIVATE(previousfield) = 1);
+    /*******************************************************/
+
+    SET_FORMS FRS(TIMEOUT = :gc_timeout);
+}
+
+ON TIMEOUT =
+{
+    CALLFRAME timeout_popup();
+}
+
+'Help', KEY FRSKEY1=
+{
+	callproc help_proc(
+		SUBJECT='Help on Account Links popup',
+		FILE=:gc_help_dir+'acctlinks_popup.hlp'
+			);
+}
+
+'Save', KEY FRSKEY4 =
+{
+    IF screenmode = 'INSERT' THEN
+/*****new********/
+    /********************************************************************** 
+    * CHECK TO SEE IF 'D03' MARKER IS SET - IF MARKER IS SET REFUSE INSERT*
+    **********************************************************************/
+
+     IF (:purchase_code != '0000') THEN
+       SELECT count(*) as count_marker from saccts_mkrs
+       WHERE branch = :branch
+       AND account_no = :account_no
+       AND mkr_code = 'D03'
+       AND mkr_status = 1;
+
+       /**************************
+       ** Check For INGRES Error
+       ***************************/
+       INQUIRE_INGRES (IIerrorno  = ERRORNO,
+       hf_errtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+       
+       IF :count_marker >0 THEN
+	        MESSAGE 'Please Contact The Administrator - This Is A Direct Debit Customer ' with style = popup;  
+	        ROLLBACK;
+	        CLEAR FIELD branch;
+	        CLEAR FIELD account_no;
+
+	        RESUME FIELD branch;
+       ENDIF;
+      ENDIF; 
+    
+/*****new********/     
+    
+    /*************************************************
+    * check account exists
+    *************************************************/
+
+      /*
+      ** Store the customer status too.
+      ** PNC 08/06/2007
+      */
+
+      SELECT IIint = branch,
+             h_custype_no = custype_no
+	    FROM   sales_accts
+	    WHERE  branch = :branch
+      AND    account_no = :account_no;
+
+	       /**************************
+	       ** Check For INGRES Error 
+	       ***************************/
+		INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			     hf_errtext = ERRORTEXT,
+			     IIrowcount = ROWCOUNT);
+
+	     IF IIerrorno != 0 THEN
+		 ROLLBACK;
+		 MESSAGE '-03- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+		 RETURN -1;
+	     ENDIF;
+		
+	     IF IIrowcount <= 0 THEN        
+		MESSAGE 'Account Does Not Exist-Insert Abandoned'
+		+ :branch + :account_no
+		WITH STYLE = POPUP;
+		ROLLBACK;
+		CLEAR FIELD branch;
+		CLEAR FIELD account_no;
+		
+		RESUME FIELD branch;
+	     ENDIF;        
+   
+
+    /*************************************************
+    * check account enot already on acctlinks
+    *************************************************/
+       SELECT IIint = branch
+	    from acctlinks
+	    where branch = :branch and
+	    account_no = :account_no;
+	       /**************************
+	       ** Check For INGRES Error 
+	       ***************************/
+		INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			     hf_errtext = ERRORTEXT,
+			     IIrowcount = ROWCOUNT);
+
+	     IF IIerrorno != 0 THEN
+		 ROLLBACK;
+		 MESSAGE '-03- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+		 RETURN -1;
+	     ENDIF;
+		
+	     IF IIrowcount > 0 THEN        
+		MESSAGE 'Account Already On AccountLinks-Insert Abandoned'
+		+ :branch + :account_no
+		WITH STYLE = POPUP;
+		ROLLBACK;
+		CLEAR FIELD branch;
+		CLEAR FIELD account_no;
+		
+		RESUME FIELD branch;
+	     ENDIF;        
+    
+	/*********************************************
+	** check top level account or top level exists
+	**********************************************/
+
+	/*
+  ** PNC 08/06/2007 - Store top level account for use in email procedure.
+	*/
+	IF :delivery_code != '00' OR :purchase_code != '0000' THEN
+
+	    
+	    SELECT var_pay = pay_code,
+             v_top_level_account_no = account_no
+	    FROM acctlinks
+	    WHERE pay_code = :pay_code
+	    AND purchase_code = '0000' 
+	    AND delivery_code = '00';
+	
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			     hf_errtext = ERRORTEXT,
+			     IIrowcount = ROWCOUNT);
+
+	     IF IIerrorno != 0 THEN
+		 ROLLBACK;
+		 MESSAGE '-03- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+		 RETURN -1;
+	     ENDIF;
+		
+	     IF IIrowcount <= 0 THEN        
+		MESSAGE 'Top Level Account Does Not Exist-Insert Abandoned '
+		+ :pay_code
+		WITH STYLE = POPUP;
+		ROLLBACK;
+		CLEAR FIELD pay_code;
+		RESUME FIELD pay_code;
+	     ENDIF;        
+		
+	COMMIT;
+	
+	ENDIF;  
+	
+	/******************************************************
+	** Check account does not have any unallocated postings
+	*******************************************************/
+	IF  (:purchase_code != '0000') THEN
+
+	    start_session = CALLPROC get_start_session();
+/*	    CALLPROC connect_osk1_sales(); */
+  	    CALLPROC connect_sales();    
+
+		SELECT dummy = total_value
+		FROM cash_postings
+		WHERE branch_id = :branch
+		AND account_no = :account_no
+		AND (total_value - allocated_value) != 0 ;
+	
+		/**************************
+		** Check For INGRES Error 
+		***************************/
+		INQUIRE_INGRES (IIerrorno  = ERRORNO,
+				hf_errtext = ERRORTEXT,
+				IIrowcount = ROWCOUNT);
+	
+		IF IIerrorno != 0 THEN
+		  ROLLBACK;
+		  
+		  CALLPROC disconnect_sales(:start_session);        
+		  
+		  MESSAGE '-03- INGRES error in select ' 
+			+ :hf_errtext WITH STYLE = POPUP;
+		  RETURN -1;
+		ENDIF;
+		
+		IF IIrowcount > 0 THEN
+		  ROLLBACK;
+		  
+		  CALLPROC disconnect_sales(:start_session);        
+		  
+		  MESSAGE 'Unallocated cash postings still exist on this ' +
+		     'account and must be cleared before this account can ' +
+		     'be put in to the acctlinks table' WITH STYLE = POPUP;
+		  RESUME;
+		ENDIF;
+		COMMIT;
+
+	CALLPROC disconnect_sales(:start_session);        
+
+	ENDIF;
+	
+	/**************************************
+	** Check code does not already exist
+	***************************************/
+
+	SELECT IIint = pay_code
+	  FROM acctlinks
+	 WHERE pay_code  = :pay_code
+	 AND purchase_code = :purchase_code
+	 AND delivery_code = :delivery_code;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-03- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN -1;
+	ENDIF;
+
+	COMMIT;
+
+	IF IIrowcount <= 0 THEN
+
+	    INSERT INTO acctlinks
+	    (
+	     pay_code,
+	     purchase_code,
+	     delivery_code,
+	     branch,
+	     account_no
+	    )
+	    VALUES
+	    (
+	     :pay_code,
+	     :purchase_code,
+	     :delivery_code,
+	     :branch,
+	     :account_no
+	    );
+
+	    /**************************
+	    ** Check For INGRES Error 
+	    ***************************/
+	    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			    hf_errtext = ERRORTEXT,
+			    IIrowcount = ROWCOUNT);
+
+	    IF IIerrorno != 0 THEN
+		ROLLBACK;
+		MESSAGE '-02- INGRES error in INSERT ' 
+			+ :hf_errtext WITH STYLE = POPUP;
+		RETURN -1;
+	    ENDIF;
+
+	    COMMIT;
+	    
+	   /* SEND TO MESSAGE CONTROL */
+	   
+	    mcs_res = callproc open_isam();
+	    
+	    if (mcs_res != 0)
+	    then
+		message 'OPEN ISAM FAILURE - ' 
+		+ varchar(:mcs_res) with style = popup;
+	    endif;
+	    
+/*	    message 'KEY INTO MCS = ' + :pay_code + :purchase_code + :delivery_code
+		with style = popup;; */
+	    
+	    mcs_res = callproc mcs_acctlinks_out(
+						'I',
+						:pay_code,
+						:purchase_code,
+						:delivery_code,
+						:gv_branch_id,
+						:gv_user_id
+							);
+				
+	    IF mcs_res != 0 
+	    THEN
+		message 'ERROR : MCS returned '+trim(char(:mcs_res))
+		    with style = popup;
+	    ELSE
+/* message 'SEND TO MCS OK ! ' with style = popup; */
+	    ENDIF;
+	    
+	    mcs_res = callproc close_isam();
+
+      /*
+      ** Send an email to the agency suppliers that a new account 
+      ** has been created.
+      **
+      ** Do NOT do this for top level accounts, internal or non-trading
+      ** accounts, or any account that has a customer type of:
+      ** 22,23,25,33,35 or 37
+      **
+      ** PNC 08/06/2007.
+      */
+
+      /*
+      ** Create temporary session table required by 
+      ** agency_supplier_email_notify procedure.
+      */ 
+
+      v_temp_table_name = 
+         SQUEEZE(TRIM('session.email_' + branch + account_no)) ;
+
+      DECLARE GLOBAL TEMPORARY TABLE :v_temp_table_name
+          ( table_name  VARCHAR(32) NOT NULL WITH DEFAULT,
+            column_name VARCHAR(32) NOT NULL WITH DEFAULT,
+            new_value   VARCHAR(64) NOT NULL WITH DEFAULT,
+            old_value   VARCHAR(64) NOT NULL WITH DEFAULT 
+          ) ON COMMIT PRESERVE ROWS WITH NORECOVERY;
+
+      INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+      IF (g_error != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error occured creating tempory table ' + v_temp_table_name + 
+                 '...' + X'0A' + 'Error: ' + VARCHAR(:g_err_text)
+            WITH STYLE=POPUP;
+         RETURN (-1);
+      ENDIF;
+
+      MODIFY :v_temp_table_name TO BTREE ON table_name, column_name;
+
+      INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+      IF (g_error != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error occured modifying tempory table ' + v_temp_table_name + 
+                 '...' + X'0A' + 'Error: ' + VARCHAR(:g_err_text) 
+            WITH STYLE=POPUP;
+         RETURN (-1);
+      ENDIF;
+
+      INSERT INTO :v_temp_table_name
+             ( table_name,
+               column_name,
+               new_value,
+               old_value )
+      VALUES ( 'acctlinks',
+               'account_no',
+               concat(branch, :v_top_level_account_no),
+               '' ) ;
+    
+      INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+      IF (g_error != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error occured modifying tempory table ' + v_temp_table_name + 
+                 '...' + X'0A' + 'Error: ' + VARCHAR(:g_err_text)
+            WITH STYLE=POPUP;
+         RETURN (-1);
+      ENDIF;
+
+      /*
+      ** Call procedure agency_supplier_email_notify
+      */
+
+      h_retval = CALLPROC agency_supplier_email_notify
+         ( request='U',
+           account_branch=:branch,
+           account_no=:account_no,
+           in_table_name=:v_temp_table_name
+         );
+
+      /*
+      ** get rid of table incase name reused.
+      */
+      drop table :v_temp_table_name ;
+
+      INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+      IF (g_error != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error dropping tempory table ' + v_temp_table_name + 
+                      '...' + X'0A' + 'Error: ' + VARCHAR(:g_err_text)
+                    WITH STYLE=POPUP;
+         RETURN (-1);
+      ENDIF;
+
+      COMMIT;
+
+	ELSE
+
+	    MESSAGE 'Code already exists.  No data saved.' WITH STYLE = POPUP;
+	    RESUME FIELD pay_code;
+	ENDIF;
+    ENDIF;
+
+    COMMIT;
+    IF :purchase_code = '0000' and :delivery_code = '00' THEN
+	RETURN 0;
+    ELSE
+	RETURN 2;
+    ENDIF;    
+}
+
+'Cancel', KEY FRSKEY3 =
+{
+    RETURN 1;
+}
+
+'Detail', KEY FRSKEY10=
+{
+    callproc mapst;
+    IIint1 = CALLFRAME LOOK_UP
+	   (II_QUERY= SELECT pay_code,
+			     purchase_code,
+			     delivery_code,
+			     branch,
+			     account_no
+			     FROM acctlinks                        
+	    WHERE pay_code = :pay_code;
+	    pay_code = BYREF(:pay_code),
+	    II_FIELD1 = 'pay_code',
+	    II_FIELD2 = 'purchase_code',
+	    II_FIELD3 = 'delivery_code',
+	    II_FIELD4 = 'branch',
+	    II_FIELD5 = 'account_no',
+	    II_FIELD_TITLE1 = 'Pay',
+	    II_FIELD_TITLE2 = 'Purchase',
+	    II_FIELD_TITLE3 = 'Delivery',        
+	    II_FIELD_TITLE4 = 'Branch',
+	    II_FIELD_TITLE5 = 'Account',
+	    II_ROWS = 16);
+    callproc mapend;
+	    
+		    /**************************
+	** Check For INGRES Error 
+	***************************/
+	     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			     hf_errtext = ERRORTEXT,
+			     IIrowcount = ROWCOUNT);
+
+	     IF IIerrorno != 0 THEN
+		 ROLLBACK;
+		 MESSAGE '-03- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+		 RETURN -1;
+	     ENDIF;
+		
+	     IF IIrowcount <= 0 THEN        
+		MESSAGE 'No Accounts Found'
+		WITH STYLE = POPUP;
+		ROLLBACK;
+		RESUME FIELD pay_code;
+	     ENDIF;        
+		
+	COMMIT;
+}

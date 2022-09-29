@@ -1,0 +1,675 @@
+/*
+** Inventory Management System CONTROL development using INGRES.
+** -------------------------------------------------------------
+**
+** SOURCE NAME: acctlinks_fm.osq
+**
+** FRAME NAME:  acctlinks_fm
+** FORM NAME:   acctlinks_fm
+**
+** PURPOSE:     File Maintenance on acctlinks table
+**
+** VERSION:     1.0
+**
+** STATUS:      Development
+**
+** AUTHOR:      A.Barratt / D.Sullivan
+**
+** DATE:        23/09/94
+**
+** CHANGE DATE: N/A
+**
+** CHANGES:     The original version
+**
+** PARAMETERS:  None
+**
+*****************************************************************************
+**  Version | Date     | Coded | Description of changes made                *
+************|**********|*******|*********************************************
+**  1.0     | 23/09/94 | AB/DS | Original code                              *
+************|**********|*******|*********************************************
+**  2.0     | 06/06/07 | PNC   | send email if account created or deleted   *
+************|**********|*******|*********************************************
+**  2.1     | 02/07/07 | PT    | send email only if agency supplier         *
+*****************************************************************************
+*   2.2     | 30/11/09 | MBT   | Mercury Defect ID 31 LYNX 2 - AZ 2009      *
+*           |          |       | add old_value column.                      *     
+*****************************************************************************
+*/
+
+INITIALIZE()=
+
+DECLARE i_rcount        = integer,
+	res             = integer,
+	mcs_res         = integer,
+	var_pay         = CHAR(4),
+	var_purchase    = CHAR(4),
+
+	v_branch        = CHAR(4) NOT NULL WITH DEFAULT,
+	v_account_no    = CHAR(9) NOT NULL WITH DEFAULT,
+	v_custype_no    = integer(1) NOT NULL WITH DEFAULT,
+
+	var_delivery    = CHAR(2),
+	del_ans         = c1,
+	row_status      = integer,
+	rec_no          = integer,
+	IIint           = integer,
+	v_rowcount      = integer4,
+	hf_pay          = CHAR(4) NOT NULL,
+	hf_purchase     = CHAR(4) NOT NULL,
+	hf_delivery     = CHAR(2) NOT NULL,
+	hf_brn          = CHAR(4) NOT NULL,
+	hf_account      = CHAR(9) NOT NULL,
+	ret_val         = INTEGER NOT NULL,
+	p_clear         = PROCEDURE,
+  p_email_users   = PROCEDURE RETURNING INTEGER
+	
+	BEGIN
+    date_time = date('now');
+    SET_FORMS FORM (mode='fill');
+    SET_FORMS FRS (timeout = :gc_timeout);
+    
+    ret_val = 0;
+    MESSAGE 'Retrieving Top Level Accounts';
+    INITTABLE acctlinks_tab 'READ';
+    acctlinks_tab = SELECT a.pay_code as pay_code,
+			   a.purchase_code as purchase_code,
+			   a.delivery_code as delivery_code,
+			   a.branch as branch,
+			   a.account_no as account_no,
+			   s.udi_name as udi_name,
+			   s.custype_no as h_custype_no    /* PNC */
+			   FROM acctlinks a, sales_accts s
+			   WHERE 
+			   a.purchase_code = '0000' 
+			   AND a.delivery_code = '00'
+			   and a.branch = s.branch
+			   AND a.account_no = s.account_no
+			   ORDER BY 1,2,3;
+      INQUIRE_INGRES(i_rcount = ROWCOUNT,
+		     res=ERRORNO);
+      IF res != 0 THEN
+         ROLLBACK;
+	 MESSAGE 'Error On Select' WITH STYLE = POPUP;
+	 RESUME FIELD acctlinks_tab.pay_code;
+      ENDIF;                                       
+			   
+      IF i_rcount = 0 THEN
+	 MESSAGE 'No Data To Retrieve ' WITH STYLE = POPUP;
+	 RESUME FIELD acctlinks_tab.pay_code;
+      ENDIF;                        
+COMMIT;
+/*
+UNLOADTABLE acctlinks_tab
+  BEGIN
+     SELECT :acctlinks_tab.udi_name = udi_name
+	    FROM sales_accts
+	    WHERE :acctlinks_tab.branch = branch
+	    AND :acctlinks_tab.account_no = account_no;
+  END;
+*/            
+RESUME FIELD acctlinks_tab.pay_code;                           
+END;
+
+ON TIMEOUT =
+{
+CALLFRAME timeout_popup();
+}
+
+'Help', KEY FRSKEY1 =
+BEGIN
+    callproc help_proc(SUBJECT = 
+	       'Help on Account Links Maintenance',
+	       file = :gc_help_dir+'acctlinks_fm.hlp');
+END
+
+'Insert',KEY FRSKEY9 =
+BEGIN
+ret_val = 0;
+hf_pay = :acctlinks_tab.pay_code;
+hf_purchase = '0000';
+hf_delivery = '00';
+hf_brn = ' ';
+hf_account = ' ';
+
+    IIint = CALLFRAME acctlinks_popup(screenmode = 'INSERT',
+				      pay_code = BYREF(hf_pay),                                         
+				      purchase_code = BYREF(hf_purchase),
+				      delivery_code = BYREF(hf_delivery),  
+				      branch        = BYREF(hf_brn),
+				      account_no    = BYREF(hf_account));
+    IF IIint = 0 THEN
+       INITTABLE acctlinks_tab 'READ';
+    acctlinks_tab = SELECT a.pay_code as pay_code,
+			   a.purchase_code as purchase_code,
+			   a.delivery_code as delivery_code,
+			   a.branch as branch,
+			   a.account_no as account_no,
+			   s.udi_name as udi_name,
+			   s.custype_no as h_custype_no    /* PNC */
+			   FROM acctlinks a, sales_accts s
+			   WHERE 
+			   a.purchase_code = '0000' 
+			   AND a.delivery_code = '00'
+			   AND a.branch = s.branch
+			   AND a.account_no = s.account_no
+			   ORDER BY 1,2,3;
+      INQUIRE_INGRES(i_rcount = ROWCOUNT,
+		     res=ERRORNO);
+      IF res != 0 THEN
+         ROLLBACK;
+	 MESSAGE 'Error On Re-Select' WITH STYLE = POPUP;
+	 RESUME FIELD acctlinks_tab.pay_code;
+      ENDIF;                                       
+			   
+COMMIT;                           
+    ELSEIF IIint = -1 THEN
+    RETURN;
+    ENDIF;
+    
+/*UNLOADTABLE acctlinks_tab
+  BEGIN
+     SELECT :acctlinks_tab.udi_name = udi_name
+	    FROM sales_accts
+	    WHERE branch = :acctlinks_tab.branch
+	    AND account_no = :acctlinks_tab.account_no;
+  END;          
+    RESUME FIELD acctlinks_tab.pay_code;*/
+    
+END        /*   of insert   */
+	 
+
+'Delete',KEY FRSKEY14 =
+BEGIN
+
+    /*
+    ** See how many rows would go...
+    */
+    IF (:acctlinks_tab.purchase_code = '0000') AND
+	     (:acctlinks_tab.delivery_code = '00') THEN 
+
+        /*
+        ** Its a top level account, select it and everything under it.
+        */
+
+	      SELECT v_rowcount = count(*)
+        FROM   acctlinks
+	      WHERE  pay_code = :acctlinks_tab.pay_code;
+
+    ELSEIF (:acctlinks_tab.delivery_code = '00') THEN
+
+        /*
+        ** Its an account, so just select for that account_no.
+        */
+
+	      SELECT v_rowcount = count(*)
+        FROM   acctlinks
+	      WHERE  pay_code      = :acctlinks_tab.pay_code
+	      AND    purchase_code = :acctlinks_tab.purchase_code;
+
+    ELSE
+
+        /*
+        ** Delivery code is not 00, so select a specific
+        ** delivery code in an account.
+        */
+
+	      SELECT v_rowcount = count(*)
+        FROM   acctlinks
+	      WHERE pay_code    = :acctlinks_tab.pay_code
+	      AND purchase_code = :acctlinks_tab.purchase_code
+	      AND delivery_code = :acctlinks_tab.delivery_code;
+
+    ENDIF;    
+
+    INQUIRE_INGRES(i_rcount = ROWCOUNT, res=ERRORNO);
+
+    IF (res != 0) THEN
+       ROLLBACK;
+	     MESSAGE 'Error On Select from acctlinks - ref 22' WITH STYLE = POPUP;
+	     RESUME FIELD acctlinks_tab.pay_code;
+    ENDIF;                                       
+
+    del_ans = PROMPT 'This will delete ' + varchar(:v_rowcount) + 
+              ' Rows, Do you wish to continue y/n' WITH STYLE = POPUP;
+
+    IF (del_ans = 'y') OR
+	     (del_ans = 'Y') THEN
+
+	      COMMIT;     
+      
+	      /* SEND TO MESSAGE CONTROL */
+
+	      mcs_res = callproc open_isam();
+    
+	      mcs_res = callproc mcs_acctlinks_out(
+					'D',
+					:acctlinks_tab.pay_code,
+					:acctlinks_tab.purchase_code,
+					:acctlinks_tab.delivery_code,
+					:gv_branch_id,
+					:gv_user_id
+						);
+			
+	      IF mcs_res != 0 THEN
+          ROLLBACK;
+	        message 'ERROR : MCS returned '+trim(char(:mcs_res)) 
+          with style = popup;
+	      ELSE
+	        message 'SEND TO MCS OK ! ';
+	      ENDIF;
+    
+	      mcs_res = callproc close_isam();
+
+        /*
+        ** Finally, do the deletes, call procedure to 
+        ** send an email to account group notifying if deleted.
+        **
+        ** An email has to be sent for every account that is deleted.
+        ** If a top level account is removed (0000) then an email is sent
+        ** for that one, and for every account under it.
+        ** Dont send an email if its a top account and no sub accounts.
+        ** Dont send an email for accounts with a customer
+        ** status of 22,23,25,33,35,37
+        ** Dont send an email for internal or non-trading accounts??
+        */
+
+        IF (:acctlinks_tab.purchase_code = '0000') AND
+	         (:acctlinks_tab.delivery_code = '00') THEN 
+
+           /*
+           ** Its a top level account, email it and everything under it.
+           */
+           v_branch     = '' ;
+           v_account_no = '' ;
+           v_custype_no = 0 ;
+
+	         SELECT v_branch     = a.branch,
+                  v_account_no = a.account_no,
+                  v_custype_no = s.custype_no
+           FROM   acctlinks a, sales_accts s
+	         WHERE  pay_code = :acctlinks_tab.pay_code
+           AND    a.branch     = s.branch      /* PNC 08/06/2007 */
+           AND    a.account_no = s.account_no  /* PNC 08/06/2007 */
+           AND    a.purchase_code != '0000'  /* Dont email top accounts */
+           AND    s.custype_no NOT IN (22,23,25,33,35,37)
+           BEGIN
+
+              res = callproc p_email_users
+              (
+                  pv_branch     = :v_branch ;
+                  pv_account_no = :v_account_no ;  /* Blank if deleting */
+                  pv_action     = 'U'
+              );
+ 
+              IF (res != 0) THEN
+                  ROLLBACK;
+                  MESSAGE 'email procedure failed - Delete not performed'
+                  WITH STYLE=POPUP;
+                  ROLLBACK ;
+                  RESUME ;
+              ENDIF ;
+
+           END;
+
+           INQUIRE_INGRES(i_rcount = ROWCOUNT, res=ERRORNO);
+
+           IF (res != 0) THEN
+              ROLLBACK;
+	            MESSAGE 'Error selecting from acctlinks - ref 25'
+              WITH STYLE = POPUP;
+	            RESUME FIELD acctlinks_tab.pay_code;
+           ENDIF;                                       
+
+           /* Now do the delete */
+	         DELETE FROM  acctlinks
+	         WHERE pay_code = :acctlinks_tab.pay_code;
+
+        ELSEIF (:acctlinks_tab.delivery_code = '00') THEN
+
+           /*
+           ** Its a normal account, email, delete it and everything related.
+           */
+           v_branch     = '' ;
+           v_account_no = '' ;
+           v_custype_no = 0 ;
+
+	         SELECT v_branch     = a.branch,
+                  v_account_no = a.account_no,
+                  v_custype_no = s.custype_no
+           FROM   acctlinks a, sales_accts s
+	         WHERE  pay_code      = :acctlinks_tab.pay_code
+	         AND    purchase_code = :acctlinks_tab.purchase_code
+           AND    a.branch     = s.branch      /* PNC 08/06/2007 */
+           AND    a.account_no = s.account_no  /* PNC 08/06/2007 */
+           AND    a.purchase_code != '0000'  /* Dont email top accounts */
+           AND    s.custype_no NOT IN (22,23,25,33,35,37)
+           BEGIN
+
+               res = callproc p_email_users
+               (
+                   pv_branch     = :v_branch ;
+                   pv_account_no = :v_account_no ;  /* Blank if deleting */
+                   pv_action     = 'U'
+               );
+ 
+               IF (res != 0) THEN
+                      ROLLBACK;
+                      MESSAGE 'email procedure failed - Delete not performed'
+                      WITH STYLE=POPUP;
+                      ROLLBACK ;
+                      RESUME ;
+               ENDIF ;
+
+            END;
+
+            INQUIRE_INGRES(i_rcount = ROWCOUNT, res=ERRORNO);
+
+            IF (res != 0) THEN
+              ROLLBACK;
+	            MESSAGE 'Error selecting from acctlinks - ref 27'
+              WITH STYLE = POPUP;
+	            RESUME FIELD acctlinks_tab.pay_code;
+            ENDIF;                                       
+
+	          DELETE FROM acctlinks 
+	          WHERE pay_code      = :acctlinks_tab.pay_code
+	          AND   purchase_code = :acctlinks_tab.purchase_code;
+
+        ELSE
+
+           /*
+           ** Its a single account, email, & delete it.
+           */
+           v_branch     = '' ;
+           v_account_no = '' ;
+           v_custype_no = 0 ;
+
+	         SELECT v_branch     = a.branch,
+                  v_account_no = a.account_no,
+                  v_custype_no = s.custype_no
+           FROM   acctlinks a, sales_accts s
+	         WHERE  pay_code      = :acctlinks_tab.pay_code
+	         AND    purchase_code = :acctlinks_tab.purchase_code
+	         AND    delivery_code = :acctlinks_tab.delivery_code
+           AND    a.purchase_code != '0000'  /* Dont email top accounts */
+           AND    s.custype_no NOT IN (22,23,25,33,35,37)
+    AND    a.branch     = s.branch      /* PNC 08/06/2007 */
+    AND    a.account_no = s.account_no  /* PNC 08/06/2007 */
+           BEGIN
+
+               res = callproc p_email_users
+               (
+                   pv_branch     = :v_branch ;
+                   pv_account_no = :v_account_no ;  /* Blank if deleting */
+                   pv_action     = 'U'
+               );
+ 
+               IF (res != 0) THEN
+                      ROLLBACK;
+                      MESSAGE 'email procedure failed - Delete not performed'
+                      WITH STYLE=POPUP;
+                      ROLLBACK ;
+                      RESUME ;
+               ENDIF ;
+
+            END;
+
+            INQUIRE_INGRES(i_rcount = ROWCOUNT, res=ERRORNO);
+
+            IF (res != 0) THEN
+              ROLLBACK;
+	            MESSAGE 'Error selecting from acctlinks - ref 28'
+              WITH STYLE = POPUP;
+	            RESUME FIELD acctlinks_tab.pay_code;
+            ENDIF;                                       
+            /*
+            ** Delivery code is not 00, so Just want to delete a specific
+            ** delivery code in an account.
+            */
+
+	          DELETE FROM acctlinks       
+	          WHERE pay_code = :acctlinks_tab.pay_code
+	          AND purchase_code = :acctlinks_tab.purchase_code
+	          AND delivery_code = :acctlinks_tab.delivery_code;
+
+        ENDIF;    
+
+        IF (res != 0) THEN
+           ROLLBACK;
+	         MESSAGE 'Error On deleting from acctlinks - ref 23' 
+           WITH STYLE = POPUP;
+	         RESUME FIELD acctlinks_tab.pay_code;
+        ENDIF;                                       
+
+	      DELETEROW acctlinks_tab;
+
+        COMMIT;
+
+	      RESUME FIELD acctlinks_tab.pay_code;
+
+    ELSE
+
+        ROLLBACK;
+
+    ENDIF;
+
+END
+
+'Detail',KEY FRSKEY4 =
+BEGIN
+ret_val = 1;
+var_pay = acctlinks_tab.pay_code;
+CALL PROCEDURE p_clear;
+MESSAGE 'Retrieving Account Details For Code ' + var_pay;
+       INITTABLE acctlinks_tab 'READ';
+    acctlinks_tab = 
+    SELECT a.pay_code as pay_code,
+			     a.purchase_code as purchase_code,
+			     a.delivery_code as delivery_code,
+			     a.branch as branch,
+			     a.account_no as account_no,
+			     s.custype_no as h_custype_no /* PNC */
+    FROM   acctlinks a, sales_accts s
+    WHERE  a.pay_code   = :var_pay 
+    AND    a.branch     = s.branch      /* PNC 08/06/2007 */
+    AND    a.account_no = s.account_no  /* PNC 08/06/2007 */
+    ORDER BY 1,2,3;
+
+INQUIRE_INGRES(i_rcount = ROWCOUNT,
+		     res=ERRORNO);
+      IF res != 0 THEN
+         ROLLBACK;
+	 MESSAGE 'Error On Accounts Select' WITH STYLE = POPUP;
+	 RESUME FIELD acctlinks_tab.pay_code;
+      ENDIF;                                       
+			   
+COMMIT;
+    
+UNLOADTABLE acctlinks_tab
+  BEGIN
+     SELECT :acctlinks_tab.udi_name = udi_name
+	    FROM sales_accts
+	    WHERE branch = :acctlinks_tab.branch
+	    AND account_no = :acctlinks_tab.account_no;
+  END;          
+    
+RESUME FIELD acctlinks_tab.pay_code;                           
+END
+
+
+	      
+'End' , KEY FRSKEY3 =
+BEGIN
+IF ret_val = 0 THEN
+    return;
+ELSE 
+    ret_val = 0;
+    CALL PROCEDURE p_clear;
+    MESSAGE 'Retrieving Top Level Accounts';
+    INITTABLE acctlinks_tab 'READ';
+    acctlinks_tab = SELECT a.pay_code as pay_code,
+			   a.purchase_code as purchase_code,
+			   a.delivery_code as delivery_code,
+			   a.branch as branch,
+			   a.account_no as account_no,
+			   s.udi_name as udi_name,
+			   s.custype_no as h_custype_no    /* PNC */
+			   FROM acctlinks a, sales_accts s
+			   WHERE 
+			   a.purchase_code = '0000' 
+			   AND a.delivery_code = '00'
+			   AND a.branch = s.branch
+			   AND a.account_no = s.account_no
+			   ORDER BY 1,2,3;
+      INQUIRE_INGRES(i_rcount = ROWCOUNT,
+		     res=ERRORNO);
+      IF res != 0 THEN
+         ROLLBACK;
+	 MESSAGE 'Error On Select' WITH STYLE = POPUP;
+	 RESUME FIELD acctlinks_tab.pay_code;
+      ENDIF;                                       
+			   
+      IF i_rcount = 0 THEN
+	 MESSAGE 'No Data To Retrieve ' WITH STYLE = POPUP;
+	 RESUME FIELD acctlinks_tab.pay_code;
+      ENDIF;                        
+COMMIT;
+/*
+UNLOADTABLE acctlinks_tab
+  BEGIN
+     SELECT :acctlinks_tab.udi_name = udi_name
+	    FROM sales_accts
+	    WHERE branch = :acctlinks_tab.branch
+	    AND account_no = :acctlinks_tab.account_no;
+  END;
+*/            
+   RESUME FIELD acctlinks_tab.pay_code;    
+ENDIF;    
+END    
+
+
+/************************************************
+** Procedure to clear down screen values
+*************************************************/
+PROCEDURE p_clear(
+)=
+{
+    CLEAR FIELD ALL;
+    date_time = DATE('NOW');
+
+}
+
+PROCEDURE p_email_users
+(
+    pv_branch     = VARCHAR(4) NOT NULL WITH DEFAULT,
+    pv_account_no = VARCHAR(32) NOT NULL WITH DEFAULT,
+    pv_action     = CHAR(1) NOT NULL WITH DEFAULT
+)=
+DECLARE
+    v_temp_table_name = VARCHAR(32) NOT NULL WITH DEFAULT;
+    temp_account_no = VARCHAR(9) NOT NULL WITH DEFAULT,
+    h_retval = INTEGER4 NOT NULL WITH DEFAULT;
+{
+
+    /*
+    ** Create temporary session table required by 
+    ** agency_supplier_email_notify procedure.
+    */ 
+
+    v_temp_table_name = SQUEEZE(TRIM('session.email_' + pv_branch + pv_account_no)) ;
+    /* message v_temp_table_name with style=popup ; */
+
+    DECLARE GLOBAL TEMPORARY TABLE :v_temp_table_name
+    (   table_name  VARCHAR(32) NOT NULL WITH DEFAULT,
+        column_name VARCHAR(32) NOT NULL WITH DEFAULT,
+        new_value   VARCHAR(64) NOT NULL WITH DEFAULT,
+        old_value   VARCHAR(64) NOT NULL WITH DEFAULT 
+    ) ON COMMIT PRESERVE ROWS WITH NORECOVERY;
+
+    INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+    IF (g_error != 0) THEN
+        ROLLBACK;
+        MESSAGE 'Error occured creating tempory table ' + v_temp_table_name + 
+                '...' + X'0A' + 'Error: ' + VARCHAR(:g_err_text)
+              WITH STYLE=POPUP;
+        RETURN (-1);
+    ENDIF;
+
+    MODIFY :v_temp_table_name TO BTREE ON table_name, column_name;
+
+    INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+    IF (g_error != 0) THEN
+        ROLLBACK;
+        MESSAGE 'Error occured modifying tempory table ' + v_temp_table_name + 
+                '...' + X'0A' + 'Error: ' + VARCHAR(:g_err_text) 
+                WITH STYLE=POPUP;
+        RETURN (-1);
+    ENDIF;
+
+    /*
+    ** If account is deleted then put blank in 'new_value' field.
+    ** else, if new, use the account number.
+    */
+    IF (pv_action = 'U') THEN /* U=deleted in this case */
+        temp_account_no = '';
+    ELSE
+        temp_account_no = pv_account_no;
+    ENDIF;
+
+    INSERT INTO :v_temp_table_name
+           ( table_name,
+             column_name,
+             new_value,
+             old_value )
+    VALUES ( 'acctlinks',
+             'account_no',
+             :temp_account_no,
+             '' ) ;
+
+    INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+    IF (g_error != 0) THEN
+        ROLLBACK;
+        MESSAGE 'Error occured modifying tempory table ' + v_temp_table_name + 
+                '...' + X'0A' + 'Error: ' + VARCHAR(:g_err_text)
+              WITH STYLE=POPUP;
+        RETURN (-1);
+    ENDIF;
+
+    COMMIT;
+
+    /*
+    ** Call procedure agency_supplier_email_notify
+    */
+
+    h_retval = CALLPROC agency_supplier_email_notify
+               ( request=:pv_action,
+                 account_branch=:pv_branch,
+                 account_no=:pv_account_no,
+                 in_table_name=:v_temp_table_name);
+
+    /* message 'asen returned ' + ascii(h_retval) with style=popup ; */
+
+    /*
+    ** get rid of table incase name reused.
+    */
+    drop table :v_temp_table_name ;
+
+    INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+    IF (g_error != 0) THEN
+       ROLLBACK;
+       MESSAGE 'Error dropping tempory table ' + v_temp_table_name + 
+               '...' + X'0A' + 'Error: ' + VARCHAR(:g_err_text)
+          WITH STYLE=POPUP;
+       RETURN (-1);
+    ENDIF;
+
+    COMMIT;
+
+    RETURN (h_retval) ;
+
+}

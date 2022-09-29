@@ -1,0 +1,141 @@
+/* Not used */
+
+/*
+** AAH Journey Analysis System Development Using INGRES
+** -----------------------------------------------------
+**
+** SOURCE NAME: actual_popup.osq
+**
+** FRAME NAME:  actual_popup
+** FORM NAME:   actual_popup
+**
+** PURPOSE:     Popup actual journey details
+**
+** VERSION:     1.0
+**
+** STATUS:      Development
+**
+** AUTHOR:      G O Jones
+**
+** DATE:        24/6/94
+**
+** CHANGE DATE: N/A
+**
+** CHANGES:     The original version
+**
+** PARAMETERS:  None
+**
+*/
+
+initialize( branch_in   = varchar(4),
+	    run_no_in   = integer,
+	    day_no_in   = integer,
+	    date_in     = date)=
+
+declare i_rcount = integer,
+	arraymod = integer,
+	arr1 = array of type of form actual_popup,
+	put_array_to_screen = procedure
+
+begin
+    set_forms form(mode='query');
+    hidden_date = date_in;
+    arr1 = select   j.journey_date                  as journey_date,
+		    j.driver_no                     as driver_no,
+		    d.name                          as driver_name,
+		    j.van_reg_no                    as van_reg_no,
+		    j.departure_time                as departure_time,
+		    j.return_time                   as return_time,
+		    j.end_mileage-j.start_mileage   as miles,
+		    j.no_packs                      as no_packs,
+		    j.no_bulk_packs                 as no_bulk_packs,
+		    j.van_maintenance               as van_maintenance,
+		    j.remarks                       as remarks
+    from journey j, driver d
+    where j.branch_id = :branch_in
+    and run_no = :run_no_in
+    and day_no = :day_no_in
+    and qualification (journey_date = :hidden_date)
+    and d.driver_no = j.driver_no
+    and d.branch_id = j.branch_id;
+    inquire_sql(i_rcount = rowcount);
+    commit;
+    if i_rcount = 0
+    then
+	message 'No journeys with specified key' with style = popup;
+	return;
+    endif;
+    /* message trim(char(:i_rcount))+' rows retrieved.' with style = popup; */
+    how_many = i_rcount;
+    display submenu
+    begin
+	initialize=
+	begin
+	    arraymod = 1;
+	    callproc put_array_to_screen();
+	end;
+	
+	'Previous'=
+	begin
+	    if arraymod = 1
+	    then
+		message 'Cannot go back past start of list'
+		    with style = popup;
+	    else
+		arraymod = arraymod - 1;
+		callproc put_array_to_screen();
+	    endif;
+	end;
+	
+	'Next'=
+	begin
+	    if arraymod = i_rcount
+	    then
+		message 'Cannot go past end of list' with style = popup;
+	    else
+		arraymod = arraymod + 1;
+		callproc put_array_to_screen();
+	    endif;
+	end;
+	
+	'End Query', key frskey3=
+	begin
+	    endloop;
+	end;
+    end;
+    return;
+end;
+
+'End Query', key frskey3=
+begin
+    /* should never actually get to here */
+end;
+
+procedure put_array_to_screen()=
+
+begin
+
+    journeyno           = arraymod;
+    journey_date        = arr1[arraymod].journey_date;
+    driver_no           = arr1[arraymod].driver_no;
+    driver_name         = arr1[arraymod].driver_name;
+    van_reg_no          = arr1[arraymod].van_reg_no;
+    departure_time      = arr1[arraymod].departure_time;
+    return_time         = arr1[arraymod].return_time;
+    miles               = arr1[arraymod].miles;
+    no_packs            = arr1[arraymod].no_packs;
+    no_bulk_packs       = arr1[arraymod].no_bulk_packs;
+    van_maintenance     = arr1[arraymod].van_maintenance;
+    remarks             = arr1[arraymod].remarks;
+    
+    set_forms field ''(mode(drops)='fill');
+    drops = select dt.description as type, d.quantity as qty
+	    from drop_type dt, drops d
+	    where branch_id = :branch_in
+	    and run_no = :run_no_in
+	    and day_no = :day_no_in
+	    and date = :journey_date
+	    and dt.drop_type = d.drop_type_no;
+    commit;
+    set_forms field ''(mode(drops)='read');
+end;

@@ -1,0 +1,61 @@
+/***************************************************************************
+** Ver | Date       | Coded | Description
+*******|************|*******|***********************************************
+** 1.0 | 08-04-1998 | AB    | Report created.
+----------------------------------------------------------------------------
+** 1.1 | 15-04-1999 | SPH   | Added program/form identifier: ctlalsr001
+----------------------------------------------------------------------------
+****************************************************************************/
+.name acctlinks
+.shortremark Acctlinks report of all linked accounts
+.longremark
+    Test More Info Facility
+.endremark
+.query select pay_code,purchase_code,delivery_code,a.branch,a.account_no,
+	      udi_name
+       from acctlinks a , sales_accts s
+       where a.branch     = s.branch AND
+	     a.account_no = s.account_no
+
+.position 
+   pay_code(5),
+   purchase_code(12),
+   delivery_code(22),
+   branch(30),
+   account_no(36),
+   udi_name(46)
+
+
+.header report
+.newpage
+
+/* Titles for each page  */
+
+.header page
+.center .print 'Report of Linked Accounts' .newline
+.newline
+.tab pay_code      .print 'Pay'
+.tab purchase_code .print 'Purchase'
+.tab delivery_code .print 'Delivery'
+.tab branch        .print 'Branch'
+.tab account_no    .print 'Account'
+.tab udi_name      .print 'UDI Name '
+
+/* Print for each row of data  */
+  
+.detail
+.tab pay_code      .print pay_code
+.tab purchase_code .print purchase_code
+.tab delivery_code .print delivery_code
+.tab branch        .print branch
+.tab account_no    .print account_no
+.tab udi_name      .print udi_name
+.nl
+
+
+.footer report
+.nl 3
+.center .print '** End of Report **'
+
+
+

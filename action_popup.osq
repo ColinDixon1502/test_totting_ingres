@@ -1,0 +1,190 @@
+/******************************************************************************
+*  Frame  - Action Code Insert/Update Popup
+*  Author - Paul Bradbury
+*
+*  Date   - 25.10.94
+*  Type   - Online Frame
+*
+*  Source - action_popup.osq
+*  Form   - action_popup
+*
+*  Parameters expected - Mode (INSERT or UPDATE),
+*                        If in UPDATE mode - code and description.
+*
+*******************************************************************************
+*  Version | Date     | Coded | Description of changes made
+***********|**********|*******|************************************************
+*  1.0     | 25.10.94 | PAB   | Original code
+******************************************************************************/
+
+INITIALIZE
+(
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+    IIrowcount  =  INTEGER(4) NOT NULL,
+    IIerrorno   =  INTEGER(4) NOT NULL,
+    hf_errtext  =  CHAR(256)  NOT NULL,
+
+/*******************************************************
+** FRAME SPECIFIC VARIABLES  
+*******************************************************/
+    IIint       =  INTEGER(4) NOT NULL, /* Holds procedure return values     */
+    IIchar1     =  CHAR(1)    NOT NULL, /* General single character variable */
+    IIchar      =  CHAR(20)   NOT NULL, /* General purpose char variable     */
+    max_code    =  INTEGER(1) NOT NULL, /* Current maximum code              */
+)=
+{
+    /******************************************************
+    ** Initialise form field values and set to query mode
+    *******************************************************/
+
+    SET_FORMS FRS (ACTIVATE(previousfield) = 1);
+    SET_FORMS FRS (timeout = :gc_timeout);
+
+    /*******************************************************/
+
+
+    IF screenmode = 'INSERT' THEN
+
+	/**********************************
+	** Select maximum value from table 
+	***********************************/
+
+	SELECT max_code = IFNULL(MAX(code),-1) + 1
+	  FROM action;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-05- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN -1;
+	ENDIF;
+
+	COMMIT;
+
+	code = max_code;
+    ENDIF;
+}
+
+
+BEFORE FIELD 'code' =
+{
+    IF screenmode = 'UPDATE' THEN
+	RESUME FIELD description;
+    ENDIF;
+}
+
+ON TIMEOUT =
+{
+CALLFRAME timeout_popup();
+}
+
+'Help', KEY FRSKEY1=
+{
+	callproc help_proc(
+		SUBJECT='Help on Company Decode Popup Frame',
+		FILE=:gc_help_dir+'compy_decode_popup.hlp'
+			);
+}
+
+'Save', KEY FRSKEY4 =
+{
+    IF screenmode = 'UPDATE' THEN
+
+	UPDATE action
+	   SET description = :description
+	 WHERE code        = :code;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-01- INGRES error in UPDATE ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN -1;
+	ENDIF;
+
+	COMMIT;
+
+    ELSEIF screenmode = 'INSERT' THEN
+
+	/**************************************
+	** Check code does not already exist
+	***************************************/
+
+	SELECT IIint = code
+	  FROM action
+	 WHERE code  = :code;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-03- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN -1;
+	ENDIF;
+
+	COMMIT;
+
+	IF IIrowcount <= 0 THEN
+
+	    INSERT INTO action
+	    (
+	     code,
+	     description
+	    )
+	    VALUES
+	    (
+	     :code,
+	     :description
+	    );
+
+	    /**************************
+	    ** Check For INGRES Error 
+	    ***************************/
+	    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			    hf_errtext = ERRORTEXT,
+			    IIrowcount = ROWCOUNT);
+
+	    IF IIerrorno != 0 THEN
+		ROLLBACK;
+		MESSAGE '-02- INGRES error in INSERT ' 
+			+ :hf_errtext WITH STYLE = POPUP;
+		RETURN -1;
+	    ENDIF;
+
+	    COMMIT;
+	ELSE
+	    MESSAGE 'Code already exists.  No data saved.' WITH STYLE = POPUP;
+	    CLEAR FIELD code;
+	    RESUME FIELD code;
+	ENDIF;
+    ENDIF;
+
+    RETURN 0;
+}
+
+
+'Cancel', KEY FRSKEY3 =
+{
+    RETURN 1;
+}

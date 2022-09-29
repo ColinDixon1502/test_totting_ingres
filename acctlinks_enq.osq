@@ -1,0 +1,244 @@
+/*
+** Inventory Management System CONTROL development using INGRES.
+** -------------------------------------------------------------
+**
+** SOURCE NAME: acctlinks_enq.osq
+**
+** FRAME NAME:  acctlinks_enq
+** FORM NAME:   acctlinks_enq
+**
+** PURPOSE:     Enquire on acctlinks table
+**
+** VERSION:     1.0
+**
+** STATUS:      Development
+**
+** AUTHOR:      A.Barratt / D.Sullivan
+**
+** DATE:        23/09/94
+**
+** CHANGES:
+**
+*******************************************************************************
+** 1.1     | 27/04/98 | PTC   | Added mapst, mapend to force Cancel(F12)
+*******************************************************************************
+** PARAMETERS:  None
+**
+*/
+
+INITIALIZE()=
+
+DECLARE i_rcount        = integer,
+	res             = integer,
+	var_pay         = c4,
+	var_purchase    = c4,
+	var_delivery    = c2,
+	del_ans         = c1,
+	IIint           = INTEGER,
+	IIchar          = CHAR(20),
+	row_status      = integer,
+	hf_brn          = CHAR(4) NOT NULL,
+	hf_udi          = CHAR(32) NOT NULL,
+	rec_no          = integer,
+	ret_val         = INTEGER NOT NULL,
+	p_clear         = PROCEDURE
+	
+	BEGIN
+    date_time = date('now');
+    SET_FORMS FORM (mode='query');
+    INITTABLE acctlinks_tab READ;
+    SET_FORMS FRS (timeout = :gc_timeout);
+    
+END;
+
+ON TIMEOUT = 
+{
+CALLFRAME timeout_popup();
+}
+
+AFTER FIELD 'branch' =
+BEGIN
+IF (branch is NOT NULL) AND (branch != '') THEN
+    SELECT name as bname
+    FROM branch
+    WHERE branch_id = :branch;
+    ENDIF;
+    RESUME NEXT;
+END
+
+AFTER FIELD 'account_no' =
+BEGIN
+   IF (account_no is NOT NULL) AND (account_no != '') THEN
+       SELECT udi_name as udi_name
+       FROM sales_accts
+       WHERE branch = :branch
+       AND account_no = :account_no;
+    ENDIF;
+    RESUME NEXT;   
+END
+
+
+
+'Help', KEY FRSKEY1 =
+BEGIN
+    callproc help_proc(SUBJECT = 
+	       'Help on Account Links Enquiry',
+	       file = :gc_help_dir+'acctlinks_enq.hlp');
+END
+
+'UDI Name', KEY FRSKEY11 =
+BEGIN
+INQUIRE_FORMS FORM(IIchar = FIELD);
+IF IIchar != 'account_no' THEN
+   MESSAGE ' Only Available On Account No ' WITH STYLE = POPUP;
+   RESUME;
+ENDIF;   
+   IIint = CALLFRAME udi_popup(branch_id=:branch,
+			       udi_name=BYREF(:udi_name));
+	   IF IIint !=0 THEN
+	      RESUME;
+	   ENDIF;
+    callproc mapst;
+    IIint = CALLFRAME LOOK_UP
+	    (II_QUERY = SELECT account_no,
+			       udi_name
+			       FROM sales_accts
+			       WHERE branch = :branch
+			       AND udi_name LIKE :udi_name;
+			       account_no = BYREF(:account_no),
+			       II_FIELD1 = 'account_no',
+			       II_FIELD2 = 'udi_name',
+			       II_FIELD_TITLE1 = 'Account No.',
+			       II_FIELD_TITLE2 = 'UDI Name',
+			       II_ROWS= 14,
+			       II_STARTROW = 4,
+			       II_STARTCOLUMN = 14);
+    callproc mapend;
+			       REDISPLAY;
+				
+       SELECT udi_name as udi_name
+       FROM sales_accts
+       WHERE branch = :branch
+       AND account_no = :account_no;
+END
+
+'Go',KEY FRSKEY4 =
+BEGIN
+    MESSAGE 'Retrieving Data From Account Links';
+    ret_val = 0;
+    IF(:pay_code IS NULL or :pay_code = '') AND
+     (:branch IS NULL or branch = '') THEN
+    
+    acctlinks_tab = SELECT a.pay_code as pay_code,
+			   a.purchase_code as purchase_code,
+			   a.delivery_code as delivery_code,
+			   a.branch as branch,
+			   a.account_no as account_no,
+			   s.udi_name as udi_name
+    FROM  acctlinks a, sales_accts s  
+    WHERE a.purchase_code = '0000' AND
+	  a.delivery_code = '00' AND
+	  a.branch = s.branch AND
+	  a.account_no = s.account_no;
+    ELSEIF (:pay_code is NOT NULL) AND (:pay_code != '') THEN
+       var_pay = :pay_code;
+       acctlinks_tab = SELECT a.pay_code as pay_code,
+       a.purchase_code as purchase_code,
+       a.delivery_code as delivery_code,
+       a.branch as branch,
+       a.account_no as account_no,
+       s.udi_name as udi_name
+    FROM  acctlinks a, sales_accts s  
+    WHERE a.pay_code = :var_pay AND
+    a.branch = s.branch AND
+    a.account_no = s.account_no;
+    ELSE
+       acctlinks_tab = SELECT a.pay_code as pay_code,
+			      a.purchase_code as purchase_code,
+			      a.delivery_code as delivery_code,
+			      a.branch as branch,   
+			      a.account_no as account_no,
+			      s.udi_name as udi_name       
+		 FROM   acctlinks a, sales_accts s 
+		 WHERE  a.branch = :branch AND
+			a.account_no = :account_no AND
+			a.branch = s.branch AND
+			a.account_no = s.account_no;
+			
+    ENDIF;      
+    INQUIRE_SQL(i_rcount = rowcount);
+    COMMIT;
+    IF i_rcount = 0 THEN
+	MESSAGE 'No Accounts on file ' WITH STYLE = POPUP;
+	RESUME FIELD branch;
+    ENDIF;
+/*    
+   MESSAGE ' Unload Starting ';
+   UNLOADTABLE acctlinks_tab
+      BEGIN
+	 SELECT udi_name as :acctlinks_tab.udi_name
+	 FROM sales_accts
+	 WHERE branch = :acctlinks_tab.branch
+	 AND account_no = :acctlinks_tab.account_no;
+      END;
+*/          
+    RESUME FIELD branch;
+    
+END
+
+'Choices', KEY FRSKEY10=
+{
+IIchar= '';
+INQUIRE_FORMS FORM(IIchar= FIELD);
+IF IIchar = 'branch' THEN
+    callproc mapst;
+    IIint = CALLFRAME LOOK_UP
+	   (II_QUERY= SELECT branch_id,
+			     name
+			     FROM branch
+			     ORDER BY 1;                        
+	    branch_id = BYREF(:branch),
+	    II_FIELD1 = 'branch_id',
+	    II_FIELD2 = 'name',
+	    II_FIELD_TITLE1 = 'Branch',
+	    II_FIELD_TITLE2 = 'Name');
+    callproc mapend;
+	 REDISPLAY;
+ELSE
+   MESSAGE 'Option Not Available On This Field' WITH STYLE = POPUP;
+   REDISPLAY;
+   RESUME;
+ENDIF;
+COMMIT;
+SELECT name as bname
+FROM branch
+WHERE branch_id = :branch;
+RESUME FIELD account_no;
+}
+
+
+    
+	      
+'End' , KEY FRSKEY3 =
+BEGIN
+  IF ret_val != 0 THEN
+     RETURN;
+  ELSE
+       CALL PROCEDURE p_clear;
+       ret_val = ret_val + 1;
+       RESUME FIELD branch;   
+  ENDIF;
+END    
+
+
+/************************************************
+** Procedure to clear down screen values
+*************************************************/
+PROCEDURE p_clear(
+)=
+{
+    CLEAR FIELD ALL;
+    date_time = DATE('NOW');
+
+}
+

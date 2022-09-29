@@ -1,0 +1,126 @@
+procedure a()=
+
+declare curr_date   = date,
+	h           = type of table header_details,
+	a1          = array of type of table header_jobs,
+	tmp         = varchar(10),
+	d1          = varchar(25),
+	rno         = integer,
+	dno         = integer,
+	b           = varchar(4),
+	ws          = varchar(1),
+	m           = varchar(1),
+	arraynum    = integer,
+	arraymod    = integer,
+	i_rcount    = integer,
+	startdate   = date,
+	enddate     = date,
+	clockno     = varchar(6),
+	van_no      = varchar(8)
+
+begin
+
+    /* Read branch and start / end dates before going into loop */
+    
+    /* Get branch */
+    b=prompt 'Enter branch ' with style = popup;
+
+    /* Get dates */
+    d1=prompt 'Enter start date ' with style = popup;
+    startdate = date(:d1);
+    d1=prompt 'Enter end date ' with style = popup;
+    enddate = date(:d1);
+
+    /* Loop while more runs to process */
+    
+    m='Y';
+    while (uppercase(:m) like 'Y%')
+    do
+	/* Get run number */
+	tmp = prompt 'Enter run number ' with style = popup;
+	rno = int4(:tmp);
+    
+	/* Get clock number */
+	clockno = prompt 'Enter clock number ' with style = popup;
+	clockno = uppercase(:clockno);
+    
+	/* Get van number */
+	van_no = prompt 'Enter van reg no ' with style = popup;
+	van_no = uppercase(:van_no);
+    
+	/* Mon - Fri or Sat run */
+	ws = prompt 'Weekday or Saturday (W or S)' with style = popup;
+    
+	/* Set working date */
+	curr_date = startdate;
+
+	/* Loop through until the end date */
+	while (curr_date <= enddate)
+	do
+	    /* Get the day number of the working date */
+	    dno = get_day_no(the_date = :curr_date);
+	
+	    /* If in range then process */
+	    if (dno < 6 and uppercase(:ws) like 'W%')
+	    or (dno = 6 and uppercase(:ws) like 'S%')
+	    then
+		/* Read header details */
+		h = select * from header_details
+		where branch_id = :b
+		and run_no = :rno
+		and day_no = :dno
+		and header_type = 1;    /* line added 22/3/96 (GOJ) */
+		inquire_sql(i_rcount = rowcount);
+		commit;
+		/* If headers exist read them */
+		if i_rcount != 0
+		then
+		    /* Read header jobs */
+		    a1 = select * from header_jobs
+		    where branch_id = :b
+		    and run_no = :rno
+		    and day_no = :dno
+		    and header_type = 1;    /* line added 22/3/96 (GOJ) */
+		    inquire_sql(arraynum = rowcount);
+		    commit;
+		    /*
+		    if arraynum = 0
+		    then
+			message 'No header jobs' with style = popup;
+			return 0;
+		    endif;
+		    */
+		    
+		    /* Insert the journey record */
+		    insert into journey
+		    values(:h.branch_id, :h.run_no, :h.day_no, :curr_date, 
+			:clockno,:van_no,
+			h.departure_time, h.return_time, NULL);
+		
+		    /* Loop through header job records */
+		    arraymod = 1;
+		    while (arraymod <= arraynum)
+		    do
+			/* Insert job record */
+			insert into jobs(branch_id, run_no, day_no, journey_date,
+					 job_number, quantity)   
+			values(:h.branch_id, :h.run_no, :h.day_no, :curr_date,
+				:a1[arraymod].job_number,
+				:a1[arraymod].quantity);
+			arraymod = arraymod + 1;
+		    endwhile;
+		    commit;
+		    
+		endif;
+	    endif;
+	
+	    /* Increment working date by 1 day */
+	    curr_date = curr_date + date('1 day');
+	 
+	 endwhile;
+     
+	 /* Repeat for another job number at same branch ? */
+	 m=prompt 'More ? ' with style= popup;
+	 
+    endwhile;                
+end;

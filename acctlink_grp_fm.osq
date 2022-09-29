@@ -1,0 +1,200 @@
+/******************************************************************************
+*  Frame  - AccountLink Groups File Maintenance                          
+*  Author - A.Barratt.
+*
+*  Date   - 26.05.95
+*  Type   - Online Frame
+*
+*  Source - acctlink_grp_fm.osq      
+*  Form   - acctlink_grp_fm       
+*
+*  Parameters expected - None.
+*
+*******************************************************************************
+*  Version | Date     | Coded | Description of changes made
+***********|**********|*******|************************************************
+*  1.0     | 25..5.95 | AAB   | Original code
+******************************************************************************/
+
+INITIALIZE
+(
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+    IIrowcount  =  INTEGER(4) NOT NULL,
+    IIerrorno   =  INTEGER(4) NOT NULL,
+    hf_errtext  =  CHAR(256)  NOT NULL,
+
+/*******************************************************
+** FRAME SPECIFIC VARIABLES  
+*******************************************************/
+    IIint       =  INTEGER(4) NOT NULL, /* Holds procedure return values     */
+    hf_code     =  INTEGER(4) NOT NULL, /* Holds returned code from popup    */
+    IIchar1     =  CHAR(1)    NOT NULL, /* General single character variable */
+    IIchar      =  CHAR(20)   NOT NULL, /* General purpose char variable     */
+    hf_desc     =  CHAR(32)   NOT NULL, /* Holds returned desc from popup    */
+)=
+{
+    /******************************************************
+    ** Initialise form field values and set to query mode
+    *******************************************************/
+
+    SET_FORMS FRS(TIMEOUT = :gc_timeout);
+
+    date = DATE('now');
+
+    SET_FORMS FRS (ACTIVATE(previousfield) = 1);
+
+    /*********************************************************
+    ** Set table mode to read and populate from the database
+    **********************************************************/
+
+    INITTABLE iitf 'READ';
+
+    iitf := SELECT groupno        = a.groupno,
+		   custgroup_name = c.custgroup_name
+	      FROM acctlink_groups a, cust_groups c
+	      where a.groupno = c.custgroup_no
+	  ORDER BY 1;
+
+    /**************************
+    ** Check For INGRES Error 
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+		    hf_errtext = ERRORTEXT,
+		    IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+	ROLLBACK;
+	MESSAGE '-01- INGRES error in select ' 
+		+ :hf_errtext WITH STYLE = POPUP;
+	RETURN;
+    ENDIF;
+
+    COMMIT;
+}
+
+
+ON TIMEOUT =
+{
+
+    CALLFRAME timeout_popup();
+
+}
+
+
+'Help', KEY FRSKEY1=
+{
+	callproc help_proc(
+		SUBJECT='Help on AccountLink Groups File Maintenance Frame',
+		FILE=:gc_help_dir+'acctlink_grp_fm.hlp'
+			);
+}
+'Insert', KEY FRSKEY9 =
+{
+    hf_code = 0;
+
+    /************************************************
+    ** Call popup to insert new credit description
+    **************************************************/
+
+    IIint = CALLFRAME acctlink_grp_popup(screenmode = 'INSERT',
+					  groupno        = BYREF(hf_code));
+
+    IF IIint = 0 THEN /** New row has been inserted **/
+
+	/**********************************
+	** Reselect data into table field
+	***********************************/
+
+	INITTABLE iitf 'READ';
+
+	iitf := SELECT groupno        = a.groupno,
+		       custgroup_name = c.custgroup_name
+		  FROM acctlink_groups a, cust_groups c
+		  where a.groupno = c.custgroup_no
+	      ORDER BY 1;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-02- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN;
+	ENDIF;
+
+	COMMIT;
+
+    ELSEIF IIint = -1 THEN
+	/*******************************************************
+	** Returned -1 : INGRES Error return to calling frame 
+	********************************************************/
+	RETURN; 
+    ENDIF;
+
+    /*****************************************************************
+    ** If returned value is not 0 or -1 then insert cancelled, resume
+    ******************************************************************/
+
+    RESUME;
+}
+
+
+
+
+'Delete', KEY FRSKEY14 =
+{
+    /***************************
+    ** Prompt for confirmation
+    ****************************/
+
+    IIchar1 = '';
+
+    WHILE UPPERCASE(IIchar1) != 'N' AND
+	  UPPERCASE(IIchar1) != 'Y' 
+    DO
+	IIchar1 = PROMPT 'Delete group ' + TRIM(CHAR(:iitf.groupno)) +
+			 '.  Confirm (Y/N) ?' WITH STYLE = POPUP;
+    ENDWHILE;
+
+    IF UPPERCASE(IIchar1) = 'Y' THEN
+	/********************
+	** Delete confirmed
+	*********************/
+
+	DELETE FROM acctlink_groups     
+	      WHERE groupno = :iitf.groupno;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-03- INGRES error in DELETE ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN;
+	ENDIF;
+
+	COMMIT;
+
+	DELETEROW iitf;
+    ENDIF;
+
+    RESUME;
+}
+
+
+'End', KEY FRSKEY3 =
+{
+    RETURN;
+}
