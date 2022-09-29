@@ -1,0 +1,1430 @@
+/********************************************************************************* 
+*  Frame      - alias_file_upload
+*
+*  Author     - Irfan Salim
+*
+*  Date       - 02/04/2019
+*
+*  Type       - Frame
+*
+*  Purpose    - Load ent_alias_maint table from .csv file containing the link  
+*               (product) code, the alias code and description.
+*               - For AAH users the file will be called alias_list_A.csv
+*               - For TRI users the file will be called alias_list_T.csv
+*               A shell script alias_file_upload.ksh will be used to import the  
+*               upload file from a remote shared directory to the local temp dir.
+*               The same field validations will be performed on each line of this
+*               file as would be performed if the data was entered into the 
+*               maintenance screen. 
+*               Any errors in validation will be reported in sufficient detail to 
+*               enable the user to correct them and represent the file. 
+*               The file will not be saved to the database until all records in the
+*               file have been successfully validated.
+*               This batch upload screen will send messages to RemTP via MCS as 
+*               priority 5 so system is not flooded with messages at peak times.  
+*
+*  Source     - alias_file_upload.osq
+*
+*  Form       - alias_file_upload
+*
+*  Parameters - None
+*
+**********************************************************************************
+*  Version | Date     | Coded | Description of changes made
+***********|**********|*******|***************************************************
+*  1.0     | 02/04/19 | ISS   | Project Alias Table
+**********************************************************************************/
+INITIALIZE (
+)= 
+DECLARE 
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+   IIrowcount              = INTEGER(4)    NOT NULL,
+   IIerrorno               = INTEGER(4)    NOT NULL,
+   IIerrtext               = CHAR(256)     NOT NULL,
+
+/*******************************************************
+** FRAME SPECIFIC VARIABLES
+*******************************************************/
+   lv_session_table        = VARCHAR (100) NOT NULL WITH DEFAULT, 
+   lv_email_address        = VARCHAR (100) NOT NULL WITH DEFAULT,
+   tableowner              = VARCHAR(32)   NOT NULL, 
+   tabext                  = VARCHAR(12)   NOT NULL;  
+   status_tbl              = VARCHAR(24)   NOT NULL;  
+   lv_session_time         = VARCHAR (100) NOT NULL,
+   lv_return               = INTEGER4      NOT NULL,
+   lv_debug_flag           = INTEGER1      NOT NULL,   
+   lv_transfer_flag        = INTEGER1      NOT NULL,
+   lv_mcs_flag             = INTEGER1      NOT NULL,
+   lv_file_ext             = CHAR (4)      NOT NULL,
+   lv_file_no              = INTEGER       NOT NULL, 
+   lv_inputfile            = VARCHAR (32)  NOT NULL,
+   lv_pid_file             = VARCHAR (56)  NOT NULL,
+   lv_script               = VARCHAR (32)  NOT NULL,
+   lv_script_file          = VARCHAR (56)  NOT NULL,
+   lv_logfile              = VARCHAR (100) NOT NULL,  
+   lv_full_path_name       = VARCHAR (72)  NOT NULL, 
+   lv_work_file            = VARCHAR (32)  NOT NULL,  
+   mcsres                  = INTEGER(4)    NOT NULL,
+   lv_mf                   = VARCHAR (40), /* name of mapping file */ 
+   lv_file_extension       = VARCHAR (32)  NOT NULL, 
+   lv_start_time           = DATE          NOT NULL,
+   lv_end_time             = DATE          NOT NULL,
+   lv_elapsed_time         = VARCHAR (32)  NOT NULL,
+   lv_boxid                = VARCHAR (32)  NOT NULL,
+   lv_system_cmd           = VARCHAR (500),
+   msgstring               = VARCHAR(500),                                
+   lv_cust_char            = CHAR(1)       NOT NULL,                                
+
+   la_alias_array          = ARRAY OF TYPE OF TABLE ent_alias_maint,
+   la_product              = ARRAY OF TYPE OF TABLE product,
+
+   /**  Local Procedures **/
+   lp_refresh_tmptbl       = PROCEDURE RETURNING INTEGER,
+   lp_import_file          = PROCEDURE RETURNING INTEGER,
+   lp_file_extension       = PROCEDURE RETURNING INTEGER,
+   lp_initialise           = PROCEDURE RETURNING INTEGER,
+   lp_load_file            = PROCEDURE RETURNING INTEGER,
+   lp_validate             = PROCEDURE RETURNING INTEGER,
+   lp_process_file         = PROCEDURE RETURNING INTEGER,
+   lp_write_log            = PROCEDURE RETURNING INTEGER,
+   lp_drop_tmptbl          = PROCEDURE RETURNING INTEGER,
+   lp_get_email_address    = PROCEDURE RETURNING INTEGER,
+   lp_email_summary        = PROCEDURE RETURNING INTEGER,
+   lp_crt_wrktable         = PROCEDURE RETURNING INTEGER,
+   lp_write_message        = PROCEDURE RETURNING INTEGER,   
+   lp_key_map_check        = PROCEDURE RETURNING NONE,  
+   lp_check_ingres_error   = PROCEDURE RETURNING INTEGER,
+
+   lp_open_file            = PROCEDURE RETURNING INTEGER NOT NULL;
+   lp_close_file           = PROCEDURE RETURNING INTEGER NOT NULL;
+
+{
+   SET LOCKMODE SESSION WHERE READLOCK = NOLOCK;
+   COMMIT;
+ 
+   SET_FORMS FORM (MODE = 'read');
+   SET_FORMS FRS (TIMEOUT = gc_timeout); 
+   screen_date = DATE ('now'); 
+ 
+   /*** Development only ***/
+ 
+   IF gv_branch_id  = ' '  OR 
+      gv_branch_id IS NULL THEN
+      gv_branch_id = '606R';
+      gv_user_id   = 'gke';
+   ENDIF;
+ 
+   /*** Development only ***/
+
+   branchid = gv_branch_id;
+   username = gv_user_id;
+ 
+   IF branchid = '606R'
+   THEN
+      custid       = 'TRI';
+      lv_cust_char = 'T';
+   ELSE
+      custid       = 'AAH';
+      lv_cust_char = 'A';
+   ENDIF;
+
+   CALLPROC lp_key_map_check ();
+ 
+   lv_debug_flag        = 0; 
+ 
+   lv_transfer_flag = 1; /* 1: Switch on remote transfer           */
+                         /* 0: Switch off remote transfer          */
+
+   lv_mcs_flag      = 0; /* 1: Switch on messaging                 */
+                         /* 0: Switch off messaging                */
+
+   /* Read the DEBUG Flag */
+   SELECT lv_debug_flag  = INT1(parameter_value)
+   FROM   application_parameters
+   WHERE  parameter_id   = 'ALIASUPDEB';
+ 
+   IF lp_check_ingres_error (pv_proc_no = 80, pv_rowcount = BYREF (IIrowcount)) != gc_success 
+   THEN
+      RESUME;
+   ENDIF;
+
+   IF IIrowcount = 0
+   THEN
+      MESSAGE 'Ingres error in SELECT from application_parameters [1]';
+      RETURN gc_fail;
+   ENDIF;
+
+   /* Read the MCS Flag */
+   SELECT lv_mcs_flag  = INT1(parameter_value)
+   FROM   application_parameters
+   WHERE  parameter_id = 'ALIASUPMCS';
+ 
+   IF lp_check_ingres_error (pv_proc_no = 90, pv_rowcount = BYREF (IIrowcount)) != gc_success 
+   THEN
+      RESUME;
+   ENDIF;
+
+   IF IIrowcount = 0
+   THEN
+      MESSAGE 'Ingres error in SELECT from application_parameters [2]';
+      RETURN gc_fail;
+   ENDIF;
+
+   SELECT tableowner = dbmsinfo('username');
+ 
+   IF custid = 'AAH' THEN
+      lv_inputfile      = 'alias_list_A'; 
+   ELSE
+      lv_inputfile      = 'alias_list_T'; 
+   ENDIF;
+
+   lv_file_ext       = '.csv';
+   lv_script         = 'alias_file_upload';
+   lv_boxid          =  get_nodename ();  
+
+   tabext            =  branchid + TRIM(username);
+   tabext            =  lowercase(:tabext); 
+   status_tbl        = 'alias_upload_tmp' + :tabext;
+
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'before initialise' WITH STYLE = POPUP;
+   ENDIF;
+
+   IF lp_initialise (pv_session_table = BYREF (lv_session_table)) != gc_success THEN
+      RESUME;
+   ENDIF;
+
+   SET_FORMS COLUMN  '' iitf (INVISIBLE(error_value) = 1);   
+   SET_FORMS COLUMN  '' iitf (INVISIBLE(error_type)  = 1);   
+   
+   RESUME FIELD iitf;
+}
+ 
+
+'Go', KEY FRSKEY4 =
+{
+   IF lp_get_email_address (pv_email_address = BYREF (lv_email_address)) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'before initialise' WITH STYLE = POPUP;
+   ENDIF;
+
+   IF lp_initialise (pv_session_table = BYREF (lv_session_table)) != gc_success THEN
+      RESUME;
+   ENDIF;
+
+   /************************************************
+   Check import flag
+   *************************************************/
+   SELECT lv_transfer_flag = INT1(parameter_value)
+   FROM   application_parameters
+   WHERE  parameter_id     = 'ALIASUPTRN';
+
+   IF lp_check_ingres_error (pv_proc_no = 100, pv_rowcount = BYREF (IIrowcount)) != gc_success 
+   THEN
+      RESUME;
+   ENDIF;
+
+   IF IIrowcount = 0
+   THEN
+      MESSAGE 'Ingres error in SELECT from application_parameters [3]';
+      RESUME;
+   ENDIF;
+ 
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'before refresh_tmptbl' WITH STYLE = POPUP;
+   ENDIF;
+   IF lp_refresh_tmptbl()  != gc_success THEN
+      RESUME;
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'logfile = ' + lv_logfile WITH STYLE = POPUP;
+   ENDIF;
+
+   IF lv_transfer_flag = 1
+   THEN
+      IF lp_open_file (pv_file_no = BYREF(lv_file_no)) != gc_success
+      THEN
+         MESSAGE 'Transfer flag set to copy but no input file located !!!' WITH STYLE = POPUP;
+         RESUME;
+      ENDIF;
+
+      IF lv_debug_flag > 1 THEN
+         MESSAGE 'lv_file_no = ' + VARCHAR(lv_file_no) WITH STYLE = POPUP;
+      ENDIF;
+
+      IF lp_close_file (pv_file_no = BYREF(lv_file_no)) != gc_success  
+      THEN
+         RESUME;
+      ENDIF;
+
+      IF lv_debug_flag > 1 THEN
+         MESSAGE ' Copying data file ' + :lv_work_file + '. Please wait...' WITH STYLE = POPUP;
+      ENDIF;
+ 
+   ELSEIF lv_transfer_flag = 2
+   THEN
+      /************************************************
+      Import input data file
+      *************************************************/
+      IF lv_debug_flag > 1 THEN
+         MESSAGE 'before import file' WITH STYLE = POPUP;  
+      ENDIF;
+      
+      IF lp_import_file(pv_csv_file = lv_work_file) != gc_success
+      THEN
+         IF lv_debug_flag > 1 THEN
+            MESSAGE 'before drop_tmptbl' WITH STYLE = POPUP;
+         ENDIF;
+
+         IF lp_drop_tmptbl()  != gc_success THEN
+            RESUME;
+         ENDIF;
+         RESUME;
+      ENDIF;
+
+   ELSE
+      MESSAGE 'Transfer flag should be set to copy [1] or import [2] !!!' WITH STYLE = POPUP;
+      RESUME;
+ 
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'before load' WITH STYLE = POPUP;
+   ENDIF;
+
+   IF lp_load_file (pv_session_table  = lv_session_table,
+                    pv_full_path_name = lv_full_path_name,
+                    pv_rowcount       = BYREF(file_rows)) != gc_success THEN
+      RESUME;
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'before validate' WITH STYLE = POPUP;
+   ENDIF;
+
+   IF lp_validate (pv_session_table  = lv_session_table,
+                   pv_full_path_name = lv_full_path_name) != gc_success THEN
+      RESUME;
+   ENDIF;
+
+   IF error_cnt = 0 THEN
+
+      IF lv_debug_flag > 1 THEN
+         MESSAGE 'before process file' WITH STYLE = POPUP;
+      ENDIF;
+
+      IF lp_process_file (pv_session_table = lv_session_table) != gc_success THEN
+         MESSAGE 'There were errors whilst processing Alias File' WITH STYLE = POPUP;
+         RESUME;
+      ENDIF;
+
+      IF lp_email_summary (pv_email_address = lv_email_address,
+                           pv_logfile       = lv_logfile) != gc_success THEN
+         RESUME;
+      ENDIF;
+
+      IF lp_write_log (pv_session_table   = lv_session_table,
+                       pv_logfile         = lv_logfile) != gc_success THEN
+         RESUME;
+      ENDIF;
+
+   ENDIF;
+
+   COMMIT;
+}
+
+
+'End', KEY FRSKEY3 =
+{
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'lv_inputfile      = ' + TRIM(lv_inputfile)      + X'0A' +
+              'lv_work_file      = ' + TRIM(lv_work_file)      + X'0A' +
+              'lv_full_path_name = ' + TRIM(lv_full_path_name) + X'0A' +
+              'lv_script_file    = ' + TRIM(lv_script_file)    + X'0A' +
+              'lv_logfile        = ' + TRIM(lv_logfile)        + X'0A' +
+              'lv_boxid          = ' + TRIM(lv_boxid)          + X'0A' +
+              'tableowner        = ' + TRIM(tableowner)        + X'0A' +
+              'lv_session_table  = ' + TRIM(lv_session_table)  + X'0A' +
+              'status_tbl        = ' + TRIM(status_tbl)
+      WITH STYLE = POPUP;
+   ENDIF;
+
+   IF drop_session_table (lv_session_table) != gc_success THEN
+      RESUME;
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_file_extension (
+   pv_file_extension       = VARCHAR (32)     NOT NULL,
+)=
+DECLARE
+   lv_day                  = INTEGER4 NOT NULL,
+   lv_month                = INTEGER4 NOT NULL,
+   lv_year                 = INTEGER4 NOT NULL,
+   lv_hour                 = INTEGER4 NOT NULL,
+   lv_minute               = INTEGER4 NOT NULL,
+{
+   pv_file_extension = '';
+
+   SELECT DATE_PART ('year',   DATE ('now')) AS :lv_year,
+          DATE_PART ('month',  DATE ('now')) AS :lv_month,
+          DATE_PART ('day',    DATE ('now')) AS :lv_day,
+          DATE_PART ('hour',   DATE ('now')) AS :lv_hour,
+          DATE_PART ('minute', DATE ('now')) AS :lv_minute;
+
+   IF lp_check_ingres_error (pv_proc_no = 110) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   pv_file_extension = VARCHAR (lv_year) + RIGHT ('0' + VARCHAR (lv_month), 2) + RIGHT ('0' + VARCHAR (lv_day), 2) + 
+                                           RIGHT ('0' + VARCHAR (lv_hour), 2)  + RIGHT ('0' + VARCHAR (lv_minute), 2); 
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_initialise (
+   pv_session_table   = VARCHAR (100) NOT NULL,
+)=
+DECLARE
+   lv_session_time    = VARCHAR (100) NOT NULL,
+{
+   lv_session_time    = SHIFT (getmillidatetime (), -7);
+   pv_session_table   = 'session.aliasfileupd' + TRIM (lv_session_time);
+
+   DECLARE GLOBAL TEMPORARY TABLE :pv_session_table (
+           link_code            CHAR (50)
+         , stock_alias_code     CHAR (50)
+         , description          CHAR (100)
+         , insert_date          DATE    
+         , customer_id          CHAR (3)
+         , error_value          CHAR (21)
+         , error_type           CHAR (28))
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY, NODUPLICATES;
+
+   IF lp_check_ingres_error (pv_proc_no = 120) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_session_table  = pv_session_table;
+
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'before file ext' WITH STYLE = POPUP;
+   ENDIF;
+
+   IF lp_file_extension (pv_file_extension = BYREF (lv_file_extension)) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   lv_work_file      =  lv_inputfile + lv_file_ext;
+   lv_full_path_name =  gc_temp      + lv_work_file;
+   lv_logfile        =  lv_script    + '_' + TRIM (lv_cust_char) + '_' + TRIM (lv_file_extension) + '.log';
+   lv_script_file    =  gc_scripts   + lv_script + '.ksh';
+
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'lv_inputfile      = ' + TRIM(lv_inputfile)      + X'0A' +
+              'lv_work_file      = ' + TRIM(lv_work_file)      + X'0A' +
+              'lv_full_path_name = ' + TRIM(lv_full_path_name) + X'0A' +
+              'lv_script_file    = ' + TRIM(lv_script_file)    + X'0A' +
+              'lv_logfile        = ' + TRIM(lv_logfile)        + X'0A' +
+              'lv_boxid          = ' + TRIM(lv_boxid)          + X'0A' +
+              'tableowner        = ' + TRIM(tableowner)        + X'0A' +
+              'lv_session_table  = ' + TRIM(lv_session_table)  + X'0A' +
+              'status_tbl        = ' + TRIM(status_tbl)
+      WITH STYLE = POPUP;
+   ENDIF;
+
+   SET_FORMS COLUMN  '' iitf (INVISIBLE(description)  = 0);   
+   SET_FORMS COLUMN  '' iitf (INVISIBLE(insert_date)  = 0);   
+   SET_FORMS COLUMN  '' iitf (INVISIBLE(customer_id)  = 0);   
+   SET_FORMS COLUMN  '' iitf (COLOR(description)      = 1);   
+   SET_FORMS COLUMN  '' iitf (COLOR(insert_date)      = 1);   
+   SET_FORMS COLUMN  '' iitf (COLOR(customer_id)      = 1);   
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_refresh_tmptbl(
+) =
+DECLARE
+   lv_int             = INTEGER4      NOT NULL,
+{
+  /* status_tbl must remain a real table, used by shell script.    */
+   SELECT lv_int      = COUNT(*)
+     FROM iitables
+    WHERE table_name  = :status_tbl
+      AND table_owner = :tableowner;
+
+   IF (lp_check_ingres_error (pv_proc_no = 130) != gc_success) THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'status_tbl = ' + VARCHAR (status_tbl) + X'0A' +
+              'lv_int     = ' + VARCHAR (lv_int)     + X'0A' +
+              'tableowner = ' + VARCHAR (tableowner)
+      WITH STYLE = POPUP;
+   ENDIF;
+
+   IF lv_int = 0 THEN
+      CREATE TABLE :status_tbl( status i1);
+
+      IF lp_check_ingres_error (pv_proc_no = 140) != gc_success THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      GRANT ALL ON :status_tbl TO PUBLIC;
+
+      IF lp_check_ingres_error (pv_proc_no = 150) != gc_success THEN
+         RETURN gc_fail;
+      ENDIF;
+
+   ELSE
+
+      MODIFY :status_tbl to truncated;
+
+      IF lp_check_ingres_error (pv_proc_no = 160) != gc_success THEN
+         RETURN gc_fail;
+      ENDIF;
+
+   ENDIF;
+
+   INSERT INTO :status_tbl
+   SELECT      status = 1;
+
+   IF (lp_check_ingres_error (pv_proc_no = 170) != gc_success) THEN
+      ROLLBACK;
+      RETURN gc_fail;
+   ENDIF;
+
+   COMMIT;
+}
+
+
+PROCEDURE lp_open_file (
+  pv_file_no = INTEGER NOT NULL
+) =
+DECLARE
+  lv_status = INTEGER NOT NULL
+{
+  pv_file_no = 0;
+
+  lv_status = OPENFILE (filename = lv_full_path_name,
+                        filetype = 'text',
+                        filemode = 'read',
+                        handle   = BYREF(pv_file_no));
+
+  IF lv_debug_flag > 1 THEN
+     MESSAGE 'in lp_open_file. lv_status = ' + VARCHAR(lv_status) + X'0A' +
+                 'pv_file_no = ' + VARCHAR(pv_file_no) WITH STYLE = POPUP;
+  ENDIF;
+
+  RETURN lv_status;
+}
+
+
+PROCEDURE lp_close_file (
+  pv_file_no = INTEGER NOT NULL
+) =
+DECLARE
+  lv_status = INTEGER NOT NULL
+{
+
+  lv_status = CLOSEFILE (handle      = pv_file_no,
+                         disposition = 'keep');
+
+  IF lv_debug_flag > 1 THEN
+     MESSAGE 'in lp_close_file. lv_status = ' + VARCHAR(lv_status) + X'0A' +
+                 'pv_file_no = ' + VARCHAR(pv_file_no) WITH STYLE = POPUP;
+  ENDIF;
+
+  IF lv_status != gc_success
+  THEN
+     MESSAGE 'Error - unable to close input file ' + :lv_work_file WITH STYLE = POPUP;
+  ENDIF;
+
+  RETURN lv_status;
+}
+
+
+PROCEDURE lp_import_file (
+   pv_csv_file          = VARCHAR (100) NOT NULL,
+)=
+DECLARE
+   lv_status            = INTEGER4      NOT NULL,
+{
+   lv_system_cmd = lv_script_file + ' ' + TRIM (pv_csv_file) + ' ' + TRIM(branchid) + ' ' + TRIM(username);
+  
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'lv_system_cmd = ' + lv_system_cmd WITH STYLE = POPUP;
+   ENDIF;
+   
+   CALL SYSTEM :lv_system_cmd;
+
+   SELECT lv_status = status
+   FROM :status_tbl;
+
+   IF lp_check_ingres_error (pv_proc_no = 180) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'lv_status = ' + VARCHAR(lv_status) WITH STYLE = POPUP;
+   ENDIF;
+
+   IF lv_status = 2 THEN
+      MESSAGE 'Error: Cannot find file ' + TRIM (pv_csv_file) WITH STYLE = POPUP;
+      RETURN gc_fail;
+   ELSEIF lv_status = 3 THEN
+      MESSAGE 'Error: File ' + TRIM (pv_csv_file) + ' is empty' WITH STYLE = POPUP;
+      RETURN gc_fail;
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_load_file (
+   pv_session_table     = VARCHAR (100) NOT NULL,
+   pv_full_path_name    = VARCHAR (100) NOT NULL,
+   pv_rowcount          = INTEGER4      NOT NULL,
+)=
+DECLARE
+   lv_record            = INTEGER4      NOT NULL,
+   lv_product           = CHAR(16)      NOT NULL,
+{
+   /* Add start timestamp to logfile */
+   lv_start_time = TRIM (CHAR (DATE ('now')));
+  
+   IF lp_write_message (pv_logfile  = lv_logfile,
+                        pv_logmess  = 'Alias Product Load -Processing Start-' + ' ' + VARCHAR (lv_start_time)) != gc_success THEN 
+      RETURN gc_fail;
+   ENDIF;
+
+   COPY TABLE :pv_session_table (
+               link_code          = c0comma,
+               stock_alias_code   = c0comma,
+               description        = c0nl) 
+   FROM       :pv_full_path_name;
+
+   IF lp_check_ingres_error (pv_proc_no = 190, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* This message will output if ALIASUPTRN is set to 1 (Copy) and input file is empty */
+   IF pv_rowcount = 0 THEN
+      ROLLBACK;
+      MESSAGE 'Error: No rows in file !!!' WITH STYLE=POPUP;
+      RETURN gc_fail;
+   ENDIF;
+
+   UPDATE :pv_session_table
+   SET     insert_date =  DATE('today'),
+           customer_id = :custid;
+
+   IF lp_check_ingres_error (pv_proc_no = 200, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   COMMIT;
+
+   /* Expand any short product codes. Ignore blanks                */
+   IF lv_debug_flag > 1 THEN
+      MESSAGE ' Expand any short product codes. Please wait...';
+   ENDIF;
+
+   la_product = SELECT    product_code =  IFNULL (link_code, '')
+                FROM     :pv_session_table
+                ORDER BY  link_code;
+
+   IF lp_check_ingres_error (pv_proc_no = 210, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   UNLOADTABLE la_product (lv_record = _RECORD)
+   {
+      lv_product = la_product[lv_record].product_code;
+
+      IF LENGTH (TRIM (la_product.product_code)) < 8 AND
+         LENGTH (TRIM (la_product.product_code)) > 0 THEN
+         lv_product = CALLPROC expand_code (code = la_product.product_code);
+
+         UPDATE :pv_session_table
+         SET     link_code = :lv_product;
+
+         IF lp_check_ingres_error (pv_proc_no = 220, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+            RETURN gc_fail;
+         ENDIF;
+      ENDIF;
+   };
+
+   inputfile = lv_work_file;
+
+   IF (ARRAYCLEAR(la_alias_array) != gc_success) THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   la_alias_array = SELECT   link_code        = IFNULL (link_code, '')
+                           , stock_alias_code = IFNULL (stock_alias_code, '')
+                           , description      = IFNULL (description, '')
+                           , insert_date
+                           , customer_id
+                    FROM    :pv_session_table
+                    ORDER BY link_code;
+
+   IF lp_check_ingres_error (pv_proc_no = 230, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   /* drop n create debug table */
+   IF lp_crt_wrktable (pv_session_table = BYREF (lv_session_table)) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_validate (
+   pv_session_table     = VARCHAR (100) NOT NULL,
+   pv_full_path_name    = VARCHAR (100) NOT NULL,
+   pv_rowcount          = INTEGER4      NOT NULL,
+   pv_logfile           = VARCHAR (100) NOT NULL WITH DEFAULT,
+)=
+DECLARE
+   lv_record            = INTEGER4      NOT NULL,
+   lv_product           = CHAR(16)      NOT NULL,
+   lv_alias_code        = CHAR(32)      NOT NULL, 
+   lv_description       = CHAR(64)      NOT NULL,
+   lv_alias_cnt         = INTEGER4      NOT NULL,
+   lv_cnt               = INTEGER4      NOT NULL,
+   lv_errors_present    = INTEGER4      NOT NULL,
+{
+   lv_errors_present    = 0;
+   load_rows            = 0;
+   error_cnt            = 0;
+   error_rows           = 0;
+
+   CLEAR FIELD iitf;
+
+   /* Validation 1 - Alias code cannot be blank/null               */
+   SELECT  lv_alias_code    = IFNULL (stock_alias_code, ''),
+           lv_product       = IFNULL (link_code, '')
+   FROM   :pv_session_table
+   WHERE   stock_alias_code IS NULL
+   BEGIN
+      INSERTROW iitf
+      (link_code           = :lv_product,
+       stock_alias_code    = :lv_alias_code,
+       error_value         = :lv_alias_code,
+       error_type          = 'ALIAS CODE-BLANK');
+       error_cnt           = :error_cnt + 1;
+       lv_errors_present   = 1;
+
+       UPDATE :pv_session_table
+       SET     error_value       = :lv_alias_code,
+               error_type        = 'ALIAS CODE-BLANK'
+       WHERE   link_code         = :lv_product
+       AND     stock_alias_code IS NULL
+       AND     customer_id       = :custid;
+
+       IF lp_check_ingres_error (pv_proc_no = 240, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+          RETURN gc_fail;
+       ENDIF;
+
+       MESSAGE 'Validation 1/8: ' + lv_product + ' ' + lv_alias_code + ' ' + custid; 
+   END;
+   
+   /* Validation 2 - Description cannot be blank/null              */
+   SELECT  lv_alias_code    = IFNULL (stock_alias_code, ''),
+           lv_description   = IFNULL (description, ''),
+           lv_product       = IFNULL (link_code, '')
+   FROM   :pv_session_table
+   WHERE   description IS NULL
+   BEGIN
+      INSERTROW iitf
+      (link_code           = :lv_product,
+       stock_alias_code    = :lv_alias_code,
+       error_value         = :lv_description,
+       error_type          = 'DESCRIPTION-BLANK');
+       error_cnt           = :error_cnt + 1;
+       lv_errors_present   = 1;
+
+       UPDATE :pv_session_table
+       SET     error_value       = :lv_description,
+               error_type        = 'DESCRIPTION-BLANK'
+       WHERE   link_code         = :lv_product
+       AND     description IS NULL
+       AND     customer_id       = :custid;
+
+       IF lp_check_ingres_error (pv_proc_no = 250, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+          RETURN gc_fail;
+       ENDIF;
+
+       MESSAGE 'Validation 2/8: ' + lv_product + ' ' + lv_alias_code + ' ' + custid; 
+   END;
+
+   /* Validation 3 - Alias code must be between 3 and 16 chars     */
+   SELECT  lv_alias_code    = IFNULL (stock_alias_code, ''),
+           lv_product       = link_code
+   FROM   :pv_session_table
+   WHERE   LENGTH(SQUEEZE(stock_alias_code)) NOT BETWEEN 3 AND 16
+   BEGIN
+      INSERTROW iitf
+      (link_code           = :lv_product,
+       stock_alias_code    = :lv_alias_code,
+       error_value         = :lv_alias_code,
+       error_type          = 'ALIAS CODE-LENGTH INVALID');
+       error_cnt           = :error_cnt + 1;
+       lv_errors_present   = 1;
+
+       UPDATE :pv_session_table
+       SET     error_value       = :lv_alias_code,
+               error_type        = 'ALIAS CODE-LENGTH INVALID'
+       WHERE   link_code         = :lv_product
+       AND     stock_alias_code  = :lv_alias_code
+       AND     customer_id       = :custid;
+
+       IF lp_check_ingres_error (pv_proc_no = 260, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+          RETURN gc_fail;
+       ENDIF;
+
+       MESSAGE 'Validation 3/8: ' + lv_product + ' ' + lv_alias_code + ' ' + custid; 
+   END;
+   
+   /* Validation 4 - Description must be between 3 and 32          */
+   SELECT  lv_alias_code    = IFNULL (stock_alias_code, ''),
+           lv_product       = IFNULL (link_code, ''),
+           lv_description   = description
+   FROM   :pv_session_table
+   WHERE   LENGTH(SQUEEZE(description)) NOT BETWEEN 3 AND 32
+   BEGIN
+      INSERTROW iitf
+      (link_code           = :lv_product,
+       stock_alias_code    = :lv_alias_code,
+       error_value         = :lv_description,
+       error_type          = 'DESCRIPTION-LENGTH INVALID');
+       error_cnt           = :error_cnt + 1;
+       lv_errors_present   = 1;
+
+       UPDATE :pv_session_table
+       SET     error_value       = :lv_description,
+               error_type        = 'DESCRIPTION-LENGTH INVALID'
+       WHERE   link_code         = :lv_product
+       AND     stock_alias_code  = :lv_alias_code
+       AND     customer_id       = :custid;
+
+       IF lp_check_ingres_error (pv_proc_no = 270, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+          RETURN gc_fail;
+       ENDIF;
+
+       MESSAGE 'Validation 4/8: ' + lv_product + ' ' + lv_alias_code + ' ' + custid; 
+   END;
+
+   /* Validation 5 - Alias code must be unique                     */
+   SELECT   lv_alias_code = IFNULL (stock_alias_code, ''),
+            lv_alias_cnt  = COUNT(stock_alias_code)
+   FROM    :pv_session_table
+   GROUP BY stock_alias_code
+   HAVING   COUNT(stock_alias_code) > 1
+   BEGIN
+      IF lv_alias_cnt > 0
+      THEN
+         SELECT DISTINCT
+                lv_product          = link_code,
+                lv_alias_code       = stock_alias_code
+         FROM  :pv_session_table
+         WHERE  stock_alias_code    = :lv_alias_code
+            BEGIN
+               INSERTROW iitf
+               (link_code           = :lv_product,
+                stock_alias_code    = :lv_alias_code,
+                error_value         = :lv_alias_code,
+                error_type          = 'ALIAS CODE-DUPLICATE IN FILE');
+                error_cnt           = :error_cnt + 1;
+                lv_errors_present   = 1;
+
+                UPDATE :pv_session_table
+                SET     error_value       = :lv_alias_code,
+                        error_type        = 'ALIAS CODE-DUPLICATE IN FILE'
+                WHERE   link_code         = :lv_product
+                AND     stock_alias_code  = :lv_alias_code
+                AND     customer_id       = :custid;
+   
+                IF lp_check_ingres_error (pv_proc_no = 280, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+                   RETURN gc_fail;
+                ENDIF;
+            END;
+      ENDIF;
+
+      MESSAGE 'Validation 5/8: ' + lv_product + ' ' + lv_alias_code + ' ' + custid; 
+   END;
+
+   /* Validation 6 - Link code must exist in op_products table     */
+   /* for AAH and op_products_extra for Trident                    */
+   SELECT  lv_product       = IFNULL (link_code, ''),
+           lv_alias_code    = IFNULL (stock_alias_code, '')
+   FROM   :pv_session_table
+   BEGIN
+      lv_cnt = 0;
+      IF custid = 'AAH' 
+      THEN
+         SELECT lv_cnt = COUNT(product_code)
+         FROM   op_products
+         WHERE  product_code = :lv_product;
+
+         IF lp_check_ingres_error (pv_proc_no = 290, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+            RETURN gc_fail;
+         ENDIF;
+      ELSE
+         SELECT lv_cnt = COUNT(o.product_code)
+         FROM   op_products       o,
+                op_products_extra e
+         WHERE  o.product_code  = e.product_code
+         AND    o.product_code    = :lv_product;
+
+         IF lp_check_ingres_error (pv_proc_no = 300, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+            RETURN gc_fail;
+         ENDIF;
+
+      ENDIF;
+
+      IF lv_cnt = 0 
+      THEN
+         IF LENGTH(lv_product) > 0
+         THEN
+            INSERTROW iitf
+            (link_code           = :lv_product,
+             stock_alias_code    = :lv_alias_code,
+             error_value         = :lv_product,
+             error_type          = 'LINK CODE-NOT FOUND');
+             error_cnt           = :error_cnt + 1;
+             lv_errors_present   = 1;
+      
+             UPDATE :pv_session_table
+             SET     error_value       = :lv_product,
+                     error_type        = 'LINK CODE-NOT FOUND'
+             WHERE   link_code         = :lv_product
+             AND     stock_alias_code  = :lv_alias_code
+             AND     customer_id       = :custid;
+      
+            IF lp_check_ingres_error (pv_proc_no = 310, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+               RETURN gc_fail;
+            ENDIF;
+         ENDIF;
+      ENDIF;
+
+      MESSAGE 'Validation 6/8: ' + lv_product + ' ' + lv_alias_code + ' ' + custid; 
+   END;
+
+   /* Validation 7 - Alias code must be unique per Customer ID     */
+   SELECT  lv_product       = IFNULL (link_code, ''),
+           lv_alias_code    = IFNULL (stock_alias_code, '')
+   FROM   :pv_session_table
+   WHERE   customer_id      = :custid
+   BEGIN
+      lv_alias_cnt = 0;
+      SELECT lv_alias_cnt = COUNT(stock_alias_code)
+      FROM   ent_alias_maint
+      WHERE  stock_alias_code = :lv_alias_code
+      AND    customer_id      = :custid;
+
+      IF lv_alias_cnt > 0
+      THEN
+         INSERTROW iitf
+         (link_code           = :lv_product,
+          stock_alias_code    = :lv_alias_code,
+          error_value         = :lv_alias_code,
+          error_type          = 'ALIAS CODE-ALREADY EXISTS');
+          error_cnt           = :error_cnt + 1;
+          lv_errors_present   = 1;
+  
+          UPDATE :pv_session_table
+          SET     error_value       = :lv_alias_code,
+                  error_type        = 'ALIAS CODE-ALREADY EXISTS'
+          WHERE   link_code         = :lv_product
+          AND     stock_alias_code  = :lv_alias_code
+          AND     customer_id       = :custid;
+   
+         IF lp_check_ingres_error (pv_proc_no = 320, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+            RETURN gc_fail;
+         ENDIF;
+      ENDIF;
+
+      MESSAGE 'Validation 7/8: ' + lv_product + ' ' + lv_alias_code + ' ' + custid; 
+   END;
+
+   /* Validation 8 - Link code cannot be blank/null                */
+   SELECT  lv_alias_code    = IFNULL (stock_alias_code, ''),
+           lv_product       = IFNULL (link_code, '')
+   FROM   :pv_session_table
+   WHERE   link_code IS NULL
+   BEGIN
+      INSERTROW iitf
+      (link_code           = :lv_product,
+       stock_alias_code    = :lv_alias_code,
+       error_value         = :lv_product,
+       error_type          = 'LINK CODE-BLANK');
+       error_cnt           = :error_cnt + 1;
+       lv_errors_present   = 1;
+
+       UPDATE :pv_session_table
+       SET     error_value       = :lv_product,
+               error_type        = 'LINK CODE-BLANK'
+       WHERE   link_code         IS NULL
+       AND     customer_id       = :custid;
+
+       IF lp_check_ingres_error (pv_proc_no = 330, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+          RETURN gc_fail;
+       ENDIF;
+
+       MESSAGE 'Validation 8/8: ' + lv_product + ' ' + lv_alias_code + ' ' + custid;
+   END;
+
+
+   /* drop n create debug table */
+   IF lp_crt_wrktable (pv_session_table = BYREF (lv_session_table)) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   SELECT error_rows = COUNT(error_type)
+   FROM  :pv_session_table
+   WHERE  error_type != '';
+
+   IF lv_errors_present = 1 
+   THEN
+      IF lp_write_log (pv_session_table   = lv_session_table,
+                       pv_logfile         = lv_logfile) != gc_success THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      SET_FORMS COLUMN  '' iitf (INVISIBLE(description)  = 1);
+      SET_FORMS COLUMN  '' iitf (INVISIBLE(insert_date)  = 1);
+      SET_FORMS COLUMN  '' iitf (INVISIBLE(customer_id)  = 1);   
+      SET_FORMS COLUMN  '' iitf (INVISIBLE(error_value)  = 0);
+      SET_FORMS COLUMN  '' iitf (INVISIBLE(error_type)   = 0);
+
+      SET_FORMS COLUMN  '' iitf (COLOR(link_code)        = 6);
+      SET_FORMS COLUMN  '' iitf (COLOR(stock_alias_code) = 6);
+
+      MESSAGE 'Errors present - Fix and reload file ...' WITH STYLE = POPUP;
+      SCROLL iitf TO 1;
+      RETURN gc_fail;
+
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_process_file(
+   pv_session_table           = VARCHAR (100) NOT NULL,
+   pv_sess_temp               = VARCHAR (100) NOT NULL,
+   pv_rowcount                = INTEGER4      NOT NULL,
+)=
+DECLARE
+   lv_record                  = INTEGER4      NOT NULL,
+   lv_alias_code              = CHAR(16)      NOT NULL, 
+   lv_link_code               = CHAR(8)       NOT NULL, 
+   lv_array_rows              = INTEGER,
+{
+   /* debug table
+   pv_session_table = _cs_ent_alias_load
+   */
+
+   lv_array_rows = ArrayAllRows(la_alias_array);  
+
+   lv_return = CALLPROC open_isam();
+   UNLOADTABLE la_alias_array (lv_record = _RECORD)
+   {
+      lv_alias_code = :la_alias_array[lv_record].stock_alias_code;
+      lv_link_code  = :la_alias_array[lv_record].link_code;
+
+      INSERT INTO ent_alias_maint
+      SELECT      stock_alias_code,
+                  link_code,
+                  description,
+                  insert_date,
+                  customer_id
+      FROM       :pv_session_table
+      WHERE       stock_alias_code = :lv_alias_code
+      AND         customer_id      = :custid;
+
+      IF lp_check_ingres_error (pv_proc_no = 340, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+         ROLLBACK;
+         RETURN gc_fail;
+      ENDIF;
+
+      IF lv_mcs_flag = 1 THEN
+
+         IF lv_debug_flag > 1 THEN
+            MESSAGE 'Sending to RemTP: ' + TRIM(lv_link_code) + ' ' + TRIM(lv_alias_code) + ' ' + custid WITH STYLE = POPUP;
+         ENDIF;
+
+         mcsres = CALLPROC mcs_alias_out('I',
+                                   :lv_link_code,
+                                    SQUEEZE(:lv_alias_code),
+                                   :custid,
+                                   :gv_branch_id,
+                                   :gv_user_id);
+         IF mcsres != 0 THEN
+            ROLLBACK;
+         ENDIF;
+   
+         MESSAGE 'Send to RemTP: ' + varchar(lv_record) + '/' + varchar(lv_array_rows) + ' ' + TRIM(lv_link_code) + ' ' + TRIM(lv_alias_code) + ' ' + custid;
+
+      ENDIF;
+   };
+   lv_return = CALLPROC close_isam();
+
+   IF mcsres != 0 THEN
+      load_rows  = 0;
+      error_cnt  = file_rows;
+
+      MESSAGE 'File not processed due to MSC issue. Please investigate !!' WITH STYLE = POPUP;
+      RETURN gc_fail;
+
+   ELSE
+
+      iitf = SELECT * FROM :pv_session_table;
+      IF lp_check_ingres_error (pv_proc_no = 350, pv_rowcount = BYREF (pv_rowcount)) != gc_success THEN
+         RETURN gc_fail;
+      ENDIF;
+   
+      SET_FORMS COLUMN  '' iitf (COLOR(link_code)        = 1);   
+      SET_FORMS COLUMN  '' iitf (COLOR(stock_alias_code) = 1);   
+      SET_FORMS COLUMN  '' iitf (COLOR(description)      = 1);   
+      SET_FORMS COLUMN  '' iitf (COLOR(insert_date)      = 1);   
+      SET_FORMS COLUMN  '' iitf (COLOR(customer_id)      = 1);   
+
+      load_rows = file_rows;
+
+   ENDIF;
+
+   COMMIT;
+
+   /* drop n create debug table */
+   IF lp_crt_wrktable (pv_session_table = BYREF (lv_session_table)) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_write_log (
+   pv_session_table            = VARCHAR (100) NOT NULL,
+   pv_logfile                  = VARCHAR (100) NOT NULL,
+)=
+DECLARE
+   lv_logmess                  = VARCHAR (200) NOT NULL,
+   lv_system_cmd               = VARCHAR (500) NOT NULL,
+{
+   lv_system_cmd = 'rm -f ' + TRIM (pv_logfile);
+   CALL SYSTEM :lv_system_cmd;
+ 
+   IF error_cnt = 0 THEN
+      IF lv_debug_flag = 1 THEN
+         SELECT DISTINCT VARCHAR (link_code) + '        ' + stock_alias_code + '' + description AS :lv_logmess
+         FROM       :pv_session_table
+         {
+            IF lp_write_message (pv_logfile    = lv_logfile,
+                                 pv_logmess    = lv_logmess) != gc_success THEN
+               RETURN gc_fail;
+            ENDIF;
+         };
+      ENDIF;
+
+   ELSE
+   
+      lv_start_time = TRIM (CHAR (DATE ('now')));
+
+      IF lp_write_message (pv_logfile  = lv_logfile,
+                           pv_logmess  = 'No Alias Data to process !!!') != gc_success THEN 
+         RETURN gc_fail;
+      ENDIF;
+
+   ENDIF;
+
+   lv_end_time = TRIM (CHAR (DATE ('now')));
+
+   IF lp_write_message (pv_logfile  = lv_logfile,
+                        pv_logmess  = 'Alias Product Load -Processing End-' + ' ' + VARCHAR (lv_end_time)) != gc_success THEN 
+      RETURN gc_fail;
+   ENDIF;
+
+   SELECT DATE (:lv_end_time) - DATE (:lv_start_time) AS :lv_elapsed_time;
+
+   IF error_cnt = 0 THEN
+      IF lp_write_message (pv_logfile  = lv_logfile,
+                           pv_logmess  = '-Time Elapsed-' + VARCHAR (lv_elapsed_time)) != gc_success THEN
+         RETURN gc_fail;
+      ENDIF;
+   ENDIF;
+
+   COMMIT;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_drop_tmptbl(
+) =
+DECLARE
+   lv_int             = INTEGER4      NOT NULL,
+{
+  /* status_tbl must remain a real table, used by shell script.    */
+   SELECT lv_int      = COUNT(*)
+     FROM iitables
+    WHERE table_name  = :status_tbl
+      AND table_owner = :tableowner;
+
+   IF lp_check_ingres_error (pv_proc_no = 360) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_int != 0 THEN
+      DROP TABLE :status_tbl;
+
+      IF lp_check_ingres_error (pv_proc_no = 370) != gc_success THEN
+         RETURN gc_fail;
+      ENDIF;
+
+   ENDIF;
+}
+
+
+PROCEDURE lp_get_email_address (
+   pv_email_address            = VARCHAR (100) NOT NULL,
+)=
+DECLARE
+   lv_rowcount                 = INTEGER4      NOT NULL,
+   lv_count                    = INTEGER       NOT NULL,
+{
+   SELECT        IFNULL (email, '')  AS pv_email_address
+   FROM          users_email
+   WHERE         branch_id            = :gv_branch_id
+   AND           user_id              = :gv_user_id;
+
+   IF lp_check_ingres_error (pv_proc_no = 380, pv_rowcount = BYREF (lv_rowcount)) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_rowcount = 0 THEN
+      MESSAGE 'User ' + VARCHAR (gv_branch_id) + ' ' + VARCHAR (gv_user_id) + 
+              ' does not have email set up in users_email table. Please add user and user email address and re-start...' 
+      WITH STYLE = POPUP;
+      RETURN 1;
+   ELSE
+      IF pv_email_address  = '' THEN
+         MESSAGE 'User ' + VARCHAR (gv_branch_id) + ' ' + VARCHAR (gv_user_id) + 
+                 '. Email address is blank in users_email table. Please add user email address and re-start...' 
+         WITH STYLE = POPUP;
+         RETURN gc_fail;
+      ENDIF;
+   ENDIF;
+
+   /* Check for email recipients...*/
+   SELECT count(*) AS lv_count
+   FROM   email_recipients_ctl
+   WHERE  sw_type = 'osq'
+   AND    sw_name = 'alias_file_upload';
+
+   IF (lp_check_ingres_error (pv_proc_no = 390, pv_rowcount = BYREF (lv_rowcount)) != gc_success)
+   THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF (lv_count = 0)
+   THEN
+      MESSAGE 'Process does not have any email recipients set-up for reporting' + X'0A' +
+              'Please add recipient details to Ingres table: email_recipients_ctl and re-run...'
+      WITH STYLE = POPUP;
+      RETURN gc_fail;
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_email_summary (
+   pv_email_address     = VARCHAR (250) NOT NULL WITH DEFAULT,
+   pv_logfile           = VARCHAR (100) NOT NULL WITH DEFAULT,
+)=
+DECLARE
+   lv_email_body        = VARCHAR (250) NOT NULL WITH DEFAULT,
+   lv_system_cmd        = VARCHAR (500) NOT NULL,
+{
+   lv_email_body = gc_temp + 'alias_file_upload.eml';
+
+   lv_system_cmd = 'cat ' + gc_logs_curr + TRIM (pv_logfile) + ' > ' + TRIM (lv_email_body);
+   CALL SYSTEM :lv_system_cmd;
+
+   lv_system_cmd = 'echo END of DATA' + ' >> ' + TRIM (lv_email_body);
+   CALL SYSTEM :lv_system_cmd;
+
+   IF custid = 'AAH' 
+   THEN
+      lv_system_cmd = '/usr/bin/echo "From: DoNotReply@aah.co.uk\nTo: '
+                    + TRIM (pv_email_address)
+                    + '\nSubject: Alias File Upload Summary - AAH'
+                    + '" | /usr/bin/cat - '
+                    + TRIM (lv_email_body) + ' | mail ' + TRIM (pv_email_address);
+   ELSE
+
+      lv_system_cmd = '/usr/bin/echo "From: DoNotReply@aah.co.uk\nTo: '
+                    + TRIM (pv_email_address)
+                    + '\nSubject: Alias File Upload Summary - ENT'
+                    + '" | /usr/bin/cat - '
+                    + TRIM (lv_email_body) + ' | mail ' + TRIM (pv_email_address);
+   ENDIF; 
+
+   CALL SYSTEM :lv_system_cmd;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_crt_wrktable (
+   pv_session_table     = VARCHAR (100) NOT NULL,
+) =
+DECLARE
+   lv_int               = INTEGER4      NOT NULL,
+   lv_rowcount          = INTEGER4      NOT NULL,
+   lv_session_rowcnt    = INTEGER4      NOT NULL,
+   lv_product_rowcnt    = INTEGER4      NOT NULL,
+{
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'IN lp_crt_wrktable'                                + X'0A' +
+              'pv_session_table = ' + VARCHAR (pv_session_table)  + X'0A' +
+              'tableowner       = ' + VARCHAR (tableowner)
+      WITH STYLE = POPUP;
+   ENDIF;
+
+   SELECT lv_int      = COUNT(*)
+     FROM iitables
+    WHERE table_name  = '_cs_ent_alias_load'
+      AND table_owner = :tableowner;
+
+   IF lp_check_ingres_error (pv_proc_no = 400) != gc_success THEN
+      RETURN gc_fail;
+   ENDIF;
+
+   IF lv_int != 0 THEN
+      DROP TABLE _cs_ent_alias_load;
+
+      IF lp_check_ingres_error (pv_proc_no = 410) != gc_success THEN
+         RETURN gc_fail;
+      ENDIF;
+
+      CREATE TABLE _cs_ent_alias_load AS
+      SELECT *
+      FROM   :pv_session_table;
+
+      IF lp_check_ingres_error (pv_proc_no = 420, pv_rowcount = BYREF (lv_rowcount) ) != gc_success THEN
+         RETURN gc_fail;
+      ENDIF;
+
+   ELSE
+
+      CREATE TABLE _cs_ent_alias_load AS
+      SELECT *
+      FROM   :pv_session_table;
+
+      IF lp_check_ingres_error (pv_proc_no = 430, pv_rowcount = BYREF (lv_rowcount) ) != gc_success THEN
+         RETURN gc_fail;
+      ENDIF;
+
+   ENDIF;
+
+   lv_session_rowcnt = lv_rowcount;
+
+   COMMIT;
+
+   IF lv_debug_flag > 1 THEN
+      MESSAGE 'CREATE TABLE _cs_ent_alias_load '          +
+              'Rowcount = ' + VARCHAR (lv_session_rowcnt) + X'0A'
+      WITH STYLE = POPUP;
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_write_message (
+   pv_logfile              = VARCHAR (100) NOT NULL,
+   pv_logmess              = VARCHAR (100) NOT NULL,
+)=
+DECLARE
+   lv_system_cmd           = VARCHAR (500) NOT NULL,
+{
+   lv_system_cmd = 'echo ' + '"' + VARCHAR (pv_logmess) + '"' + ' >> ' + :gc_logs_curr + TRIM (pv_logfile);
+
+   CALL SYSTEM :lv_system_cmd;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_check_ingres_error (
+   pv_proc_no                   = INTEGER4      NOT NULL,
+   pv_rowcount                  = INTEGER4      NOT NULL,
+)=
+DECLARE
+   lv_errorno                   = INTEGER4      NOT NULL,
+   lv_errortext                 = VARCHAR (256) NOT NULL,
+   lv_rowcount                  = INTEGER4      NOT NULL,
+{
+   INQUIRE_INGRES (lv_errorno = ERRORNO, lv_errortext = ERRORTEXT, lv_rowcount = ROWCOUNT);
+
+   IF lv_errorno != 0  THEN
+      ROLLBACK;
+      IF (pv_proc_no = 190 and lv_errorno = 33000) 
+      THEN
+         MESSAGE 'ERROR 190-33000 FILE FORMAT INCORRECT, NO DATA HAS BEEN LOADED, PLEASE CORRECT FILE BEFORE TRYING AGAIN' 
+         WITH STYLE = POPUP;
+      ELSE 
+         MESSAGE 'INGRES ERROR ' + TRIM (VARCHAR (pv_proc_no)) + ' - ' + TRIM (VARCHAR (lv_errorno)) + ' ' + TRIM (lv_errortext) 
+         WITH STYLE = POPUP;
+      ENDIF;
+
+      RETURN gc_fail;
+   ENDIF;
+
+   pv_rowcount = lv_rowcount;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_key_map_check (
+)=
+{
+   /* Set up key mapping file if not set up by system_logon        */
+   INQUIRE_FORMS FRS (lv_mf = MAPFILE);
+
+   IF lv_mf not like '%aah_pc220.map' THEN
+     /* Get II_SYSTEM environment variable */
+     CALLPROC get_ii_system (BYREF (gv_ii_system));
+
+     IF gv_ii_system = 'UNKNOWN' THEN
+        MESSAGE 'Could not find path to mapping file. Exiting.' WITH STYLE = POPUP;
+        EXIT;
+     ENDIF;
+
+     /* Append path to mapping file */
+     lv_mf = gv_ii_system + '/ingres/files/aah_pc220.map';
+
+     /* Set mapping file */
+     SET_FORMS FRS (MAPFILE = lv_mf);
+   ENDIF;
+}

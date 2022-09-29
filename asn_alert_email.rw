@@ -1,0 +1,54 @@
+/*
+**
+**  Report Name: ASN Alert report 
+**        
+**         Date: 10/12/2009
+**
+**       Author: Bhavin Bhatt  
+**
+**       Project: Core ASN Project
+**
+*/
+.NAME asn_alert_email
+.PW 500
+.NOFIRSTFF
+.NOFORMFEED
+.PL 0
+
+.DECLARE
+   IIreport_number = integer
+	 
+.SETUP
+   SET LOCKMODE SESSION WHERE READLOCK = NOLOCK ,MAXLOCKS = 300 ;
+
+.QUERY
+
+       SELECT e.account_branch,e.account_number,
+              e.picknote,e.invoice,
+              e.account_branch+e.account_number as cust_id
+       FROM   asn_event e
+       WHERE  e.processed_flag = 0
+       AND    e.asn_event_type = 'A'
+       AND    e.asn_event_code = 'IPX'
+
+.SORT
+         cust_id,picknote
+
+.BREAK cust_id
+
+.position
+   picknote(20)
+
+.HEADER report
+    .PRINT 'Failed to process EDI ASN for the following pick notes: '
+    .NL 2
+    .TAB picknote .PRINT 'Picknote'
+    .NL 2
+
+.DETAIL
+    .TAB picknote .PRINT picknote
+    .NL 1
+
+.FOOTER cust_id
+
+.FOOTER report

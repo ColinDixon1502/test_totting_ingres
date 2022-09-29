@@ -1,0 +1,357 @@
+/************************************************************
+*  Frame   - asn_resend_asn - To read from asn_resend_request
+*            and if record(s) exist, read invoice from 
+*            asn_invoice table where it is stored as a blob.
+*            Write to a csv file for XML and Reims ASN's.
+*
+*  Type    - PROCEDURE
+*
+*  Author  - Bhavin Bhatt/Irfan Salim
+*
+*  Date    - 22/01/2010
+*
+*  Parameters IN - None
+*
+*  Return Value - 0 Success
+*                 1 Failure / Ingres Error
+*                 2 Failure / Process Error
+*
+************************************************************
+* Ver |Date    |Coded|Description
+******|********|*****|**************************************
+* 2.0 |17/02/10| ISS |Core ASN Project
+************************************************************/
+
+PROCEDURE asn_resend_asn(
+)=
+
+/*********************************************************
+** INGRES ERROR HANDLING VARIABLES
+*********************************************************/
+DECLARE 
+    IIerrorno       = INTEGER(4)   NOT NULL WITH DEFAULT,
+    IIrowcount      = INTEGER(4)   NOT NULL WITH DEFAULT,
+    IIerrortext     = VARCHAR(256) NOT NULL WITH DEFAULT,
+
+/*********************************************************
+** PROCEDURE SPECIFIC VARIABLES
+*********************************************************/
+
+    ret_code        = INTEGER(4)  NOT NULL WITH DEFAULT,
+    tot_rows        = INTEGER(4)  NOT NULL WITH DEFAULT,
+    loop_cnt        = INTEGER(4)  NOT NULL WITH DEFAULT,
+    loop_cnt_event  = INTEGER(4)  NOT NULL WITH DEFAULT,
+    tot_rows_header = INTEGER(4)  NOT NULL WITH DEFAULT,
+
+    lv_txn          = VARCHAR(1)   NOT NULL WITH DEFAULT,
+    lv_txn_desc     = VARCHAR(3)   NOT NULL WITH DEFAULT,
+    file_ext        = VARCHAR(4)   NOT NULL WITH DEFAULT,
+    asn_xml         = VARCHAR(128) NOT NULL WITH DEFAULT,
+    asn_edi         = VARCHAR(128) NOT NULL WITH DEFAULT,
+    asn_edi1        = VARCHAR(128) NOT NULL WITH DEFAULT,
+    asn_edi2        = VARCHAR(128) NOT NULL WITH DEFAULT,
+    asn_file        = VARCHAR(256) NOT NULL WITH DEFAULT,
+    file_name       = VARCHAR(128) NOT NULL WITH DEFAULT,
+    import_dir      = VARCHAR(32)  NOT NULL WITH DEFAULT,
+    email_id_to     = VARCHAR(500) NOT NULL WITH DEFAULT;
+    system_cmd      = VARCHAR(700) NOT NULL WITH DEFAULT;
+    email_file_name = VARCHAR(100) NOT NULL WITH DEFAULT;
+    logmess         = VARCHAR(500);
+    batch_online    = CHAR(1) NOT NULL;
+    process_asn     = INTEGER(4) NOT NULL WITH DEFAULT,
+
+    request_array   = ARRAY OF TYPE OF TABLE asn_resend_request;
+
+    display_message = PROCEDURE RETURNING NONE;
+
+/*********************************************************
+** MAIN 
+*********************************************************/
+{
+    batch_online = 'B'; /* 'O'nline or 'B'atch depending */
+                        /* where messages to be reported */
+
+    ret_code = CALLPROC ARRAYCLEAR(request_array); 
+
+    request_array = SELECT * FROM asn_resend_request;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != 0) THEN
+       ROLLBACK;
+       MESSAGE 'Error reading from asn_resend_request table ' + :IIerrortext;
+       RETURN 1;
+    ENDIF;
+
+    IF IIrowcount <= 0 THEN
+       MESSAGE '-------------- No ASN Resend requests found --------------';
+       RETURN 0;
+    ENDIF;
+
+    tot_rows = IIrowcount;
+
+    import_dir='/aahdb/work/control/import/';
+
+    logmess= 'No of ASNs to process: ' + varchar(:tot_rows);
+    CALLPROC display_message();
+
+    loop_cnt = 1;
+
+    WHILE loop_cnt <= tot_rows
+    DO
+      process_asn = 1;
+
+      logmess = 'Processing ASN resend request ' + varchar(:loop_cnt) + ':'
+        +X'0A'+'Brn:'+squeeze(vchar(:request_array[:loop_cnt].account_branch))
+        +'  Acc:'+squeeze(vchar(:request_array[:loop_cnt].account_number))
+        +'  Picknote:'+squeeze(vchar(:request_array[:loop_cnt].picknote))
+        +'  username:'+squeeze(vchar(:request_array[:loop_cnt].username))
+        +'  userid:'+squeeze(vchar(:request_array[:loop_cnt].userid));
+      CALLPROC display_message();
+ 
+     /***********************************************/
+     /* Determine whether XML or EDI transmission ? */
+     /***********************************************/
+     SELECT txn_method as lv_txn
+       FROM asn_summary_header
+      WHERE account_branch = :request_array[:loop_cnt].account_branch
+        AND account_number = :request_array[:loop_cnt].account_number
+        AND picknote = :request_array[:loop_cnt].picknote
+        AND txn_method in ('E','X');
+     
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+               IIerrortext = ERRORTEXT, 
+               IIrowcount = ROWCOUNT);
+  
+      IF (IIerrorno != 0) THEN
+        ROLLBACK;
+        logmess = 'Error reading from asn_summary_header table ' + :IIerrortext;
+        CALLPROC display_message();
+        RETURN 1;
+      ENDIF;
+  
+      IF IIrowcount <= 0 THEN
+        logmess = 'Error: No transmission method !!!'; 
+        CALLPROC display_message();
+        process_asn = 0;
+
+      ELSEIF IIrowcount > 1 THEN
+        logmess= 'Error: Multiple transmission method !!!';
+        CALLPROC display_message();
+        process_asn = 0;
+
+      ELSE
+
+        IF lv_txn = 'X'
+        /* ASN to go to RemTP */
+        THEN
+          lv_txn_desc = 'XML';
+          asn_xml = squeeze(vchar(:request_array[:loop_cnt].account_branch)) 
+            + '_' + squeeze(vchar(:request_array[:loop_cnt].account_number)) 
+            + '_' + squeeze(vchar(:request_array[:loop_cnt].picknote));
+          file_name = 'resend_asn_' + :asn_xml;
+
+        ELSEIF lv_txn = 'E'
+        /* ASN to go to Reims */
+        THEN
+          lv_txn_desc = 'EDI';
+
+          asn_edi1 = squeeze(vchar(:request_array[:loop_cnt].account_number)); 
+          asn_edi2 = squeeze(vchar(:request_array[:loop_cnt].picknote));
+
+          /* grab last 4 integers from account number */
+          asn_edi1 = squeeze(vchar(right(squeeze(left(:request_array[:loop_cnt].account_number,8)),4)));
+
+          /* grab last 3 integers from picknote */
+          asn_edi2=squeeze(right(squeeze(left(vchar(:request_array[:loop_cnt].picknote),8)),3));
+
+          /* EDI ASN format is asn_nnnnnnn.dat */
+          asn_edi = :asn_edi1 + :asn_edi2;
+          file_name = 'asn_' + :asn_edi;
+
+        ELSE
+          logmess= 'Error: Not XML or EDI transmission !!!';
+          CALLPROC display_message();
+          process_asn = 0;
+        ENDIF;
+
+        file_ext  = '.' + :lv_txn_desc;
+        asn_file  = :gc_temp + :file_name + :file_ext;
+
+      logmess = 'Transmission method: ' + varchar(:lv_txn_desc); 
+      CALLPROC display_message();
+
+      ENDIF;
+
+    IF process_asn = 1 THEN
+
+     /****************************/
+     /* Generate file from blob  */
+     /****************************/
+      ret_code = CALLPROC asn_read_resend_invoice(
+            :request_array[:loop_cnt].account_branch,
+            :request_array[:loop_cnt].account_number,
+            :request_array[:loop_cnt].picknote,
+            :asn_file
+              );
+
+      IF ret_code != 0 THEN
+         MESSAGE 'Error reading blob  ';
+         RETURN 1;
+      ENDIF;
+
+      IF lv_txn = 'X' THEN 
+       /**************************************/
+       /* Create XML ASN file in .csv format */
+       /**************************************/
+        system_cmd = :gc_imsexes + 'postings_convert -d ' + :gc_temp 
+          + :file_name + :file_ext + ' -c ' + :gc_temp + :file_name + '.csv -t';
+        CALL SYSTEM :system_cmd;
+
+        logmess= 'Generated XML asn: ' + :gc_temp + squeeze(vchar(:file_name)) 
+          + '.csv';
+        CALLPROC display_message();
+
+      ELSE
+
+       /**************************************/
+       /* Create EDI ASN file in .csv format */
+       /**************************************/
+        system_cmd = :gc_imsexes + 'postings_convert -d ' + :gc_temp 
+          + :file_name + :file_ext + ' -c ' + :gc_temp + :file_name + '.csv -t';
+        CALL SYSTEM :system_cmd;
+
+        logmess= 'Generated EDI asn: ' + :gc_temp + squeeze(vchar(:file_name))
+          + '.csv';
+        CALLPROC display_message();
+
+       /**************************************************/
+       /* Move EDI file to import directory for processing
+       /**************************************************/
+        system_cmd = 'mv ' + :gc_temp + squeeze(vchar(:file_name)) + '.csv '
+         + :import_dir;
+        logmess= :system_cmd;
+        CALLPROC display_message();
+        CALL SYSTEM :system_cmd;
+
+       /****************************/
+       /* Create trigger for EDI ASN    
+       /****************************/
+        system_cmd = '> ' + :import_dir + :file_name + '.trg';
+        CALL SYSTEM :system_cmd;
+        logmess= 'Created trigger ' + :import_dir + :file_name + '.trg';
+        CALLPROC display_message();
+
+       /***************************/
+       /* Create asn_event record */
+       /***************************/
+        INSERT INTO asn_event (
+                asn_event_code,
+                asn_event_type,
+                event_date_time,
+                account_branch,
+                account_number,
+                print_branch,
+                picknote,
+                invoice,
+                processed_flag)
+        VALUES (
+                'IRR',
+                'R',
+                 date('now'),
+                :request_array[:loop_cnt].account_branch,
+                :request_array[:loop_cnt].account_number,
+                '',
+                :request_array[:loop_cnt].picknote,
+                0,
+                0);
+       
+        INQUIRE_INGRES (IIerrorno = ERRORNO, 
+                 IIerrortext = ERRORTEXT, 
+                 IIrowcount = ROWCOUNT);
+    
+        IF (IIerrorno != 0) THEN
+           ROLLBACK;
+           logmess= 'Error inserting into asn_event table ' + :IIerrortext;
+           CALLPROC display_message();
+           RETURN 1;
+        ENDIF;
+
+       /***************************/
+       /* Update asn_event record */
+       /***************************/
+       UPDATE asn_event a
+         FROM asn_summary_header b
+          SET print_branch = b.print_branch,
+              invoice = b.invoice
+        WHERE a.account_branch = :request_array[:loop_cnt].account_branch
+          AND a.account_number = :request_array[:loop_cnt].account_number
+          AND a.picknote = :request_array[:loop_cnt].picknote
+          AND asn_event_code = 'IRR'
+          AND asn_event_type = 'R'
+          AND a.account_branch = b.account_branch
+          AND a.account_number = b.account_number
+          AND a.picknote = b.picknote;
+      ENDIF;
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, 
+                 IIerrortext = ERRORTEXT, 
+                 IIrowcount = ROWCOUNT);
+    
+        IF (IIerrorno != 0) THEN
+           ROLLBACK;
+           logmess= 'Error updating asn_event table ' + :IIerrortext;
+           CALLPROC display_message();
+           RETURN 1;
+        ENDIF;
+
+        logmess= 'Inserted IRR event for EDI ASN Resend';
+        CALLPROC display_message();
+
+    ENDIF; /* process_asn = 1 */
+
+       /*****************************/
+       /* Remove request from table */
+       /*****************************/
+     
+       DELETE FROM asn_resend_request
+        WHERE account_branch = :request_array[:loop_cnt].account_branch
+          AND account_number = :request_array[:loop_cnt].account_number
+          AND picknote = :request_array[:loop_cnt].picknote;
+       
+       INQUIRE_INGRES (IIerrorno = ERRORNO, 
+                IIerrortext = ERRORTEXT, 
+                IIrowcount = ROWCOUNT);
+    
+       IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         logmess= 'Error deleting from asn_resend_request table ' 
+           + :IIerrortext;
+         CALLPROC display_message();
+          RETURN 1;
+       ENDIF;
+
+       logmess= 'Deleted from ASN resend request table'
+         + X'0A'+'---------------------------------------------------------';
+       CALLPROC display_message();
+
+      loop_cnt = loop_cnt + 1;
+
+    ENDWHILE;
+
+    COMMIT;
+
+    RETURN gc_success;
+}
+
+
+PROCEDURE display_message() =
+{
+     IF batch_online = 'O' THEN
+       MESSAGE varchar(:logmess) WITH STYLE = POPUP;
+     ELSE
+       MESSAGE varchar(:logmess);
+     ENDIF;
+}

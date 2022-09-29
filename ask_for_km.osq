@@ -1,0 +1,21 @@
+initialize()=
+
+declare miles = integer not null;
+
+begin
+    clear field km;
+end;
+
+'OK', key frskey4, after field km=
+begin
+    validate field km;
+    if km is null
+    then
+	message 'A value must be entered.' with style = popup;
+	resume;
+    endif;
+    miles = ifnull(:km,0) / 1.609344;
+    message 'Converted '+trim(char(:km))+' km to '+trim(char(:miles))+' miles.';
+    sleep 2;
+    return miles;
+end;

@@ -1,0 +1,1376 @@
+/*
+** Inventory Management System CONTROL development using INGRES.
+** -------------------------------------------------------------
+**
+** SOURCE NAME: apply_product_extra_changes.osq
+**
+** PURPOSE:     Insert/Update future Product Extra records. 
+**
+** VERSION:     1.0
+**
+** STATUS:      Development
+**
+** AUTHOR:      Bhavin Bhatt
+**
+** DATE:        03/03/2007
+**
+** PARAMETERS: call_type, product_code, start_date, end_date, transfer_muperc,
+**             to_price_trade, promotional_price1, ssp, price_changed, 
+**             price_type
+**             price_changed = 'P' and price_type = 1 for promotional price1
+**             price_changed = 'P' and price_type = 2 for price_2
+**             price_changed = 'B' and price_type = 1 for SSP and PP1
+**             price_changed = 'B' and price_type = 2 for SSP and Price 2
+**
+**             call_type = 'D'
+**             price_changed = 'P' then set promo flag to 'N'
+**             price_changed = 'B' then set promo flag to 'N' and SSP to 0
+**
+** RETURN VALUE : 0 Success
+**                1 Error / Failure
+*****************************************************************************
+* Ver |   Date  |Coded|Description
+*****************************************************************************
+* 1.2 |04-Dec-07| PSN |Change due to new table column (product_extra_audit)
+*****************************************************************************
+*/
+
+procedure apply_product_extra_changes(
+				call_type          = CHAR(1) NOT NULL,
+				product_code       = CHAR(8) NOT NULL,
+				start_date         = DATE    NOT NULL,
+				end_date           = DATE    NOT NULL,
+				promotional_price1 = FLOAT8  NOT NULL,
+				ssp                = FLOAT8  NOT NULL,
+				transfer_muperc    = FLOAT8  NOT NULL,
+				to_price_trade     = CHAR(1) NOT NULL,
+				price_changed      = CHAR(1) NOT NULL,  /* P for promotional price1, */
+                                                /* B for both pp1 and SSP or 
+                                                   both price2 and SSP */
+				price_type         = INTEGER NOT NULL   /* 1 for PP1, 2 for Price 2  */
+				) =
+
+DECLARE 
+	row_count          =  INTEGER(4)   NOT NULL,
+  error_no           =  INTEGER(4)   NOT NULL,
+  error_text         =  VARCHAR(256) NOT NULL,
+  ret_code           =  INTEGER1     NOT NULL,
+  mcsres             =  INTEGER1     NOT NULL,
+  IIInt              =  INTEGER1     NOT NULL,
+	curr_date          =  DATE         NOT NULL,
+	pe_rec_cnt         =  INTEGER(4)   NOT NULL,
+	loop_cnt           =  INTEGER(4)   NOT NULL,
+  end_date_supplied  =  CHAR(1)      NOT NULL,
+  promotion_flag     =  CHAR(1)      NOT NULL,
+	pe_rec_date        =  DATE         NOT NULL,
+  err_msg            =  VARCHAR(120) NOT NULL,
+  price_2            =  FLOAT8  NOT NULL,
+  selling_flag       =  CHAR(1)      NOT NULL,
+
+  pe_rec_array       =  ARRAY OF TYPE OF TABLE product_extra,
+  pe_rec             =  TYPE OF TABLE product_extra,
+
+  check_ingres_error =  PROCEDURE RETURNING INTEGER,
+  create_audit_rec   =  PROCEDURE RETURNING INTEGER,
+  select_curr_pe_rec =  PROCEDURE RETURNING INTEGER,
+  update_pe_rec      =  PROCEDURE RETURNING INTEGER,
+  create_pe_rec      =  PROCEDURE RETURNING INTEGER,
+  insert_product_rec =  PROCEDURE RETURNING INTEGER,
+  remove_discount    =  PROCEDURE RETURNING INTEGER,
+  definalise_recs    =  PROCEDURE RETURNING INTEGER,
+	
+{
+
+  promotion_flag = 'Y';
+
+	IF call_type != 'P' AND    /* Enterprise Promotional Price */
+		 call_type != 'D' AND    /* Enterprise Promotional Price De-finalise */
+		 call_type != 'S' THEN   /* Supplier Discount    */
+
+     err_msg = 'FEP - Wrong Call Type Passed to the procedure.';
+     IIInt = callproc report_error(error_message = :err_msg);
+		 MESSAGE :err_msg WITH STYLE = POPUP;
+     RETURN 1;
+
+	ENDIF;
+
+	IF call_type     = 'P'  AND    /* Enterprise Promotional Price */
+     price_changed != 'N' AND
+     price_changed != 'P' AND
+     price_changed != 'B' THEN
+
+     err_msg = 'FEP - Wrong Price Change Passed to the procedure.';
+     IIInt = callproc report_error(error_message = :err_msg);
+		 MESSAGE :err_msg WITH STYLE = POPUP;
+     RETURN 1;
+
+	ENDIF;
+
+	IF call_type     = 'P'    AND    /* Enterprise Promotional Price */
+     (price_changed = 'P' OR
+      price_changed = 'B')  AND
+     price_type     != 1    AND
+     price_type     != 2    THEN
+
+     err_msg = 'FEP - Wrong Price type Passed to the procedure.';
+     IIInt = callproc report_error(error_message = :err_msg);
+		 MESSAGE :err_msg WITH STYLE = POPUP;
+     RETURN 1;
+
+	ENDIF;
+
+	IF call_type     = 'D'  AND    /* Enterprise Promotional Price De-finalise */
+     price_changed != 'P' AND
+     price_changed != 'B' THEN
+
+     err_msg = 'FEP - Wrong Price Change Passed to the proc. for De-finalise.';
+     IIInt = callproc report_error(error_message = :err_msg);
+		 MESSAGE :err_msg WITH STYLE = POPUP;
+     RETURN 1;
+
+	ENDIF;
+
+  /* Value for price_2 will be passed in the parameter promotional_price1 */
+  /* as either promotional_price1 or price_2 will be passed to this proc. */
+  /* The parameter price_type indicate which price is passed.             */
+  /* price_type = 1 then promotional_price1, price_type = 2 then price_2  */
+
+  IF price_type = 2 THEN
+
+	   SELECT selling_flag = ref_ch4
+     FROM   op_products_extra
+	   WHERE  product_code = :product_code;
+
+	   ret_code = CALLPROC check_ingres_error(proc_no = 07);
+
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+     price_2 = promotional_price1;
+
+	ENDIF;
+
+	IF ifnull(product_code,'') = '' THEN
+
+		 err_msg = 'FEP - Product Code can not be blank.';
+     IIInt = callproc report_error(error_message = :err_msg);
+		 MESSAGE :err_msg WITH STYLE = POPUP;
+     RETURN 1;
+
+	ENDIF;
+
+  IF call_type     = 'D' THEN /* De-finalise */
+
+     ret_code = CALLPROC definalise_recs();
+     RETURN ret_code;
+
+	ENDIF; /* IF call_type     = 'D' THEN */
+
+  /* Special case to update new_line = 'N' */
+
+	IF call_type     = 'P' AND    /* Enterprise Promotional Price */
+     price_changed = 'N' THEN
+
+     UPDATE product_extra
+        SET new_line = 'N'
+     WHERE product_code    =  :product_code
+       AND operative_date  >= :start_date
+       AND new_line = 'Y';
+
+	   ret_code = CALLPROC check_ingres_error(proc_no = 08);
+
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+     /* If no record found then create one with operative date as start date */
+
+     IF row_count <= 0 THEN
+
+				ret_code = CALLPROC create_pe_rec(rec_type = 'S'); 
+        IF ret_code != 0 THEN
+           RETURN 1;
+        ENDIF;
+
+        UPDATE product_extra
+           SET new_line = 'N'
+        WHERE product_code    =  :product_code
+          AND operative_date  >= :start_date
+          AND new_line = 'Y';
+
+	      ret_code = CALLPROC check_ingres_error(proc_no = 09);
+
+        IF ret_code != 0 THEN
+           RETURN 1;
+        ENDIF;
+
+     ENDIF; /* IF row_count != 1 THEN */
+
+     RETURN 0;
+
+	ENDIF; /* call_type     = 'P' AND price_changed = 'N' */
+
+ 	IF call_type                 = 'S'  AND     /* Supplier Discount */ 
+     ifnull(transfer_muperc,0) != 0   AND     /* % discount        */
+ 	   to_price_trade            != 'P' AND     /* Price 1           */ 
+ 		 to_price_trade            != 'T' THEN    /* Trade Price       */ 
+ 
+ 		 err_msg = 'FEP - Wrong Price Type Passed to the procedure.';
+     IIInt = callproc report_error(error_message = :err_msg);
+		 MESSAGE :err_msg WITH STYLE = POPUP;
+     RETURN 1;
+ 
+ 	ENDIF;
+
+ 	IF ifnull(start_date,'') = '' AND
+		 ifnull(end_date,'')   = '' THEN
+		 err_msg = 'FEP - Start Date OR End Date must be supplied.';
+     IIInt = callproc report_error(error_message = :err_msg);
+		 MESSAGE :err_msg WITH STYLE = POPUP;
+     RETURN 1;
+	ENDIF;
+
+  /* If start date is blank, end date is supplied and */
+  /* Supplier Discount percentage is 0 then, it is a  */
+  /* special case of removing Supplier Discount.      */
+
+	IF call_type                 = 'S' AND   /* Supplier Discount    */
+		 ifnull(start_date,'')     = ''  AND
+		 ifnull(end_date,'')       != '' AND
+     ifnull(transfer_muperc,0) = 0   THEN
+
+     ret_code = CALLPROC remove_discount();
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+     RETURN 0;
+	ENDIF;
+
+  pe_rec_cnt = 0;
+
+  /* Apply Supplier Discount to all future records */
+
+	IF call_type                 = 'S' AND   /* Supplier Discount    */
+		 ifnull(start_date,'')     != '' AND
+		 ifnull(end_date,'')       = ''  THEN
+
+     end_date_supplied = 'N';
+
+	   pe_rec_array = SELECT *
+                    FROM   product_extra
+	                  WHERE  product_code    = :product_code
+	                  AND    operative_date  >= :start_date
+                    ORDER BY operative_date;
+ 
+	ELSE /* All other cases */
+
+     end_date_supplied = 'Y';
+
+	   pe_rec_array = SELECT *
+                    FROM   product_extra
+	                  WHERE  product_code    = :product_code
+	                  AND    operative_date  >= :start_date
+	                  AND    operative_date  <= :end_date + '1 day'
+                    ORDER BY operative_date;
+ 
+  ENDIF;
+ 
+	ret_code = CALLPROC check_ingres_error(proc_no = 10);
+
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  pe_rec_cnt = row_count;
+
+  IF pe_rec_cnt > 0 THEN
+    
+     loop_cnt = 1;
+
+     /* Check if the first record is of start date or not. If not create  */
+     /* one record for start date and insert into product_extra & product */
+ 
+     IF pe_rec_array[loop_cnt].operative_date != :start_date THEN
+
+				ret_code = CALLPROC create_pe_rec(rec_type = 'S'); 
+        IF ret_code != 0 THEN
+           RETURN 1;
+        ENDIF;
+
+		 ENDIF;
+
+     WHILE loop_cnt <= pe_rec_cnt DO
+
+        IF pe_rec_array[loop_cnt].operative_date = :end_date + '1 day' THEN
+
+           /* If end_date + 1 day then make promotional price 0 */
+           /* and promotion flag No                             */
+
+           IF call_type     = 'P'  THEN    /* Enterprise Promotional Price */
+           
+              IF price_type = 1 THEN
+                 promotional_price1 = 0;
+              ELSE
+								 price_2 = 0;
+              ENDIF;
+              IF price_changed = 'B' THEN
+                 ssp = 0;
+				      ENDIF;
+           
+				   ENDIF;
+
+           promotional_price1 = 0.00;
+           promotion_flag = 'N';
+
+        ENDIF;
+
+        ret_code = CALLPROC update_pe_rec(rec_in = pe_rec_array[loop_cnt]);
+        IF ret_code != 0 THEN
+           RETURN 1;
+        ENDIF;
+        loop_cnt = loop_cnt + 1;
+
+     ENDWHILE;
+  
+     /* Check if the last record is end date + 1 day or not. If not create */
+     /* one for end date + 1 day and insert into product_extra & product   */
+     /* NOTE : To be done only when end date is supplied                   */
+ 
+     IF pe_rec_array[loop_cnt - 1].operative_date < :end_date + '1 day' AND
+				end_date_supplied = 'Y'                                         THEN
+
+        /* If end_date + 1 day then make promotional price 0 */
+        /* and promotion flag No                             */
+
+        IF call_type     = 'P'  THEN    /* Enterprise Promotional Price */
+         
+           IF price_type = 1 THEN
+              promotional_price1 = 0;
+           ELSE
+              price_2 = 0;
+           ENDIF;
+           IF price_changed = 'B' THEN
+              ssp = 0;
+				   ENDIF;
+        
+			  ENDIF;
+
+        promotion_flag = 'N';
+
+				ret_code = CALLPROC create_pe_rec(rec_type = 'E'); 
+        IF ret_code != 0 THEN
+           RETURN 1;
+        ENDIF;
+
+		 ENDIF;
+
+     RETURN 0;
+
+  ENDIF;
+
+  /* Record doesn't exist, create new records for start and end date */
+
+	ret_code = CALLPROC create_pe_rec(rec_type = 'S'); 
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+  
+  IF end_date_supplied = 'Y' THEN
+
+     IF call_type     = 'P'  THEN    /* Enterprise Promotional Price */
+     
+        IF price_type = 1 THEN
+           promotional_price1 = 0;
+        ELSE
+           price_2 = 0;
+        ENDIF;
+
+        IF price_changed = 'B' THEN
+           ssp = 0;
+		 	  ENDIF;
+     
+     ENDIF;
+
+     promotion_flag = 'N';
+
+	   ret_code = CALLPROC create_pe_rec(rec_type = 'E'); 
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+  ENDIF;
+
+  RETURN 0;
+}
+
+/************************************************************************
+** Procedure to create product_extra record. Select current record which 
+** is less than start date, update the date with either start date or end 
+** date and insert into the table. After that update same record as per
+** the passed parameter.
+*************************************************************************/
+
+PROCEDURE create_pe_rec(rec_type = CHAR(1) NOT NULL)=
+{
+
+  IF rec_type = 'S' THEN   /* Start */
+     pe_rec_date = :start_date;
+  ELSE /* End */
+     pe_rec_date = :end_date + '1 day';
+	ENDIF;
+
+  ret_code = CALLPROC select_curr_pe_rec();
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  IF rec_type = 'S' THEN   /* Start */
+     pe_rec.operative_date = :start_date;
+  ELSE /* End */
+     pe_rec.operative_date = :end_date + '1 day';
+	ENDIF;
+
+  ret_code = CALLPROC products_extra_insert(pe_record_in = pe_rec);
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  ret_code = CALLPROC insert_product_rec(op_date = pe_rec.operative_date);
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  IF call_type = 'D' THEN /* Enterprise Promotional Price De-finalise */
+     RETURN 0;
+  ENDIF;
+
+  ret_code = CALLPROC update_pe_rec(rec_in = pe_rec);
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  RETURN 0;
+}
+
+/******************************************
+** Procedure to update product_extra record
+*******************************************/
+
+PROCEDURE update_pe_rec(rec_in = TYPE OF TABLE product_extra)=
+   
+{
+  IF call_type = 'P' THEN
+
+     IF price_changed = 'P' THEN
+
+        IF price_type = 1 THEN
+
+           UPDATE product_extra
+           SET    promotional_price1 = :promotional_price1,
+                  ref_ch3            = :promotion_flag
+           WHERE  product_code       = :product_code
+           AND    operative_date     = :rec_in.operative_date;
+   
+           ret_code = CALLPROC check_ingres_error(proc_no = 110);
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+           curr_date = :rec_in.operative_date;
+           ret_code = CALLPROC create_audit_rec(action='U',
+                 fname='promotional_price1',
+                 oldval=varchar(:rec_in.promotional_price1),
+                 newval=varchar(:promotional_price1));
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+           ret_code = CALLPROC create_audit_rec(action='U',
+                 fname='ref_ch3',
+                 oldval=varchar(:rec_in.ref_ch3),
+                 newval=varchar(:promotion_flag));
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+        ELSE  /* IF price_type = 2 */
+
+           curr_date = :rec_in.operative_date;
+
+           IF selling_flag = 'O' OR
+              selling_flag = 'B' THEN
+
+              UPDATE product_extra
+              SET    ref_fl4        = :price_2
+              WHERE  product_code   = :product_code
+              AND    operative_date = :rec_in.operative_date;
+   
+              ret_code = CALLPROC check_ingres_error(proc_no = 111);
+
+              IF ret_code != 0 THEN
+                 RETURN 1;
+              ENDIF;
+
+              ret_code = CALLPROC create_audit_rec(action='U',
+                    fname='ref_fl4',
+                    oldval=varchar(:rec_in.ref_fl4),
+                    newval=varchar(:price_2));
+
+              IF ret_code != 0 THEN
+                 RETURN 1;
+              ENDIF;
+
+           ELSE
+
+              UPDATE product_extra
+              SET    price_2        = :price_2
+              WHERE  product_code   = :product_code
+              AND    operative_date = :rec_in.operative_date;
+   
+              ret_code = CALLPROC check_ingres_error(proc_no = 112);
+
+              IF ret_code != 0 THEN
+                 RETURN 1;
+              ENDIF;
+
+              ret_code = CALLPROC create_audit_rec(action='U',
+                    fname='price_2',
+                    oldval=varchar(:rec_in.price_2),
+                    newval=varchar(:price_2));
+
+              IF ret_code != 0 THEN
+                 RETURN 1;
+              ENDIF;
+
+           ENDIF; /* IF selling_flag = 'O' OR */
+
+        ENDIF; /* IF price_type = 1 THEN */
+
+     ELSEIF price_changed = 'B' THEN
+
+        IF price_type = 1 THEN
+
+           UPDATE product_extra
+           SET    promotional_price1 = :promotional_price1,
+                  ssp                = :ssp,
+                  ref_ch3            = :promotion_flag
+           WHERE  product_code    = :product_code
+           AND    operative_date  = :rec_in.operative_date;
+   
+           ret_code = CALLPROC check_ingres_error(proc_no = 113);
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+           curr_date = :rec_in.operative_date;
+           ret_code = CALLPROC create_audit_rec(action='U',
+                 fname='promotional_price1',
+                 oldval=varchar(:rec_in.promotional_price1),
+                 newval=varchar(:promotional_price1));
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+           ret_code = CALLPROC create_audit_rec(action='U',
+                 fname='ref_ch3',
+                 oldval=varchar(:rec_in.ref_ch3),
+                 newval=varchar(:promotion_flag));
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+        ELSE  /* IF price_type = 2 */
+
+           curr_date = :rec_in.operative_date;
+
+           IF selling_flag = 'O' OR
+              selling_flag = 'B' THEN
+
+              UPDATE product_extra
+              SET    ref_fl4        = :price_2,
+                     ssp            = :ssp
+              WHERE  product_code   = :product_code
+              AND    operative_date = :rec_in.operative_date;
+   
+              ret_code = CALLPROC check_ingres_error(proc_no = 114);
+
+              IF ret_code != 0 THEN
+                 RETURN 1;
+              ENDIF;
+
+              ret_code = CALLPROC create_audit_rec(action='U',
+                    fname='ref_fl4',
+                    oldval=varchar(:rec_in.ref_fl4),
+                    newval=varchar(:price_2));
+
+              IF ret_code != 0 THEN
+                 RETURN 1;
+              ENDIF;
+
+           ELSE
+
+              UPDATE product_extra
+              SET    price_2         = :price_2,
+                     ssp             = :ssp
+              WHERE  product_code    = :product_code
+              AND    operative_date  = :rec_in.operative_date;
+   
+              ret_code = CALLPROC check_ingres_error(proc_no = 115);
+
+              IF ret_code != 0 THEN
+                 RETURN 1;
+              ENDIF;
+
+              ret_code = CALLPROC create_audit_rec(action='U',
+                    fname='price_2',
+                    oldval=varchar(:rec_in.price_2),
+                    newval=varchar(:price_2));
+
+              IF ret_code != 0 THEN
+                 RETURN 1;
+              ENDIF;
+
+           ENDIF; /* IF selling_flag = 'O' OR */
+
+        ENDIF; /* IF price_type = 1 THEN */
+
+        ret_code = CALLPROC create_audit_rec(action='U',
+              fname='ssp',
+              oldval=varchar(:rec_in.ssp),
+              newval=varchar(:ssp));
+
+        IF ret_code != 0 THEN
+           RETURN 1;
+        ENDIF;
+
+     ENDIF;
+
+  ELSE
+
+     UPDATE product_extra
+     SET    transfer_muperc = :transfer_muperc,
+            to_price_trade  = :to_price_trade,
+            transfer_price  = 0
+	   WHERE  product_code    = :product_code
+	   AND    operative_date  = :rec_in.operative_date;
+
+	   ret_code = CALLPROC check_ingres_error(proc_no = 120);
+
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+     curr_date = :rec_in.operative_date;
+     ret_code = CALLPROC create_audit_rec(action='U',
+            fname='transfer_muperc',
+            oldval=varchar(:rec_in.transfer_muperc),
+            newval=varchar(:transfer_muperc));
+
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+     ret_code = CALLPROC create_audit_rec(action='U',
+            fname='to_price_trade',
+            oldval=varchar(:rec_in.to_price_trade),
+            newval=varchar(:to_price_trade));
+
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+     ret_code = CALLPROC create_audit_rec(action='U',
+            fname='transfer_price',
+            oldval=varchar(:rec_in.transfer_price),
+            newval=varchar(float8(0)));
+
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+	ENDIF; /* IF call_type = 'P' */
+
+/**********************/
+   ret_code = CALLPROC open_isam();
+ 
+   mcsres = CALLPROC mcs_product_out('U',
+              :product_code,
+              :rec_in.operative_date,
+              :gv_branch_id,
+              :gv_user_id);
+ 
+   ret_code = CALLPROC close_isam();
+ 
+   IF mcsres != 0 THEN
+      ROLLBACK;
+      err_msg = 'FEP - Message control failure for Product Extra - ' +
+                ' error code = ' + varchar(mcsres) + '.';
+      IIInt = callproc report_error(error_message = :err_msg);
+      MESSAGE :err_msg WITH STYLE = POPUP;
+      RETURN 1;
+   ENDIF;
+/*****************/
+
+  RETURN 0;
+}
+
+/**********************************
+** Procedure to check ingres errors
+***********************************/
+
+PROCEDURE check_ingres_error(proc_no = INTEGER NOT NULL)=
+   
+{
+
+    INQUIRE_INGRES (error_no   = ERRORNO,
+		    error_text = ERRORTEXT,
+		    row_count  = ROWCOUNT);
+
+    IF error_no != 0 
+		THEN
+			ROLLBACK;
+			err_msg = 'FEP - INGRES ERROR ' + trim(char(:proc_no)) +
+        ' in apply_product_extra_changes ' +
+				' - ' + trim(char(:error_no)) + ' ' + :error_text;
+      MESSAGE :err_msg WITH STYLE = POPUP;
+			RETURN 1;
+    ENDIF;
+
+    RETURN 0;
+
+}
+
+PROCEDURE create_audit_rec(action=CHAR(1) NOT NULL,
+         fname  = VARCHAR(30) NOT NULL,
+         oldval = VARCHAR(40) ,
+         newval = VARCHAR(40) ) =
+DECLARE
+   ftype = VARCHAR(10)   NOT NULL;
+   v_source = CHAR(5)    NOT NULL;
+
+{
+  /* Old and New values are same, no need to create audit record */
+  IF ifnull(newval,'') = ifnull(oldval,'') THEN
+     RETURN 0;
+	ENDIF;
+
+  IF fname = 'to_price_trade' OR
+     fname = 'ref_ch3'        THEN
+	  ftype = 'CHAR'; 
+	ELSE
+	  ftype = 'FLOAT'; 
+  ENDIF;
+
+  IF (call_type != 'S')   /* Supplier Discount */
+  THEN
+      v_source = 'Promo'; 
+  ELSE
+      v_source = 'SuppD'; 
+  ENDIF;
+
+  INSERT INTO product_extra_audit
+      (product_code,
+       operative_date,
+       action,
+       change_date,
+       branch_id,
+       user_id,
+       field_name,
+       field_type,
+       old_value,
+       new_value,
+       source)
+  VALUES
+      (:product_code,
+       :curr_date,
+       :action,
+       DATE('NOW'),
+       :gv_branch_id,
+       :gv_user_id,
+       :fname,
+       :ftype,
+       ifnull(:oldval,''),
+       ifnull(:newval,''),
+       :v_source);
+
+  ret_code = CALLPROC check_ingres_error(proc_no = 200);
+
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  RETURN 0;
+}
+
+/**************************************************
+** Procedure to select current product_extra record
+***************************************************/
+
+PROCEDURE select_curr_pe_rec()=
+   
+{
+	pe_rec = SELECT *
+           FROM   product_extra
+	         WHERE  product_code    = :product_code
+	         AND    operative_date  in (SELECT MAX(operative_date)
+                                      FROM   product_extra
+                                      WHERE  product_code   =  :product_code
+	                                    AND    operative_date <= :pe_rec_date);
+
+	ret_code = CALLPROC check_ingres_error(proc_no = 300);
+
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  IF row_count != 1 THEN
+     err_msg = 'FEP - Current Product Extra Record not found.';
+     IIInt = callproc report_error(error_message = :err_msg);
+     MESSAGE :err_msg WITH STYLE = POPUP;
+     RETURN 1;
+  ENDIF;
+
+  RETURN 0;
+}
+
+/************************************
+** Procedure to insert product record
+*************************************/
+
+PROCEDURE insert_product_rec(op_date = DATE NOT NULL)=
+DECLARE
+		product_rec_exist = CHAR(1) NOT NULL;
+   
+{
+  product_rec_exist = 'N';
+
+  SELECT 'Y' as product_rec_exist
+  FROM   product
+	WHERE  product_code   = :product_code
+  AND    operative_date = :op_date;
+
+	ret_code = CALLPROC check_ingres_error(proc_no = 400);
+
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  IF row_count > 0 OR product_rec_exist = 'Y' THEN
+     RETURN 0;
+  ENDIF;
+	
+  INSERT INTO product
+	  (product_code,
+	   operative_date,
+	   supplier_code,
+	   supp_outer,
+	   points_value,
+	   min_order_qty,
+	   seas_start_mth,
+	   seas_end_mth,
+	   cat_freeze,
+	   man_order_mkr,
+	   price_list_excl,
+	   zero_rebate_mkr,
+	   order_within_chain,
+	   code_subst_mkr,
+	   addition_goods_mkr,
+	   pip_code,
+	   uni_code,
+	   replace_code,
+	   supp_item_code,
+	   product_seq,
+	   item_sequence,
+	   product_group,   
+	   min_issue_qty,
+	   max_issue_qty,
+	   sda_code,       
+	   pack_size,  
+	   company_mkr,
+	   rebate_level,
+	   vat_code,   
+	   report_group,
+	   prom_period,
+	   multi_order_mkr,
+	   shelf_life,
+	   rtn_bef_expiry,
+	   hosp_restric,
+	   legal_restric,
+	   drug_tariff,
+	   batch_no_reqd,
+	   umbrella_group,
+	   location_type,
+	   cd_type,
+	   discont_date,
+	   insertion_date,
+	   aah_trade_price,
+	   man_trade_price,
+	   invoice_cost_price,
+	   prom_cost_price,
+	   prom_end_date,
+	   sett_disc_cost,
+	   cost_disc_perc,
+	   retail_price,
+	   rpm_marker,
+	   date_trade_altered,
+	   double_discount_mkr,
+	   therapeutic_mkr1,
+	   therapeutic_mkr2,
+	   therapeutic_mkr3,
+	   fridge_supply,
+	   height,
+	   width,
+	   depth,
+	   special_size,
+	   description,
+	   desc_char_count,
+	   b_price,
+	   b_quantity,
+	   b_discount,
+	   c_price,
+	   c_quantity,
+	   c_discount,
+	   d_price,
+	   d_quantity,
+	   d_discount,
+	   e_price,
+	   e_quantity,
+	   e_discount,
+	   wsaler_price,
+	   wsaler_qualify_qty,
+	   wsaler_discount,
+	   hospital_price,
+	   hosp_b_price,
+	   hosp_b_quantity,
+	   hosp_c_price,
+	   hosp_c_quantity,
+	   hosp_d_price,
+	   hosp_d_quantity,
+	   hosp_e_price,
+	   hosp_e_quantity,
+	   mpm_1_price,
+	   mpm_1_qual_qty,
+	   mpm_1_retail_price,
+	   mpm_1_end_date,
+	   mpm_1_retail_mkr,
+	   mpm_2_price,
+	   mpm_2_qual_qty,
+	   mpm_2_retail_price,
+	   mpm_2_end_date,
+	   mpm_2_retail_mkr,
+	   ppl_price,
+	   ppl_qual_qty,
+	   ppl_retail,
+	   ppl_man_retail,
+	   ppl_man_price,
+	   ppl_man_qty,
+	   vr8_price,
+	   vr8_qual_qty,
+	   promo_vr8_price,
+	   promo_vr8_qual_qty,
+	   promo_vr8_end_date,
+	   vr9_price,
+	   vr9_qual_qty,
+	   vr9_end_date,
+	   prom_3_price,
+	   prom_3_qual_qty,
+	   prom_3_retail_price,
+	   prom_3_retail_mkr,
+	   prom_3_end_date,
+	   prom_4_price,
+	   prom_4_qual_qty,
+	   prom_4_retail_price,
+	   prom_4_retail_mkr,
+	   prom_4_end_date,
+	   trans_count,
+	   last_updated,
+	   user_id,
+	   branch_id)
+  SELECT product_code,
+	     :op_date,
+	     supplier_code,
+	     supp_outer,
+	     points_value,
+	     min_order_qty,
+	     seas_start_mth,
+	     seas_end_mth,
+	     cat_freeze,
+	     man_order_mkr,
+	     price_list_excl,
+	     zero_rebate_mkr,
+	     order_within_chain,
+	     code_subst_mkr,
+	     addition_goods_mkr,
+	     pip_code,
+	     uni_code,
+	     replace_code,
+	     supp_item_code,
+	     product_seq,
+	     item_sequence,
+	     product_group,     
+	     min_issue_qty,
+	     max_issue_qty,
+	     sda_code,         
+	     pack_size,
+	     company_mkr,
+	     rebate_level,
+	     vat_code,
+	     report_group,
+	     prom_period,
+	     multi_order_mkr,
+	     shelf_life,
+	     rtn_bef_expiry,
+	     hosp_restric,
+	     legal_restric,
+	     drug_tariff,
+	     batch_no_reqd,
+	     umbrella_group,
+	     location_type,
+	     cd_type,
+	     discont_date,
+	     insertion_date,
+	     aah_trade_price,
+	     man_trade_price,
+	     invoice_cost_price,
+	     prom_cost_price,
+	     prom_end_date,
+	     sett_disc_cost,
+	     cost_disc_perc,
+	     retail_price,
+	     rpm_marker,
+	     date_trade_altered,
+	     double_discount_mkr,
+	     therapeutic_mkr1,
+	     therapeutic_mkr2,
+	     therapeutic_mkr3,
+	     fridge_supply,
+	     height,
+	     width,
+	     depth,
+	     special_size,
+	     description,
+	     desc_char_count,
+	     b_price,
+	     b_quantity,
+	     b_discount,
+	     c_price,
+	     c_quantity,
+	     c_discount,
+	     d_price,
+	     d_quantity,
+	     d_discount,
+	     e_price,
+	     e_quantity,
+	     e_discount,
+	     wsaler_price,
+	     wsaler_qualify_qty,
+	     wsaler_discount,
+	     hospital_price,
+	     hosp_b_price,
+	     hosp_b_quantity,
+	     hosp_c_price,
+	     hosp_c_quantity,
+	     hosp_d_price,
+	     hosp_d_quantity,
+	     hosp_e_price,
+	     hosp_e_quantity,
+	     mpm_1_price,
+	     mpm_1_qual_qty,
+	     mpm_1_retail_price,
+	     mpm_1_end_date,
+	     mpm_1_retail_mkr,
+	     mpm_2_price,
+	     mpm_2_qual_qty,
+	     mpm_2_retail_price,
+	     mpm_2_end_date,
+	     mpm_2_retail_mkr,
+	     ppl_price,
+	     ppl_qual_qty,
+	     ppl_retail,
+	     ppl_man_retail,
+	     ppl_man_price,
+	     ppl_man_qty,
+	     vr8_price,
+	     vr8_qual_qty,
+	     promo_vr8_price,
+	     promo_vr8_qual_qty,
+	     promo_vr8_end_date,
+	     vr9_price,
+	     vr9_qual_qty,
+	     vr9_end_date,
+	     prom_3_price,
+	     prom_3_qual_qty,
+	     prom_3_retail_price,
+	     prom_3_retail_mkr,
+	     prom_3_end_date,
+	     prom_4_price,
+	     prom_4_qual_qty,
+	     prom_4_retail_price,
+	     prom_4_retail_mkr,
+	     prom_4_end_date,
+	     trans_count,
+	     DATE('NOW'),
+	     :gv_user_id,
+	     :gv_branch_id
+	FROM  product
+  WHERE product_code = :product_code
+	AND   operative_date = (SELECT MAX(operative_date)
+                          FROM   product
+                          WHERE  product_code = :product_code
+                          AND    operative_date <= :op_date);
+
+	ret_code = CALLPROC check_ingres_error(proc_no = 410);
+
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  RETURN 0;
+}
+
+PROCEDURE remove_discount()=
+{
+  pe_rec_cnt = 0;
+	pe_rec_array = SELECT *
+                 FROM   product_extra
+	               WHERE  product_code    = :product_code
+	               AND    operative_date  >= date('today')
+	               AND    operative_date  <= :end_date + '1 day'
+                 ORDER BY operative_date;
+
+	ret_code = CALLPROC check_ingres_error(proc_no = 510);
+
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  pe_rec_cnt = row_count;
+
+  IF pe_rec_cnt > 0 THEN
+    
+     /**** ret_code = CALLPROC open_isam(); *****/
+
+     loop_cnt = 1;
+
+     WHILE loop_cnt <= pe_rec_cnt DO
+
+        UPDATE product_extra
+        SET    transfer_muperc = 0,
+               to_price_trade  = ''
+	      WHERE  product_code    = :product_code
+	      AND    operative_date  = :pe_rec_array[loop_cnt].operative_date;
+
+	      ret_code = CALLPROC check_ingres_error(proc_no = 520);
+
+        IF ret_code != 0 THEN
+           RETURN 1;
+        ENDIF;
+
+        curr_date = :pe_rec_array[loop_cnt].operative_date;
+        ret_code = CALLPROC create_audit_rec(action='U',
+               fname='transfer_muperc',
+               oldval=varchar(:pe_rec_array[loop_cnt].transfer_muperc),
+               newval=varchar(float8(0)));
+
+        IF ret_code != 0 THEN
+           RETURN 1;
+        ENDIF;
+
+        ret_code = CALLPROC create_audit_rec(action='U',
+               fname='to_price_trade',
+               oldval=varchar(:pe_rec_array[loop_cnt].to_price_trade),
+               newval=varchar(' '));
+   
+        IF ret_code != 0 THEN
+           RETURN 1;
+        ENDIF;
+/*****************
+*        mcsres = CALLPROC mcs_product_out('U',
+*                   :product_code,
+*                   :pe_rec_array[loop_cnt].operative_date,
+*                   :gv_branch_id,
+*                   :gv_user_id);
+*
+*        IF mcsres != 0 THEN
+*           ROLLBACK;
+*           ret_code = CALLPROC close_isam();
+*           err_msg = 'FEP - Message control failure for Product Extra - ' +
+*               ' error code = ' + varchar(mcsres) + '.';
+*           IIInt = callproc report_error(error_message = :err_msg);
+*           MESSAGE :err_msg WITH STYLE = POPUP;
+*           RETURN 1;
+*        ENDIF;
+*******************/
+
+        loop_cnt = loop_cnt + 1;
+
+     ENDWHILE;
+  
+  ENDIF; /* IF pe_rec_cnt > 0 THEN */
+
+  /***** ret_code = CALLPROC close_isam(); *****/
+
+  RETURN 0;
+}
+
+PROCEDURE definalise_recs()=
+{
+
+  /* Check if record exist for the start date */
+
+  SELECT count(*) as pe_rec_cnt
+  FROM   product_extra
+  WHERE  product_code   = :product_code
+  AND    operative_date = :start_date;
+
+	ret_code = CALLPROC check_ingres_error(proc_no = 609);
+
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  IF pe_rec_cnt <= 0 THEN
+     /* Record doesn't exist, create one for start date */
+     /* and insert into product_extra & product         */
+
+	   ret_code = CALLPROC create_pe_rec(rec_type = 'S'); 
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+  ENDIF;
+
+  pe_rec_cnt = 0;
+	pe_rec_array = SELECT *
+                 FROM   product_extra
+	               WHERE  product_code    = :product_code
+	               AND    operative_date  >= :start_date
+	               AND    operative_date  <= :end_date 
+                 ORDER BY operative_date;
+
+	ret_code = CALLPROC check_ingres_error(proc_no = 610);
+
+  IF ret_code != 0 THEN
+     RETURN 1;
+  ENDIF;
+
+  pe_rec_cnt = row_count;
+
+  IF pe_rec_cnt > 0 THEN
+
+     ret_code = CALLPROC open_isam();
+     loop_cnt = 1;
+
+     WHILE loop_cnt <= pe_rec_cnt DO
+
+        IF price_changed = 'P' THEN
+
+           UPDATE product_extra
+           SET    ref_ch3 = 'N',
+                  promotional_price1 = 0
+	         WHERE  product_code    = :product_code
+	         AND    operative_date  = :pe_rec_array[loop_cnt].operative_date;
+
+	         ret_code = CALLPROC check_ingres_error(proc_no = 620);
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+           curr_date = :pe_rec_array[loop_cnt].operative_date;
+           ret_code = CALLPROC create_audit_rec(action='U',
+                 fname='ref_ch3',
+                 oldval=varchar(:pe_rec_array[loop_cnt].ref_ch3),
+                 newval='N');
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+           ret_code = CALLPROC create_audit_rec(action='U',
+                 fname='promotional_price1',
+                 oldval=varchar(:pe_rec_array[loop_cnt].promotional_price1),
+                 newval='0');
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+        ELSE /* price_changed = 'B' */
+
+           UPDATE product_extra
+           SET    ref_ch3 = 'N',
+                  ssp = 0,
+                  promotional_price1 = 0
+	         WHERE  product_code    = :product_code
+	         AND    operative_date  = :pe_rec_array[loop_cnt].operative_date;
+
+	         ret_code = CALLPROC check_ingres_error(proc_no = 630);
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+           curr_date = :pe_rec_array[loop_cnt].operative_date;
+           ret_code = CALLPROC create_audit_rec(action='U',
+                 fname='ref_ch3',
+                 oldval=varchar(:pe_rec_array[loop_cnt].ref_ch3),
+                 newval='N');
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+           ret_code = CALLPROC create_audit_rec(action='U',
+                 fname='ssp',
+                 oldval=varchar(:pe_rec_array[loop_cnt].ssp),
+                 newval='0');
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+           ret_code = CALLPROC create_audit_rec(action='U',
+                 fname='promotional_price1',
+                 oldval=varchar(:pe_rec_array[loop_cnt].promotional_price1),
+                 newval='0');
+
+           IF ret_code != 0 THEN
+              RETURN 1;
+           ENDIF;
+
+        ENDIF; /* IF price_changed = 'P' THEN */
+
+        mcsres = CALLPROC mcs_product_out('U',
+              :product_code,
+              :pe_rec_array[loop_cnt].operative_date,
+              :gv_branch_id,
+              :gv_user_id);
+
+        IF mcsres != 0 THEN
+           ROLLBACK;
+           err_msg = 'FEP - Message control failure for Product Extra - ' +
+                ' definalise - error code = ' + varchar(mcsres) + '.';
+           IIInt = callproc report_error(error_message = :err_msg);
+           MESSAGE :err_msg WITH STYLE = POPUP;
+           RETURN 1;
+        ENDIF;
+
+        loop_cnt = loop_cnt + 1;
+
+     ENDWHILE;
+
+  ENDIF; /* IF pe_rec_cnt > 0 THEN */
+
+  ret_code = CALLPROC close_isam();
+ 
+  RETURN 0;
+}

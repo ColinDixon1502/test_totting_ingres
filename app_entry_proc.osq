@@ -1,0 +1,127 @@
+/* A called application can use this entry procedure */
+/* to populate a set of global variables using rows */
+/* in a global temporary table (GTT), built by the calling app. */
+/* This preserves the 'state' of the application. */
+/* This procedure will then call a frame or procedure in the called */
+/* application, passing parameters if required. */
+/* The name of the procedure to call, along with details of any parameters */
+/* should also be in the GTT: session.abf_app_variables */
+
+procedure app_entry_proc()=
+
+declare startingpoint = varchar(50) not null,
+        startingtype = varchar(15) not null,
+        varname = varchar(30),
+        value = varchar(100),
+        vartype = varchar(15),
+        isglobal = char(6),
+        errno = integer,
+        errtext = varchar(150),
+        elogtext = varchar(250),
+        complexcall = integer,
+        retval = integer
+
+begin
+  /* message 'test: app entry proc' with style=popup; */
+  startingpoint='';
+  startingtype='';
+  complexcall=0;
+  select varname as :varname, value as :value, vartype as :vartype, 
+    isglobal as :isglobal
+  from session.abf_app_variables
+  begin
+    if isglobal = 'start'
+    then
+      if vartype='appstartname'
+      then
+        startingpoint=ifnull(:value,'');
+      elseif vartype='appstarttype'
+      then
+        startingtype=ifnull(:value,'');
+      endif;
+    elseif isglobal='global'
+    then
+      elogtext='Calling setglobal '+trim(:varname)+'='+trim(:value);
+      callproc errorlog(elogtext,'AppE');
+      callproc setglobal(varname,value,vartype);
+    elseif isglobal like 'par%'
+    then
+      complexcall=1;
+    endif;
+  end;
+  inquire_ingres(errno=errorno,errtext=errortext);
+  if errno !=0
+  then
+    rollback;
+    elogtext='Error '+trim(char(:errno))
+      +'selecting from GTT in app_entry_proc: '+trim(:errtext);
+    callproc popup_message(message=:elogtext,elog='Y');
+    drop table session.abf_app_variables;
+    commit;
+    return 1;
+  endif;
+  if complexcall=0
+  then
+    drop table session.abf_app_variables;
+    commit;
+  endif;
+  if startingpoint='' or startingtype=''
+  then
+    elogtext='Unknown start: Module='+trim(:startingpoint)
+      +' Type='+trim(:startingtype);
+    callproc errorlog(elogtext,'AppE');
+    return 1;
+  endif;
+
+  /* Call the frame/procedure. */
+  /* Assume (for now at least) that we will only be starting an app at */
+  /* either a frame or a procedure, and we're not expecting the frame/proc */
+  /* to return a value - we'll just return back to the calling app. */
+  /* gv_calledapp must be a non-nullable global variable. */
+  /* main_menu_doesn't allow F12 to be used to return from the top level */
+  /* menu. If an app calls a second app with main_menu as starting point, */
+  /* we want to allow F12 to return. We can test this gv to override the */
+  /* default behaviour. (Change reqd to main_menu.osq to support this). */
+  gv_calledapp=1;
+  if uppercase(startingtype)='FRAME'
+  then
+    if complexcall=0
+    then
+      callframe :startingpoint;
+    else
+      elogtext=ifnull(:gv_branch_id,'')+' '+ifnull(:gv_user_id,'')
+        +' Reading parameters from GTT to pass to frame '
+        +trim(:startingpoint);
+      callproc errorlog(elogtext,'AppE');
+      retval=callproc callprocwithparam('frame',:startingpoint);
+      drop table session.abf_app_variables;
+      commit;
+      return retval;
+    endif;
+  elseif uppercase(startingtype)='PROC' 
+  or uppercase(startingtype)='PROCEDURE' 
+  then
+    if complexcall=0
+    then
+      callproc :startingpoint;
+    else
+      elogtext=ifnull(:gv_branch_id,'')+' '+ifnull(:gv_user_id,'')
+        +' Reading parameters from GTT to pass to procedure '
+        +trim(:startingpoint);
+      callproc errorlog(elogtext,'AppE');
+      retval=callproc callprocwithparam('proc',:startingpoint);
+      drop table session.abf_app_variables;
+      commit;
+      return retval;
+    endif;
+  else
+    /* Unknown starting type. */
+    elogtext=ifnull(:gv_branch_id,'')+' '+ifnull(:gv_user_id,'')
+      +' Unknown starting type: '+trim(:startingtype);
+    callproc errorlog(elogtext,'AppE');
+    drop table session.abf_app_variables;
+    return 1;
+  endif;
+  
+  return 0;
+end;

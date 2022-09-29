@@ -1,0 +1,31 @@
+/******************************************************************************
+*  1.1     | 05/02/98 | PTC   | Added 'timeout' Code 
+*******************************************************************************/
+initialize()=
+declare validres = integer
+
+begin
+    set_forms frs (timeout = :gc_timeout);
+end;
+
+after field branch_id=
+begin
+    validres = callproc val_branch(:branch_id);
+    if validres != 0
+    then
+	message 'Invalid branch ID.' with style = popup;
+	resume;
+    endif;
+    return 0;
+end;
+
+'End', key frskey3=
+begin
+    branch_id = '';
+    return -1;
+end;
+
+on timeout =
+{
+callframe timeout_popup();
+}

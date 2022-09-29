@@ -1,0 +1,1049 @@
+/**********************************************************
+*  Frame   - asn_load_events_remtp - To load events from  
+*            a file received from remtp and create event
+*            records in asn_event table.  
+*
+*  Type    - PROCEDURE
+*
+*  Author  - Irfan Salim
+*
+*  Date    - 02/02/2010
+*
+*  Parameters IN - event file name
+*
+*  Return Value - 0 Success
+*                 1 Failure / Ingres Error
+*
+**********************************************************
+* Ver |Date    |Coded|Description
+******|********|*****|************************************
+* 1.0 |02/02/10| IS  |Original Code
+*-----|--------|-----|------------------------------------
+* 1.1 |13/12/11| BB  |Reduce number of messages logged in 
+*     |        |     |the log file.
+**********************************************************/
+
+PROCEDURE asn_load_events_remtp(
+)=
+
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+DECLARE 
+    IIerrorno        = INTEGER(4)   NOT NULL WITH DEFAULT,
+    IIrowcount       = INTEGER(4)   NOT NULL WITH DEFAULT,
+    IIerrortext      = VARCHAR(256) NOT NULL WITH DEFAULT,
+
+/*******************************************************
+** PROCEDURE SPECIFIC VARIABLES
+*******************************************************/
+
+    logmess          = VARCHAR(500),
+    batch_online     = CHAR(1)     NOT NULL,
+    ret_code         = INTEGER(1)  NOT NULL WITH DEFAULT,
+    tot_rows_event   = INTEGER(4)  NOT NULL WITH DEFAULT,
+    loop_cnt         = INTEGER(4)  NOT NULL WITH DEFAULT,
+    tot_rows_summary = INTEGER(4)  NOT NULL WITH DEFAULT,
+    tot_rows_order   = INTEGER(4)  NOT NULL WITH DEFAULT,
+    string_length    = INTEGER(1)  NOT NULL WITH DEFAULT,
+    char_val_curr    = CHAR(1)     NOT NULL WITH DEFAULT,
+    char_cnt_curr    = INTEGER(1)  NOT NULL WITH DEFAULT, 
+    store_no         = VARCHAR(12) NOT NULL WITH DEFAULT,
+    store_number     = VARCHAR(12) NOT NULL WITH DEFAULT,
+    cust_group       = INTEGER(4)  NOT NULL WITH DEFAULT,
+    udi_name         = VARCHAR(24) NOT NULL WITH DEFAULT,
+    mess_flag        = INTEGER(4)  NOT NULL WITH DEFAULT,
+ 
+    event_file       = VARCHAR(128) NOT NULL WITH DEFAULT,
+    param_string     = VARCHAR(100) NOT NULL WITH DEFAULT,
+    system_cmd       = VARCHAR(700) NOT NULL WITH DEFAULT;
+
+    staging_array    = ARRAY OF TYPE OF TABLE tmp_remtp_event_staging;
+    summary_array    = ARRAY OF TYPE OF TABLE asn_summary_header;
+    order_array      = ARRAY OF TYPE OF TABLE asn_order_header;
+
+/*******************************************************
+** LOCAL PROCEDURES
+*******************************************************/
+
+    create_error_file      = PROCEDURE,
+    copy_staging_records   = PROCEDURE RETURNING INTEGER NOT NULL,
+    update_staging_records = PROCEDURE RETURNING INTEGER NOT NULL,
+    load_staging_array     = PROCEDURE RETURNING INTEGER NOT NULL,
+    create_summary_records = PROCEDURE RETURNING INTEGER NOT NULL,
+    create_order_records   = PROCEDURE RETURNING INTEGER NOT NULL,
+    create_event_records   = PROCEDURE RETURNING INTEGER NOT NULL,
+    write_message          = PROCEDURE RETURNING NONE;
+
+/*******************************************************
+** MAIN 
+*******************************************************/
+{
+   batch_online = 'B'; /* 'O'nline or 'B'atch depending       */
+                       /* where messages to be reported       */
+
+   mess_flag = 1; /* 1: Show debugging popups */
+                  /* 0: Don't show debugging popups */
+
+   param_string = callproc CommandLineParameters();
+
+   event_file = squeeze(param_string);
+
+   IF ifnull(event_file,'') = ''
+   THEN
+      MESSAGE 'Error : Event file name Parameter not Passed ... ' ;
+      CALLPROC create_error_file(); 
+      RETURN gc_fail;
+   ENDIF;
+
+   ret_code = CALLPROC copy_staging_records();
+   IF ret_code != 0 THEN
+      RETURN 1;
+   ENDIF;
+
+   ret_code = CALLPROC update_staging_records();
+   IF ret_code != 0 THEN
+      RETURN 1;
+   ENDIF;
+
+   ret_code = CALLPROC load_staging_array();
+   IF ret_code != 0 THEN
+      RETURN 1;
+   ENDIF;
+
+   logmess = 'TOTAL EVENTS IN FILE: ' + varchar(:tot_rows_event);
+   callproc write_message();
+
+   loop_cnt = 1;
+
+   WHILE loop_cnt <= tot_rows_event
+   DO
+     logmess = '';
+     IF batch_online = 'B' THEN
+       MESSAGE varchar(:logmess);
+     ENDIF;
+
+     logmess = 'ASN Event ' + varchar(:loop_cnt) + ': '
+      + squeeze(:staging_array[:loop_cnt].asn_event_code);
+     callproc write_message();
+
+     ret_code = CALLPROC create_summary_records();
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+     ret_code = CALLPROC create_order_records();
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+
+     ret_code = CALLPROC create_event_records();
+     IF ret_code != 0 THEN
+        RETURN 1;
+     ENDIF;
+/*********
+*    logmess = '';
+*    IF batch_online = 'B' THEN
+*      MESSAGE varchar(:logmess);
+*    ENDIF;
+*********/
+     loop_cnt = loop_cnt + 1;
+
+   ENDWHILE;
+}
+
+
+PROCEDURE copy_staging_records() =
+{
+   ret_code = 0;
+
+   SELECT ret_code = count(*) 
+   FROM   iitables
+   WHERE  table_type = 'T'
+   AND    table_name = 'tmp_remtp_event_staging';
+
+   INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+   IF (IIerrorno != 0) THEN
+      ROLLBACK;
+      MESSAGE 'Error Selecting from iitables ' + :IIerrortext;
+      CALLPROC create_error_file();
+      RETURN 1;
+   ENDIF;
+
+   IF ret_code > 0 THEN
+
+     MODIFY tmp_remtp_event_staging to truncated;
+
+     INQUIRE_INGRES (IIerrorno = ERRORNO, 
+           IIerrortext = ERRORTEXT, 
+           IIrowcount = ROWCOUNT);
+
+     IF (IIerrorno != 0) THEN
+        ROLLBACK;
+        MESSAGE 'Error truncating staging table ' + :IIerrortext;
+        CALLPROC create_error_file();
+        RETURN 1;
+     ENDIF;
+
+   ELSE
+
+     CREATE TABLE tmp_remtp_event_staging (
+        asn_event_code         char(3),
+        asn_event_type         char(1),
+        event_dt               char(14),
+        event_date_time        date,
+        account_branch         char(4),
+        account_number         char(9),
+        cust_order             char(17),
+        order_dt               char(12),
+        order_date_time        date,
+        print_branch           char(4),
+        picknote               integer4    not null,
+        invoice                integer4    not null,
+        invoice_dt             char(14),
+        invoice_date_time      date,
+        trunker_number         integer2    not null,
+        trunker_day            integer1    not null,
+        van_number             integer2    not null,
+        van_day                integer1    not null,
+        asn_status             integer1    not null,
+        est_del_d              char(8),
+        est_del_date           date,
+        txn_method             char(1)     not null default '',
+        remtp_file_generation  integer4    not null default 0);
+
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error creating staging table ' + :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+   ENDIF;
+
+   COPY TABLE tmp_remtp_event_staging
+      (asn_event_code          = c0comma,
+       asn_event_type          = c0comma,
+       event_dt                = c0comma,
+       account_branch          = c0comma,
+       account_number          = c0comma,
+       cust_order              = c0comma,
+       order_dt                = c0comma,
+       print_branch            = c0comma,
+       picknote                = c0comma,
+       invoice                 = c0comma,
+       invoice_dt              = c0comma,
+       trunker_number          = c0comma,
+       trunker_day             = c0comma,
+       van_number              = c0comma,
+       van_day                 = c0comma,
+       asn_status              = c0comma,
+       est_del_d               = c0comma,
+       txn_method              = c0comma,
+       remtp_file_generation   = c0nl)
+   from :event_file
+   with on_error = TERMINATE;
+
+   INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+   IF (IIerrorno != 0) THEN
+      ROLLBACK;
+      MESSAGE 'Error populating staging table ' + :IIerrortext;
+      CALLPROC create_error_file();
+      RETURN 1;
+   ENDIF;
+}
+
+
+PROCEDURE update_staging_records() =
+{
+   update  tmp_remtp_event_staging
+   set     event_date_time = (
+      LEFT(RIGHT(event_dt, 8), 2) + '/'
+    + LEFT(RIGHT(event_dt, 10), 2) + '/'
+    + LEFT(event_dt, 4) + ' '
+    + LEFT(RIGHT(event_dt, 6), 2) + ':'
+    + LEFT(RIGHT(event_dt, 4), 2) + ':'
+    + RIGHT(event_dt, 2))
+   where   event_dt is not null
+   and     event_dt != '';
+
+   INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+   IF (IIerrorno != 0) THEN
+      ROLLBACK;
+      MESSAGE 'Error updating staging table for event_date_time' + :IIerrortext;
+      CALLPROC create_error_file();
+      RETURN 1;
+   ENDIF;
+
+
+   update  tmp_remtp_event_staging
+   set     order_date_time = (
+      SQUEEZE(LEFT(RIGHT(order_dt, 6), 2)) + '/'
+    + SQUEEZE(LEFT(RIGHT(order_dt, 8), 2)) + '/'
+    + SQUEEZE(LEFT(order_dt, 4)) + ' '
+    + SQUEEZE(LEFT(RIGHT(order_dt, 4), 2)) + ':'
+    + SQUEEZE(RIGHT(order_dt, 2)))
+   where   order_dt is not null
+   and     order_dt != '';
+
+   INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+   IF (IIerrorno != 0) THEN
+      ROLLBACK;
+      MESSAGE 'Error updating staging table for order_date_time' + :IIerrortext;
+      CALLPROC create_error_file();
+      RETURN 1;
+   ENDIF;
+
+
+   update  tmp_remtp_event_staging
+   set     invoice_date_time = (
+        LEFT(RIGHT(invoice_dt, 8), 2) + '/'
+      + LEFT(RIGHT(invoice_dt, 10), 2) + '/'
+      + LEFT(invoice_dt, 4) + ' '
+      + LEFT(RIGHT(invoice_dt, 6), 2) + ':'
+      + LEFT(RIGHT(invoice_dt, 4), 2) + ':'
+      + RIGHT(invoice_dt, 2))
+   where   invoice_dt is not null
+   and     invoice_dt != '';
+
+   INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+   IF (IIerrorno != 0) THEN
+      ROLLBACK;
+      MESSAGE 'Error updating staging table for invoice_date_time' + :IIerrortext;
+      CALLPROC create_error_file();
+      RETURN 1;
+   ENDIF;
+
+
+   update  tmp_remtp_event_staging
+   set     est_del_date      = (
+       RIGHT(est_del_d, 2) + '/'
+      + LEFT(RIGHT(est_del_d, 4), 2) + '/'
+      + LEFT(est_del_d, 4))
+   where   est_del_d is not null;
+
+
+   INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+   IF (IIerrorno != 0) THEN
+      ROLLBACK;
+      MESSAGE 'Error updating staging table for est_del_date' + :IIerrortext;
+      CALLPROC create_error_file();
+      RETURN 1;
+   ENDIF;
+}
+
+
+PROCEDURE load_staging_array() =
+{
+   /* Clear arrays */
+   ret_code = CALLPROC ARRAYCLEAR(staging_array); 
+   ret_code = CALLPROC ARRAYCLEAR(summary_array); 
+   ret_code = CALLPROC ARRAYCLEAR(order_array); 
+
+   staging_array = SELECT * 
+                     FROM tmp_remtp_event_staging
+                    WHERE asn_event_code NOT IN ('RIT', 'RIX')
+                 ORDER BY event_date_time;
+
+   INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+   IF (IIerrorno != 0) THEN
+      ROLLBACK;
+      MESSAGE 'Error reading from staging table ' + :IIerrortext;
+      CALLPROC create_error_file();
+      RETURN 1;
+   ENDIF;
+
+   IF IIrowcount <= 0 THEN
+      MESSAGE 'No record found ... ' ;
+      RETURN 0;
+   ELSE
+      tot_rows_event = IIrowcount;
+   ENDIF;
+}
+
+
+PROCEDURE create_summary_records() =
+{
+  /* Insert summary_header record */
+   summary_array = 
+     SELECT * 
+       FROM asn_summary_header
+      WHERE account_branch  = squeeze(:staging_array[:loop_cnt].account_branch)
+        AND account_number  = squeeze(:staging_array[:loop_cnt].account_number)
+        AND picknote  = squeeze(:staging_array[:loop_cnt].picknote)
+        AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+
+   INQUIRE_INGRES (IIerrorno = ERRORNO, 
+          IIerrortext = ERRORTEXT, 
+          IIrowcount = ROWCOUNT);
+
+   IF (IIerrorno != 0) THEN
+      ROLLBACK;
+      MESSAGE 'Error reading from asn summary header table ' + :IIerrortext;
+      CALLPROC create_error_file();
+      RETURN 1;
+   ENDIF;
+
+   tot_rows_summary = IIrowcount; 
+
+   IF tot_rows_summary = 0 THEN
+
+    logmess = 'asn_summary_header [Insert] '
+     + X'0A' +'account_branch: ' 
+     + squeeze(:staging_array[:loop_cnt].account_branch)
+     +' account_number: ' 
+     + squeeze(:staging_array[:loop_cnt].account_number)
+     +' cust_order: ' 
+     + ifnull(squeeze(varchar(:staging_array[:loop_cnt].cust_order)),'')
+/*****
+*     + X'0A' +'order_date_time: ' 
+*     + squeeze(varchar(:staging_array[:loop_cnt].order_date_time))
+*     + X'0A' +'print_branch: ' 
+*     + ifnull(squeeze(:staging_array[:loop_cnt].print_branch),'') 
+*****/
+     + X'0A' +'picknote: ' + squeeze(vchar(:staging_array[:loop_cnt].picknote))
+     + ' invoice: ' + squeeze(vchar(:staging_array[:loop_cnt].invoice))
+/*****
+*    + X'0A' +'invoice_date_time: ' 
+*    + ifnull(squeeze(vchar(:staging_array[:loop_cnt].invoice_date_time)),'')
+*    + X'0A' +'trunker_number: ' 
+*    + ifnull(squeeze(vchar(:staging_array[:loop_cnt].trunker_number)),'')
+*    + X'0A' +'trunker_day: ' 
+*    + ifnull(squeeze(vchar(:staging_array[:loop_cnt].trunker_day)),'')
+*    + X'0A' + 'van_number: ' 
+*    + squeeze(vchar(:staging_array[:loop_cnt].van_number))
+*    + X'0A' + 'van_day: ' 
+*    + ifnull(squeeze(vchar(:staging_array[:loop_cnt].van_day)),'')
+*    + X'0A' + 'est_del_date: ' 
+*    + ifnull(squeeze(varchar(:staging_array[:loop_cnt].est_del_date)),'')
+*****/
+     + ' asn_status: ' 
+     + squeeze(vchar(:staging_array[:loop_cnt].asn_status))
+     + ' txn_method: ' 
+     + ifnull(squeeze(vchar(:staging_array[:loop_cnt].txn_method)),'')
+     + ' remtp_file_generation: ' + 
+     ifnull(squeeze(vchar(:staging_array[:loop_cnt].remtp_file_generation)),'');
+    callproc write_message();
+
+     INSERT INTO asn_summary_header (
+           account_branch,
+           account_number,
+           cust_order,
+           order_date_time,
+           print_branch,
+           picknote,
+           invoice,
+           invoice_date_time,
+           trunker_number,
+           trunker_day,
+           van_number,
+           van_day,
+           est_del_date,
+           asn_status,
+           txn_method,
+           remtp_file_generation,
+           ingres_asn_batch,
+           asn_file_generation,
+           asn_reims_reference)
+     VALUES
+       (
+          :staging_array[:loop_cnt].account_branch,
+          :staging_array[:loop_cnt].account_number,
+          ifnull(:staging_array[:loop_cnt].cust_order,''),
+          :staging_array[:loop_cnt].order_date_time,
+          ifnull(:staging_array[:loop_cnt].print_branch,''),
+          :staging_array[:loop_cnt].picknote,
+          :staging_array[:loop_cnt].invoice,
+          ifnull(:staging_array[:loop_cnt].invoice_date_time,''),
+          :staging_array[:loop_cnt].trunker_number,
+          :staging_array[:loop_cnt].trunker_day,
+          :staging_array[:loop_cnt].van_number,
+          :staging_array[:loop_cnt].van_day,
+          ifnull(:staging_array[:loop_cnt].est_del_date,''),
+          :staging_array[:loop_cnt].asn_status,
+          :staging_array[:loop_cnt].txn_method,
+          :staging_array[:loop_cnt].remtp_file_generation,
+          '', /* ingres_asn_batch */
+          0,  /* asn_file_generation */
+          ''  /* asn_reims_reference */
+          );
+      
+   ELSE
+
+     /* Update summary_header record */
+      logmess = 'asn_summary_header [Update] '
+       + X'0A' +'order_date_time: '
+       + squeeze(varchar(:staging_array[:loop_cnt].order_date_time))
+/*******
+*       + X'0A' +'event_date_time: ' 
+*       + squeeze(varchar(:staging_array[:loop_cnt].event_date_time))
+******/
+       + X'0A' +'account_branch: ' 
+       + squeeze(:staging_array[:loop_cnt].account_branch)
+       + ' account_number: ' 
+       + squeeze(:staging_array[:loop_cnt].account_number)
+       + ' picknote: ' 
+       + squeeze(vchar(:staging_array[:loop_cnt].picknote))
+
+       /* fields to update */
+       + ' invoice: ' + squeeze(vchar(:staging_array[:loop_cnt].invoice));
+/*******
+*       + X'0A' +'invoice_date_time: ' 
+*       + ifnull(squeeze(vchar(:staging_array[:loop_cnt].invoice_date_time)),'')
+*       + X'0A' +'trunker_number: ' 
+*       + squeeze(vchar(:staging_array[:loop_cnt].trunker_number))
+*       + X'0A' +'trunker_day: ' 
+*       + squeeze(vchar(:staging_array[:loop_cnt].trunker_day))
+*       + X'0A' +'van_number: ' 
+*       + squeeze(vchar(:staging_array[:loop_cnt].van_number))
+*       + X'0A' +'van_day: ' + squeeze(vchar(:staging_array[:loop_cnt].van_day))
+*       + X'0A' +'est_del_date: ' 
+*       + ifnull(squeeze(varchar(:staging_array[:loop_cnt].est_del_date)),'')
+*       + X'0A' +'asn_status: ' 
+*       + squeeze(vchar(:staging_array[:loop_cnt].asn_status))
+*       + X'0A' +'txn_method: ' 
+*       + squeeze(vchar(:staging_array[:loop_cnt].txn_method))
+*       + X'0A' +'remtp_file_generation: ' 
+*       + squeeze(vchar(:staging_array[:loop_cnt].remtp_file_generation));
+******/
+      callproc write_message();
+
+       /* Update invoice if not zero */
+       IF (:staging_array[:loop_cnt].invoice) != 0 THEN
+        UPDATE asn_summary_header
+           SET invoice = (:staging_array[:loop_cnt].invoice)
+         WHERE account_branch = (:staging_array[:loop_cnt].account_branch)
+           AND account_number = (:staging_array[:loop_cnt].account_number)
+           AND picknote = (:staging_array[:loop_cnt].picknote)
+           AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+
+         /*** logmess = 'Updated invoice';
+         callproc write_message(); ***/
+       ENDIF;
+
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error updating asn summary header table '
+           + 'invoice ' + :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+       /* Update txn_method if not null or blank */
+       
+       IF ((:staging_array[:loop_cnt].txn_method) != ''
+       AND (:staging_array[:loop_cnt].txn_method) IS NOT NULL)
+       THEN 
+         UPDATE asn_summary_header
+            SET txn_method=:staging_array[:loop_cnt].txn_method
+          WHERE account_branch = (:staging_array[:loop_cnt].account_branch)
+            AND account_number = (:staging_array[:loop_cnt].account_number)
+            AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+ 
+          /*** logmess = 'Updated txn_method';
+          callproc write_message(); ***/
+       ENDIF;
+
+       /* Update invoice_date_time if not null */
+       IF (:staging_array[:loop_cnt].invoice_date_time) IS NOT NULL THEN
+        UPDATE asn_summary_header
+           SET invoice_date_time = (:staging_array[:loop_cnt].invoice_date_time)
+         WHERE account_branch = (:staging_array[:loop_cnt].account_branch)
+           AND account_number = (:staging_array[:loop_cnt].account_number)
+           AND picknote = (:staging_array[:loop_cnt].picknote)
+           AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+
+         /*** logmess = 'Updated invoice_date_time';
+         callproc write_message(); ***/
+       ENDIF;
+
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error updating asn summary header table '
+           + 'invoice_date_time ' + :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+       /* Update trunker_number if not zero */
+       IF (:staging_array[:loop_cnt].trunker_number) != 0 THEN
+        UPDATE asn_summary_header
+           SET trunker_number  = (:staging_array[:loop_cnt].trunker_number)
+         WHERE account_branch = (:staging_array[:loop_cnt].account_branch)
+           AND account_number = (:staging_array[:loop_cnt].account_number)
+           AND picknote = (:staging_array[:loop_cnt].picknote)
+           AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+
+         /*** logmess = 'Updated trunker_number';
+         callproc write_message(); ***/
+       ENDIF;
+  
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error updating asn summary header table ' 
+            + 'trunker_number ' + :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+       /* Update trunker_day if not zero */ 
+       IF (:staging_array[:loop_cnt].trunker_day) != 0 THEN 
+        UPDATE asn_summary_header
+           SET trunker_day = (:staging_array[:loop_cnt].trunker_day)
+         WHERE account_branch = (:staging_array[:loop_cnt].account_branch)
+           AND account_number = (:staging_array[:loop_cnt].account_number)
+           AND picknote = (:staging_array[:loop_cnt].picknote)
+           AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+
+         /*** logmess = 'Updated trunker_day';
+         callproc write_message(); ***/
+       ENDIF;
+
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error updating asn summary header table ' 
+           + 'trunker_day ' + :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+       /* Update van_number if not zero */
+       IF (:staging_array[:loop_cnt].van_number) != 0 THEN
+        UPDATE asn_summary_header
+           SET van_number = (:staging_array[:loop_cnt].van_number)
+         WHERE account_branch = (:staging_array[:loop_cnt].account_branch)
+           AND account_number = (:staging_array[:loop_cnt].account_number)
+           AND picknote = (:staging_array[:loop_cnt].picknote)
+           AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+
+         /*** logmess = 'Updated van_number';
+         callproc write_message(); ***/
+       ENDIF;
+
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error updating asn summary header table '
+           + 'van_number ' + :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+       /* Update van_day if not zero */ 
+       IF (:staging_array[:loop_cnt].van_day) != 0 THEN
+        UPDATE asn_summary_header
+           SET van_day = (:staging_array[:loop_cnt].van_day)
+         WHERE account_branch = (:staging_array[:loop_cnt].account_branch)
+           AND account_number = (:staging_array[:loop_cnt].account_number)
+           AND picknote = (:staging_array[:loop_cnt].picknote)
+           AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+
+         /*** logmess = 'Updated van_day';
+         callproc write_message(); ***/
+       ENDIF;
+
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error updating asn summary header table ' 
+           + 'van_day ' + :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+       /* Update est_del_date if not null */
+       IF (:staging_array[:loop_cnt].est_del_date) IS NOT NULL THEN
+        UPDATE asn_summary_header
+           SET est_del_date = (:staging_array[:loop_cnt].est_del_date)
+         WHERE account_branch = (:staging_array[:loop_cnt].account_branch)
+           AND account_number = (:staging_array[:loop_cnt].account_number)
+           AND picknote = (:staging_array[:loop_cnt].picknote)
+           AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+
+         /*** logmess = 'Updated est_del_date';
+         callproc write_message(); ***/
+       ENDIF;
+
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error updating asn summary header table '
+           + 'est_del_date ' + :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+       /* Update asn_status if not zero */
+       IF (:staging_array[:loop_cnt].asn_status) != 0 THEN
+        UPDATE asn_summary_header
+           SET asn_status = (:staging_array[:loop_cnt].asn_status)
+         WHERE account_branch = (:staging_array[:loop_cnt].account_branch)
+           AND account_number = (:staging_array[:loop_cnt].account_number)
+           AND picknote = (:staging_array[:loop_cnt].picknote)
+           AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+
+         /*** logmess = 'Updated asn_status';
+         callproc write_message(); ***/
+       ENDIF;
+
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error updating asn summary header table ' 
+           + 'asn_status ' + :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+       /* Update remtp_file_generation if not zero */
+       IF (:staging_array[:loop_cnt].remtp_file_generation) != 0 THEN 
+        UPDATE asn_summary_header
+           SET remtp_file_generation=:staging_array[:loop_cnt].remtp_file_generation
+         WHERE account_branch = (:staging_array[:loop_cnt].account_branch)
+           AND account_number = (:staging_array[:loop_cnt].account_number)
+           AND picknote = (:staging_array[:loop_cnt].picknote)
+           AND order_date_time = (:staging_array[:loop_cnt].order_date_time);
+
+         /*** logmess = 'Updated remtp_file_generation';
+         callproc write_message(); ***/
+       ENDIF;
+
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error updating asn summary header table '
+           + 'remtp_file_generation ' + :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+   ENDIF;
+
+   COMMIT;
+
+   RETURN gc_success;
+};
+
+
+PROCEDURE create_order_records() =
+{
+  order_array = 
+   SELECT * 
+     FROM asn_order_header
+    WHERE account_branch       = :staging_array[:loop_cnt].account_branch
+      AND account_number       = :staging_array[:loop_cnt].account_number
+      AND ifnull(cust_order,'')= ifnull(:staging_array[:loop_cnt].cust_order,'')
+       AND order_date_time      = :staging_array[:loop_cnt].order_date_time;
+
+  INQUIRE_INGRES (IIerrorno = ERRORNO, 
+         IIerrortext = ERRORTEXT, 
+         IIrowcount = ROWCOUNT);
+
+  IF (IIerrorno != 0) THEN
+     ROLLBACK;
+     MESSAGE 'Error reading from asn order header table ' + :IIerrortext;
+     CALLPROC create_error_file();
+     RETURN 1;
+  ENDIF;
+
+  tot_rows_order = IIrowcount; 
+
+  IF tot_rows_order = 0 THEN
+
+    logmess = 'asn_order_header [Insert] '
+      + X'0A' + 'account_branch: ' 
+      + squeeze(:staging_array[:loop_cnt].account_branch)
+      + ' account_number: ' 
+      + squeeze(:staging_array[:loop_cnt].account_number)
+      + ' cust_order: ' 
+      + ifnull(squeeze(varchar(:staging_array[:loop_cnt].cust_order)),'');
+/********
+*     + ' order_date_time: ' 
+*     + squeeze(varchar(:staging_array[:loop_cnt].order_date_time));
+********/
+    callproc write_message();
+ 
+      INSERT INTO asn_order_header (
+           account_branch,
+           account_number,
+           cust_order,
+           order_date_time,
+           customer_group,
+           udi_name,
+           store_number,
+           edi_file_generation,
+           edi_reims_reference)
+      VALUES
+        (
+          :staging_array[:loop_cnt].account_branch,
+          :staging_array[:loop_cnt].account_number,
+          ifnull(:staging_array[:loop_cnt].cust_order,''),
+          :staging_array[:loop_cnt].order_date_time,
+          0,
+          '',
+          '',
+          0,
+          ''
+        );
+
+    /* Extract store no from udi_name using following rules:      */
+    /* Use number between opening and closing bracket if brackets */
+    /* exist. If not or blank or does not have a valid number     */
+    /* then write appropriate message to database record.         */
+    /* First character can be alpha, the rest must be numeric.    */
+
+     SELECT left(shift(udi_name,-1*(locate(udi_name,'('))),
+            locate(shift(udi_name,-1*(locate(udi_name,'('))),')')-1) as store_no 
+       FROM sales_accts
+      WHERE branch = (:staging_array[:loop_cnt].account_branch)
+        AND account_no = (:staging_array[:loop_cnt].account_number);
+
+     INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+     IF (IIerrorno != 0) THEN
+        ROLLBACK;
+        MESSAGE 'Error selecting udi_name ' + :IIerrortext;
+        CALLPROC create_error_file();
+        RETURN 1;
+     ENDIF;
+
+    /******************** Store No Validation ************************ 
+       1.Reject string if there are illegal characters                    
+       2.Reject if string length = 0
+       3.Accept if string length = 1 and is a numeric
+       4.Reject if string length > 1 there are is no numeric data
+
+        REJECT - Write 'NOT IN DB' to database
+        ACCEPT - Write the DB record to database
+    ********************* Store No Validation ***********************/       
+
+     store_no = SQUEEZE(:store_no); 
+
+     string_length = length(trim(store_no));
+     char_cnt_curr = 1;
+     
+    /** Step through string validating each character **/         
+
+     WHILE char_cnt_curr <= string_length
+     DO
+       char_val_curr = CHAREXTRACT(UPPERCASE(store_no),char_cnt_curr);
+
+       /*
+         MESSAGE 'pos=' + varchar(:char_cnt_curr) +
+                 ' char=' + varchar(:char_val_curr) WITH STYLE=POPUP;
+       */
+
+         IF char_val_curr < ASCII('0') OR char_val_curr > ASCII('9') THEN
+           IF char_val_curr < ASCII('A') OR char_val_curr > ASCII('Z') THEN
+             /* Checking from char 2 to end */
+             IF char_cnt_curr > 1 AND
+                char_val_curr > ASCII('A') OR char_val_curr < ASCII('Z') THEN
+                store_no = 'NOT ON DB';
+                ENDLOOP;
+             ENDIF;
+           ENDIF;
+         ELSE
+           store_no = store_no;
+         ENDIF;
+
+       char_cnt_curr  = char_cnt_curr + 1;
+
+     ENDWHILE;
+
+/*********
+*    logmess = 'store_no: ' + varchar(:store_no);
+*    callproc write_message();
+********/
+
+    /* Update customer_group, udi_name, store_no */
+      UPDATE asn_order_header a
+        FROM sales_accts b
+         SET customer_group = b.custgroup_no,
+             udi_name = b.udi_name,
+             store_number = :store_no
+       WHERE account_branch   = (:staging_array[:loop_cnt].account_branch)
+         AND account_number   = (:staging_array[:loop_cnt].account_number)
+         AND ifnull(cust_order,'') = ifnull(:staging_array[:loop_cnt].cust_order,'')
+         AND order_date_time  = (:staging_array[:loop_cnt].order_date_time)
+         AND a.account_branch = b.branch
+         AND a.account_number = b.account_no;
+
+     INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+     IF (IIerrorno != 0) THEN
+       ROLLBACK;
+        MESSAGE 'Error updating asn order header table ' 
+          + 'customer details ' + :IIerrortext;
+        CALLPROC create_error_file();
+        RETURN 1;
+     ENDIF;
+
+     COMMIT;
+
+    /* Select customer_group, udi_name, store_no */
+      SELECT customer_group as cust_group, 
+             udi_name as udi_name, 
+             store_number as store_number
+        FROM asn_order_header
+       WHERE account_branch   = (:staging_array[:loop_cnt].account_branch)
+         AND account_number   = (:staging_array[:loop_cnt].account_number)
+         AND cust_order       = (:staging_array[:loop_cnt].cust_order)
+         AND order_date_time  = (:staging_array[:loop_cnt].order_date_time);
+
+     INQUIRE_INGRES (IIerrorno = ERRORNO, 
+            IIerrortext = ERRORTEXT, 
+            IIrowcount = ROWCOUNT);
+
+     IF (IIerrorno != 0) THEN
+        ROLLBACK;
+        MESSAGE 'Error selecting asn order header table ' 
+          + 'customer details ' + :IIerrortext;
+        CALLPROC create_error_file();
+        RETURN 1;
+     ENDIF;
+
+     logmess = 'asn_order_header [Update] '
+      + X'0A' + 'account_branch: ' 
+      + squeeze(:staging_array[:loop_cnt].account_branch)
+      + ' account_number: ' 
+      + squeeze(:staging_array[:loop_cnt].account_number)
+      + ' cust_order: ' 
+      + ifnull(squeeze(varchar(:staging_array[:loop_cnt].cust_order)),'')
+/******
+*     + ' order_date_time: ' 
+*     + squeeze(varchar(:staging_array[:loop_cnt].order_date_time))
+******/
+      + X'0A' + 'customer_group: ' + ifnull(squeeze(varchar(:cust_group)),'')
+      + ' store_number: ' + ifnull(squeeze(varchar(:store_number)),'');
+     callproc write_message();
+
+  ENDIF;
+
+  COMMIT;
+
+  RETURN gc_success;
+};
+
+
+PROCEDURE create_event_records() =
+{
+  logmess = 'asn_events [Insert] '
+   + X'0A' + 'asn_event_type: ' 
+   + squeeze(:staging_array[:loop_cnt].asn_event_type)
+   + ' account_branch: ' 
+   + squeeze(:staging_array[:loop_cnt].account_branch)
+   + ' account_number: ' 
+   + squeeze(:staging_array[:loop_cnt].account_number)
+   + ' picknote: ' + squeeze(vchar(:staging_array[:loop_cnt].picknote))
+   + ' invoice: ' + squeeze(vchar(:staging_array[:loop_cnt].invoice));
+  callproc write_message();
+
+  INSERT INTO asn_event (
+          asn_event_code,
+          asn_event_type,
+          event_date_time,
+          account_branch,
+          account_number,
+          print_branch,
+          picknote,
+          invoice,
+          processed_flag)
+  VALUES
+    (    :staging_array[:loop_cnt].asn_event_code,
+         :staging_array[:loop_cnt].asn_event_type,
+         :staging_array[:loop_cnt].event_date_time,
+         :staging_array[:loop_cnt].account_branch,
+         :staging_array[:loop_cnt].account_number,
+          ifnull(:staging_array[:loop_cnt].print_branch,''),
+         :staging_array[:loop_cnt].picknote,
+         :staging_array[:loop_cnt].invoice,
+         0
+    );
+
+  COMMIT;
+
+  RETURN gc_success;
+};
+
+
+PROCEDURE create_error_file() =
+DECLARE
+  cmd_line   = VARCHAR(90) NOT NULL;
+
+{
+   cmd_line = 'touch ' + :gc_temp + 'asn_load_events_remtp.error';
+   CALL SYSTEM cmd_line;
+   RETURN;
+};
+
+
+PROCEDURE write_message() =
+{
+  IF batch_online = 'O' THEN
+    MESSAGE varchar(:logmess) WITH STYLE = POPUP;
+  ELSE
+    IF mess_flag = 1 THEN
+      MESSAGE varchar(:logmess);
+    ENDIF;
+  ENDIF;
+}

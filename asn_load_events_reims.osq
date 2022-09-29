@@ -1,0 +1,317 @@
+/**********************************************************
+*  Frame   - asn_load_events_reims - To load events from  
+*            a file received from reims and create events
+*            record in asn_event table.  
+*
+*  Type    - PROCEDURE
+*
+*  Author  - Bhavin Bhatt
+*
+*  Date    - 22/01/2010
+*
+*  Parameters IN - event file name
+*
+*  Return Value - 0 Success
+*                 1 Failure / Ingres Error
+*
+**********************************************************
+* Ver |Date    |Coded|Description
+******|********|*****|************************************
+* 1.0 |29/02/08| BB  |Original Code
+**********************************************************/
+
+PROCEDURE asn_load_events_reims(
+)=
+
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+DECLARE 
+    IIerrorno       = INTEGER(4)   NOT NULL WITH DEFAULT,
+    IIrowcount      = INTEGER(4)   NOT NULL WITH DEFAULT,
+    IIerrortext     = VARCHAR(256) NOT NULL WITH DEFAULT,
+
+/*******************************************************
+** PROCEDURE SPECIFIC VARIABLES
+*******************************************************/
+
+    ret_code        = INTEGER(1)  NOT NULL WITH DEFAULT,
+    tot_rows_reims  = INTEGER(4)  NOT NULL WITH DEFAULT,
+    loop_cnt        = INTEGER(4)  NOT NULL WITH DEFAULT,
+    loop_cnt_event  = INTEGER(4)  NOT NULL WITH DEFAULT,
+    tot_rows_header = INTEGER(4)  NOT NULL WITH DEFAULT,
+
+    event_file      = VARCHAR(128)   NOT NULL WITH DEFAULT,
+    param_string    = VARCHAR(100)NOT NULL WITH DEFAULT,
+    email_id_to     = VARCHAR(500)NOT NULL WITH DEFAULT;
+    system_cmd      = VARCHAR(700)NOT NULL WITH DEFAULT;
+    email_file_name = VARCHAR(100)    NOT NULL WITH DEFAULT;
+
+    staging_array   = ARRAY OF TYPE OF TABLE tmp_reims_event_staging;
+    event_array     = ARRAY OF TYPE OF TABLE asn_event;
+    header_array    = ARRAY OF TYPE OF TABLE asn_summary_header;
+
+/*******************************************************
+** LOCAL PROCEDURES
+*******************************************************/
+
+    create_error_file     = PROCEDURE,
+    create_event_records  = PROCEDURE RETURNING INTEGER NOT NULL,
+
+/*******************************************************
+** MAIN 
+*******************************************************/
+{
+    param_string = callproc CommandLineParameters();
+
+    event_file = squeeze(param_string);
+
+    IF ifnull(event_file,'') = ''
+    THEN
+       MESSAGE 'Error : Event file name Parameter not Passed ... ' ;
+       CALLPROC create_error_file(); 
+       RETURN gc_fail;
+    ENDIF;
+
+    ret_code = 0;
+
+    SELECT ret_code = count(*) 
+    FROM   iitables
+    WHERE  table_type = 'T'
+    AND    table_name = 'tmp_reims_event_staging';
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != 0) THEN
+       ROLLBACK;
+       MESSAGE 'Error Selecting from iitables ' +
+                    :IIerrortext;
+       CALLPROC create_error_file();
+       RETURN 1;
+    ENDIF;
+
+    IF ret_code > 0 THEN
+
+       MESSAGE 'Modify staging table to truncated ... ';
+       MODIFY tmp_reims_event_staging to truncated;
+
+       INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+       IF (IIerrorno != 0) THEN
+          ROLLBACK;
+          MESSAGE 'Error truncating staging table ' +
+                       :IIerrortext;
+          CALLPROC create_error_file();
+          RETURN 1;
+       ENDIF;
+
+    ELSE
+
+       MESSAGE 'Create staging table ... ';
+
+       CREATE TABLE tmp_reims_event_staging
+           (asn_event_code         char(3)     not null,
+            asn_event_type         char(1)     not null,
+            event_dt               varchar(17) not null,
+            asn_file_generation    integer4    not null,
+            asn_reims_reference    char(12)    not null,
+            trading_partner        char(13)    not null,
+            ingres_asn_batch       char(45)
+           );
+
+       INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+       IF (IIerrorno != 0) THEN
+          ROLLBACK;
+          MESSAGE 'Error creating staging table ' +
+                       :IIerrortext;
+          CALLPROC create_error_file();
+          RETURN 1;
+       ENDIF;
+
+    ENDIF;
+
+    copy table tmp_reims_event_staging
+       (asn_event_code          = c0comma,
+        asn_event_type          = c0comma,
+        event_dt                = c0comma,
+        asn_file_generation     = c0comma,
+        asn_reims_reference     = c0comma,
+        trading_partner         = c0comma,
+        ingres_asn_batch        = c0nl)
+    from :event_file
+    with on_error = TERMINATE;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != 0) THEN
+       ROLLBACK;
+       MESSAGE 'Error populating staging table ' +
+                    :IIerrortext;
+       CALLPROC create_error_file();
+       RETURN 1;
+    ENDIF;
+
+    MESSAGE 'Convert date into ingres format ... ';
+
+    update  tmp_reims_event_staging
+    set     event_dt = left(event_dt,2) + '-' +
+            trim(right(left(event_dt,6),3)) + '-' +
+            trim(right(left(event_dt,11),4)) +
+            trim(right(event_dt,6))
+    where   event_dt is not null
+    and     event_dt != '';
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != 0) THEN
+       ROLLBACK;
+       MESSAGE 'Error updating staging table for date' +
+                    :IIerrortext;
+       CALLPROC create_error_file();
+       RETURN 1;
+    ENDIF;
+
+    ret_code = CALLPROC ARRAYCLEAR(staging_array); 
+
+    staging_array = SELECT * 
+                    FROM   tmp_reims_event_staging;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != 0) THEN
+       ROLLBACK;
+       MESSAGE 'Error reading from staging table ' +
+                    :IIerrortext;
+       CALLPROC create_error_file();
+       RETURN 1;
+    ENDIF;
+
+    IF IIrowcount <= 0 THEN
+       MESSAGE 'No record found ... ' ;
+       RETURN 0;
+    ELSE
+       tot_rows_reims = IIrowcount;
+       MESSAGE 'No of records to process : ' + vchar(:tot_rows_reims);
+    ENDIF;
+
+    loop_cnt = 1;
+
+    WHILE loop_cnt <= tot_rows_reims
+    DO
+      MESSAGE 'Processing ingres asn batch : ' 
+             + vchar(:staging_array[:loop_cnt].ingres_asn_batch);
+
+      header_array = SELECT *
+                     FROM   asn_summary_header
+                     WHERE  ingres_asn_batch = 
+                        squeeze(:staging_array[:loop_cnt].ingres_asn_batch);
+
+      INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+      IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error reading from asn summary header table ' +
+                      :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+      ENDIF;
+
+      IF IIrowcount > 0 THEN
+  
+         tot_rows_header = IIrowcount; 
+         ret_code = CALLPROC create_event_records();
+
+         IF ret_code != 0 THEN
+            RETURN 1;
+         ENDIF;
+
+      ELSE
+
+         MESSAGE 'No asn_summary_header record found for : ' 
+             + vchar(:staging_array[:loop_cnt].ingres_asn_batch);
+  
+      ENDIF;
+
+      loop_cnt = loop_cnt + 1;
+
+    ENDWHILE;
+
+    COMMIT;
+
+    RETURN gc_success;
+}
+
+
+PROCEDURE create_error_file() =
+DECLARE
+  cmd_line   = VARCHAR(90) NOT NULL;
+
+{
+   cmd_line = 'touch /aahdb/temp/control/data/asn_load_events_reims.error';
+   CALL SYSTEM cmd_line;
+   RETURN;
+};
+
+
+PROCEDURE create_event_records() =
+{
+   loop_cnt_event = 1;
+
+   WHILE loop_cnt_event <= tot_rows_header
+   DO
+     INSERT INTO asn_event (
+                    asn_event_code,
+                    asn_event_type,
+                    event_date_time,
+                    account_branch,
+                    account_number,
+                    print_branch,
+                    picknote,
+                    invoice,
+                    processed_flag)
+     VALUES
+       (
+          :staging_array[:loop_cnt].asn_event_code,
+          :staging_array[:loop_cnt].asn_event_type,
+          :staging_array[:loop_cnt].event_dt,
+          :header_array[:loop_cnt_event].account_branch,
+          :header_array[:loop_cnt_event].account_number,
+          :header_array[:loop_cnt_event].print_branch,
+          :header_array[:loop_cnt_event].picknote,
+          :header_array[:loop_cnt_event].invoice,
+          0
+       );
+
+     INQUIRE_INGRES (IIerrorno = ERRORNO, 
+             IIerrortext = ERRORTEXT, 
+             IIrowcount = ROWCOUNT);
+
+     IF (IIerrorno != 0) THEN
+         ROLLBACK;
+         MESSAGE 'Error inserting into asn_event table ' +
+                      :IIerrortext;
+         CALLPROC create_error_file();
+         RETURN 1;
+     ENDIF;
+
+     loop_cnt_event = loop_cnt_event + 1;
+
+   ENDWHILE;
+
+   RETURN 0;
+};

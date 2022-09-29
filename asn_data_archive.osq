@@ -1,0 +1,515 @@
+/**********************************************************
+*  Frame   - asn_data_archive - Delete data from ASN tables
+*            which are more than a set no of days old. The 
+*            period is stored in the parameter table
+*            application_parameters.
+*
+*  Type    - PROCEDURE
+*
+*  Author  - Bhavin Bhatt
+*
+*  Date    - 06/12/2012
+*
+**********************************************************
+* Ver |Date    |Coded|Description
+******|********|*****|************************************
+* 1.0 |06/12/12| BB  |Original Code
+**********************************************************/
+
+PROCEDURE asn_data_archive()=
+
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+DECLARE 
+    IIerrorno    = INTEGER(4)   NOT NULL WITH DEFAULT,
+    IIrowcount   = INTEGER(4)   NOT NULL WITH DEFAULT,
+    IIerrtext    = VARCHAR(256) NOT NULL WITH DEFAULT,
+
+/*******************************************************
+** PROCEDURE SPECIFIC VARIABLES
+*******************************************************/
+
+    ret_code     = INTEGER(1)  NOT NULL WITH DEFAULT,
+    arc_days     = INTEGER(1)  NOT NULL WITH DEFAULT,
+    row_count    = INTEGER(1)  NOT NULL WITH DEFAULT,
+    loop_count   = INTEGER(1)  NOT NULL WITH DEFAULT,
+    brn_count    = INTEGER(1)  NOT NULL WITH DEFAULT,
+    day_today    = CHAR(3)     NOT NULL WITH DEFAULT,
+    date_string  = VARCHAR(26) NOT NULL WITH DEFAULT,
+
+    brn_array    = ARRAY OF branch_id, 
+
+/*******************************************************
+** LOCAL PROCEDURES
+*******************************************************/
+
+    lp_create_error_file    = PROCEDURE,
+    lp_check_ingres_error   = PROCEDURE RETURNING INTEGER NOT NULL, 
+    lp_select_records       = PROCEDURE RETURNING INTEGER NOT NULL, 
+
+/*******************************************************
+** MAIN 
+*******************************************************/
+{
+    MESSAGE VCHAR(DATE('NOW')) + ' - Archive asn data 4GL - starts ... ';
+
+    arc_days = 0;
+
+    SELECT arc_days = INT4(parameter_value)
+    FROM   application_parameters
+    WHERE  parameter_id = 'ASNARCHIVE';
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 1);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    IF IIrowcount <= 0 THEN
+       MESSAGE 'Archive Parameter not found, using default 90.';
+       arc_days = 90;
+    ELSE
+       MESSAGE 'Archive Parameter found, Value is = ' + VCHAR(:arc_days);
+    ENDIF;
+
+    date_string = VCHAR(:arc_days) + ' days';
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - Select distinct branches ... ';
+
+    brn_array = SELECT distinct account_branch as branch_id
+                FROM   asn_summary_header;
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 5);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+
+    IF IIrowcount <= 0 THEN
+       MESSAGE 'No Branch to Process, Terminating ....';
+       RETURN;
+    ELSE
+       brn_count = IIrowcount;
+    ENDIF;
+
+    row_count = 0;
+
+    SELECT row_count = count(*) 
+    FROM   iitables
+    WHERE  table_type = 'T'
+    AND    table_name = 'ftdel_asn_summary_header';
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 10);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    IF row_count > 0 THEN
+
+       DROP TABLE ftdel_asn_summary_header;
+
+       ret_code = CALLPROC lp_check_ingres_error(proc_no = 12);
+
+       IF ret_code != 0 THEN
+          CALLPROC create_error_file();
+          RETURN;
+       ENDIF;
+
+    ENDIF; 
+
+    CREATE TABLE ftdel_asn_summary_header
+    AS     SELECT * 
+           FROM   asn_summary_header
+           WHERE  1 <> 1;
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 15);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - No. of Branches to process : ' 
+       + VCHAR(:brn_count);
+
+    loop_count = 1;
+
+    WHILE loop_count <= brn_count DO
+
+        ret_code = CALLPROC lp_select_records(
+            branch_in = IFNULL(:brn_array[loop_count].branch_id,''));
+
+        IF ret_code != 0 THEN
+           CALLPROC create_error_file();
+           RETURN;
+        ENDIF;
+
+        loop_count = loop_count + 1;
+
+    ENDWHILE;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - Records selected.';
+
+    MODIFY  ftdel_asn_summary_header to ISAM 
+      ON account_branch,account_number, cust_order,order_date_time, picknote;
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 35);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - Delete from edi_event.';
+
+    DELETE FROM edi_event e
+    WHERE  EXISTS (SELECT 1 FROM ftdel_asn_summary_header f
+                   WHERE  e.account_branch = f.account_branch
+                   AND    e.account_number = f.account_number
+                   AND    e.cust_order = f.cust_order
+                   AND    e.order_date_time = 
+                             DATE_TRUNC('DAY',f.order_date_time));
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 45);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - No. of Records Deleted from edi_event : '
+      + VCHAR(:IIrowcount);
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - Delete from asn_order_header.';
+
+    DELETE FROM asn_order_header e
+    WHERE  EXISTS (SELECT 1 FROM ftdel_asn_summary_header f
+                   WHERE  e.account_branch = f.account_branch
+                   AND    e.account_number = f.account_number
+                   AND    e.cust_order = f.cust_order
+                   AND    e.order_date_time = f.order_date_time);
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 55);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    MESSAGE VCHAR(DATE('NOW')) 
+      + ' - No. of Records Deleted from asn_order_header : ' 
+      + VCHAR(:IIrowcount);
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - Delete from asn_summary_header.';
+
+    DELETE FROM asn_summary_header e
+    WHERE  EXISTS (SELECT 1 FROM ftdel_asn_summary_header f
+                   WHERE  e.account_branch = f.account_branch
+                   AND    e.account_number = f.account_number
+                   AND    e.cust_order = f.cust_order
+                   AND    e.picknote = f.picknote
+                   AND    e.order_date_time = f.order_date_time);
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 65);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    MESSAGE VCHAR(DATE('NOW')) 
+      + ' - No. of Records Deleted from asn_summary_header : ' 
+      + VCHAR(:IIrowcount);
+
+    MODIFY  ftdel_asn_summary_header
+      to ISAM on account_branch,account_number, picknote,invoice;
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 75);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - Delete from asn_event.';
+
+    DELETE FROM asn_event e
+    WHERE  EXISTS (SELECT 1 FROM ftdel_asn_summary_header f
+                   WHERE  e.account_branch = f.account_branch
+                   AND    e.account_number = f.account_number
+                   AND    e.invoice = f.invoice
+                   AND    e.picknote = f.picknote);
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 85);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    MESSAGE VCHAR(DATE('NOW')) 
+      + ' - No. of Records Deleted from asn_event : ' + VCHAR(:IIrowcount);
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - Delete from asn_invoice.';
+
+    DELETE FROM asn_invoice e
+    WHERE  EXISTS (SELECT 1 FROM ftdel_asn_summary_header f
+                   WHERE  e.account_branch = f.account_branch
+                   AND    e.account_number = f.account_number
+                   AND   (e.picknote = f.picknote or
+                          e.picknote = f.invoice));
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 95);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    MESSAGE VCHAR(DATE('NOW')) 
+      + ' - No. of Records Deleted from asn_invoice : ' + VCHAR(:IIrowcount);
+
+    COMMIT;
+
+    DROP TABLE ftdel_asn_summary_header; 
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 105);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+    MESSAGE VCHAR(DATE('NOW')) + ' - Archive asn data 4GL - Ends ... ' ;
+
+    SELECT day_today = UPPERCASE(dow('today'));
+
+    IF day_today = 'SAT' THEN
+       MESSAGE VCHAR(DATE('NOW')) + ' - Saturday Night - Modify the Tables ... ' ;
+    ELSE
+       RETURN;
+    ENDIF;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - Mofidy ASN tables - Starts ... ' ;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - modify asn_summary_header.';
+
+    MODIFY asn_summary_header TO BTREE UNIQUE ON
+        account_branch,
+        account_number,
+        order_date_time,
+        cust_order,
+        picknote
+    WITH nonleaffill = 80,
+        leaffill = 70,
+        fillfactor = 80,
+        extend = 16;
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 205);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - Create index 1 on asn_summary_header.';
+
+    CREATE INDEX asn_summary_header_idx1 on asn_summary_header (
+        invoice)
+    WITH STRUCTURE = isam,
+        nocompression,
+        key = (invoice),
+        fillfactor = 80,
+        location = (aahdb01);
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 210);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - Create index 2 on asn_summary_header.';
+
+    CREATE INDEX asn_summary_header_in1 on asn_summary_header (
+        ingres_asn_batch)
+    WITH STRUCTURE = isam,
+        nocompression,
+        key = (ingres_asn_batch),
+        fillfactor = 80,
+        location = (aahdb09, aahdb10);
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 215);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - asn_summary_header done.';
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - modify asn_event.';
+
+    MODIFY asn_event TO BTREE ON
+        account_branch,
+        account_number,
+        invoice,
+        picknote
+    WITH nonleaffill = 90,
+        leaffill = 85,
+        fillfactor = 90,
+        extend = 16,
+        compression = (nokey, hidata);
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 220);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - asn_event done.';
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - modify asn_invoice.';
+
+    MODIFY asn_invoice TO BTREE ON
+        account_branch,
+        account_number,
+        picknote
+    WITH nonleaffill = 80,
+        leaffill = 70,
+        fillfactor = 80,
+        extend = 16;
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 225);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+    MESSAGE VCHAR(DATE('NOW')) + ' - asn_invoice done.';
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - modify asn_order_header.';
+
+    MODIFY asn_order_header TO BTREE ON
+        account_branch,
+        account_number,
+        order_date_time,
+        cust_order
+    WITH nonleaffill = 80,
+        leaffill = 70,
+        fillfactor = 80,
+        extend = 16;
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 230);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+    MESSAGE VCHAR(DATE('NOW')) + ' - asn_order_header done.';
+
+    MESSAGE VCHAR(DATE('NOW')) + ' - modify edi_event.';
+
+    MODIFY edi_event TO BTREE ON
+        asn_event_code,
+        asn_event_type,
+        processed_flag
+    WITH nonleaffill = 80,
+        leaffill = 70,
+        fillfactor = 80,
+        extend = 16;
+
+    ret_code = CALLPROC lp_check_ingres_error(proc_no = 235);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+       RETURN;
+    ENDIF;
+
+    COMMIT;
+    MESSAGE VCHAR(DATE('NOW')) + ' - edi_event done.';
+
+    COMMIT;
+    MESSAGE VCHAR(DATE('NOW')) + ' - Mofidy ASN tables - Ends ... ' ;
+    RETURN;
+}
+
+
+PROCEDURE lp_create_error_file() =
+DECLARE
+  cmd_line   = VARCHAR(90) NOT NULL;
+
+{
+   cmd_line = 'touch /aahdb/temp/control/data/asn_data_archive.error';
+   CALL SYSTEM cmd_line;
+   RETURN;
+};
+
+/***************************************
+** Procedure to check ingres errors
+****************************************/
+PROCEDURE lp_select_records(branch_in = CHAR(4) NOT NULL) =
+{
+    MESSAGE VCHAR(DATE('NOW')) + ' - Select records for : ' + :branch_in;
+
+    INSERT INTO ftdel_asn_summary_header
+    SELECT *
+    FROM   asn_summary_header
+    WHERE  order_date_time < DATE('today') - DATE(:date_string)
+    AND    account_branch = :branch_in;
+
+    ret_code = lp_check_ingres_error(proc_no = 500);
+
+    IF ret_code != 0 THEN
+       CALLPROC create_error_file();
+    ENDIF;
+
+    COMMIT;
+};
+
+/***************************************
+** Procedure to check ingres errors
+****************************************/
+PROCEDURE lp_check_ingres_error(proc_no = INTEGER NOT NULL) =
+{
+
+    INQUIRE_INGRES (IIerrorno   = ERRORNO,
+        IIerrtext  = ERRORTEXT,
+        IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE 'INGRES ERROR ' + trim(char(:proc_no)) +
+         ' - ' + trim(char(:IIerrorno)) + ' ' + :IIerrtext WITH STYLE = POPUP;
+
+       RETURN 1;
+    ENDIF;
+
+    RETURN 0;
+
+};
