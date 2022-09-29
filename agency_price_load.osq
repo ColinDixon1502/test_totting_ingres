@@ -1,0 +1,888 @@
+/*******************************************************
+*  Procedure - agency_price_load.osq
+*  Author    - P Nagra
+*
+*  Date      - 18-Jan-2010
+*
+*  Project   - AZ Lynx 2
+*  Purpose   - Procedure to:
+*              process az_channel_pricing_rejects
+*              process az_channel_pricing into agency_price
+*              generate email success file (and lines)
+*              (email error file (and lines) generated in 
+*               calling script)
+*              call MCS to update RemTP
+*
+*  Parameters IN - NONE
+*
+********************************************************
+* Ver | Date     |Coded| Description
+***** |**********|*****|*********************************
+* 1.0 |18/01/2010| PSN | Original Version
+******|**********|*****|*********************************
+* 1.1 |26/09/2014| CD  | AZ-NDD Project: Add second_cust_type
+*     |          |     | to az_channel and agency_price tables.
+*     |          |     | Pass records with non-zero second_cust_type
+*     |          |     | to RemTP via a ta28 transaction.
+*******************************************************/
+PROCEDURE agency_price_load
+(
+) =
+DECLARE
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+
+    IIerrorno     = INTEGER       NOT NULL WITH DEFAULT,
+    IIrowcount    = INTEGER       NOT NULL WITH DEFAULT,
+    IIerrortext   = VARCHAR (256) NOT NULL WITH DEFAULT,
+
+/*******************************************************
+** PROCEDURE SPECIFIC VARIABLES
+*******************************************************/
+
+    IIchar           = VARCHAR(32)  NOT NULL WITH DEFAULT,
+    IIint            = INTEGER      NOT NULL WITH DEFAULT,
+
+    v_original_file_name = VARCHAR(50) NOT NULL WITH DEFAULT,
+    v_rejects_done     = CHAR(1)      NOT NULL WITH DEFAULT,
+    v_err_file_created = CHAR(1)      NOT NULL WITH DEFAULT,
+    v_loop_cnt         = INTEGER(2)   NOT NULL WITH DEFAULT,
+    v_sub_loop_cnt     = INTEGER(2)   NOT NULL WITH DEFAULT,
+    v_ean_code         = CHAR(13)     NOT NULL WITH DEFAULT,
+    v_product_code     = CHAR(8)      NOT NULL WITH DEFAULT,
+    v_error_rec_cnt    = INTEGER(2)   NOT NULL WITH DEFAULT,
+    v_price            = FLOAT8       NOT NULL WITH DEFAULT,
+    v_start_date       = DATE         NOT NULL WITH DEFAULT,
+    v_end_date         = DATE         NOT NULL WITH DEFAULT,
+    v_mcs_res          = INTEGER1     NOT NULL WITH DEFAULT,
+    v_count            = INTEGER(2)   NOT NULL WITH DEFAULT,
+    v_arr_rowcount     = INTEGER(2)   NOT NULL WITH DEFAULT,
+    v_sub_arr_rowcount = INTEGER(2)   NOT NULL WITH DEFAULT,
+    v_update_datetime  = DATE         NOT NULL WITH DEFAULT,
+    v_email_to         = VARCHAR(500) NOT NULL WITH DEFAULT,
+    v_system_cmd       = VARCHAR(300) NOT NULL WITH DEFAULT,
+    v_mail_title       = VARCHAR(200) NOT NULL WITH DEFAULT,
+
+    v_reject_recs_arr  = ARRAY OF TYPE OF TABLE az_channel_pricing_rejects, 
+    v_valid_recs_arr   = ARRAY OF TYPE OF TABLE az_channel_pricing, 
+    v_az_channel_arr   = ARRAY OF TYPE OF TABLE az_channel, 
+    v_email_array      = ARRAY OF TYPE OF TABLE agency_interface_email;
+
+/*******************************************************
+** LOCAL PROCEDURES
+*******************************************************/
+
+    lp_display_message     = PROCEDURE RETURNING NONE;
+    lp_create_error_file   = PROCEDURE RETURNING NONE;
+    lp_add_to_error_report = PROCEDURE RETURNING NONE;
+    lp_call_mcs            = PROCEDURE RETURNING INTEGER1;
+    lp_update_rejects      = PROCEDURE RETURNING INTEGER1;
+
+/*******************************************************
+** MAIN PROCEDURE - agency_price_load
+*******************************************************/
+{
+    v_rejects_done = gc_no;
+    v_err_file_created = gc_no;
+    v_error_rec_cnt = 0;
+    v_arr_rowcount = 0;
+
+    /* Process rejects table first...*/
+    /* Select unprocessed records if any...*/
+    v_reject_recs_arr = SELECT *
+                        FROM   az_channel_pricing_rejects
+                        WHERE  IFNULL(processed_flag,0) = 0
+                        ORDER BY line_number ASC;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-05- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_create_error_file();
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    IF (IIrowcount <= 0)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 
+                                    'No unprocessed records found in az_channel_pricing_rejects...');
+    ELSE
+        v_original_file_name = v_reject_recs_arr[1].original_file_name;
+        v_arr_rowcount = IIrowcount;
+
+        CALLPROC lp_display_message(lpv_message =
+                                    'No. of az_channel_pricing_rejects records to process : ' 
+                                    + VARCHAR(v_arr_rowcount));
+
+        /* Add reject lines to error report...*/
+        v_loop_cnt = 1;
+
+        WHILE (v_loop_cnt <= v_arr_rowcount)
+        DO
+            CALLPROC lp_add_to_error_report();
+            v_loop_cnt = v_loop_cnt + 1;
+        ENDWHILE;
+
+        /* Now mark the unprocessed lines as processed...*/
+        UPDATE az_channel_pricing_rejects
+        SET processed_flag = 1,
+            processed_date = DATE('now')
+        WHERE IFNULL(processed_flag,0) = 0;
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-10- INGRES error in UPDATE ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            RETURN gc_fail;
+        ENDIF;
+
+        COMMIT;
+
+        CALLPROC lp_display_message(lpv_message = 
+                                    'az_channel_pricing_rejects records have been processed...');
+
+    ENDIF;
+
+    v_rejects_done = gc_yes;
+    v_arr_rowcount = 0;
+    
+    /* Process valid table next...*/
+    /* Select unprocessed records if any...*/
+    v_valid_recs_arr = SELECT *
+                       FROM   az_channel_pricing
+                       WHERE  IFNULL(processed_flag,0) = 0
+                       ORDER BY line_number ASC;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-15- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_create_error_file();
+        RETURN gc_fail;
+    ENDIF;
+
+    IF (IIrowcount <= 0)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 
+                                    'No unprocessed records found in az_channel_pricing. Exiting ...');
+        RETURN gc_success;
+    ELSE
+        v_original_file_name = v_valid_recs_arr[1].original_file_name;
+        v_arr_rowcount = IIrowcount;
+    ENDIF;
+
+    CALLPROC lp_display_message(lpv_message =
+                                'No. of az_channel_pricing records to process : ' 
+                                + VARCHAR(v_arr_rowcount));
+
+    COMMIT;
+
+    v_mcs_res = CALLPROC open_isam();
+
+    /* Validate the selected records...*/
+    v_loop_cnt = 1;
+
+    WHILE (v_loop_cnt <= v_arr_rowcount)
+    DO
+        CALLPROC lp_display_message(lpv_message =
+                                    'Processing Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number));
+
+        v_valid_recs_arr[v_loop_cnt].processed_flag = 1;
+
+        /* Validate Ean Code (numeric)...*/
+        v_ean_code = v_valid_recs_arr[v_loop_cnt].ean_code;
+        IIint = 1;
+
+        WHILE (IIint <= 13)
+        DO
+            IF ((ASCII(CHAREXTRACT(v_ean_code,IIint)) < ASCII('0')) OR
+                (ASCII(CHAREXTRACT(v_ean_code,IIint)) > ASCII('9')))
+            THEN
+                CALLPROC lp_display_message(lpv_message =
+                                            'Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                            ' ' + v_valid_recs_arr[v_loop_cnt].ean_code +
+                                            ' - EAN Code is not numeric.');
+
+                v_valid_recs_arr[v_loop_cnt].processed_flag = 11;
+
+                CALLPROC lp_add_to_error_report();
+                IIint = IIint + 99;
+            ENDIF;
+
+            IIint = IIint + 1;
+        ENDWHILE;
+
+        /* If Ean Code valid...*/
+        /* Validate END date - must not have passed...*/
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 1)
+        THEN
+            IF (IFNULL(v_valid_recs_arr[v_loop_cnt].end_date, '') != '')
+            THEN
+                IF (DATE_TRUNC('day', v_valid_recs_arr[v_loop_cnt].end_date) < DATE('today'))
+                THEN
+                    CALLPROC lp_display_message(lpv_message =
+                                                'Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                                ' ' + VARCHAR(v_valid_recs_arr[v_loop_cnt].end_date) +
+                                                ' - end_date has passed.');
+    
+                    v_valid_recs_arr[v_loop_cnt].processed_flag = 22;
+    
+                    CALLPROC lp_add_to_error_report();
+                ENDIF;
+            ENDIF;
+        ENDIF;
+
+        /* Validate START date - must not be greater than END date...*/
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 1)
+        THEN
+            IF (IFNULL(v_valid_recs_arr[v_loop_cnt].end_date, '') != '')
+            THEN
+                IF ((IFNULL(v_valid_recs_arr[v_loop_cnt].start_date, '')) 
+								     > IFNULL(v_valid_recs_arr[v_loop_cnt].end_date, ''))
+                THEN
+                    CALLPROC lp_display_message(lpv_message =
+                                                'Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                                ' ' + VARCHAR(v_valid_recs_arr[v_loop_cnt].start_date) +
+                                                ' - start_date is greater than end_date.');
+    
+                    v_valid_recs_arr[v_loop_cnt].processed_flag = 33;
+    
+                    CALLPROC lp_add_to_error_report();
+                ENDIF;
+            ENDIF;
+        ENDIF;
+
+        /* If START date is valid...*/
+        /* Validate product - ensure it is an AZ product...*/
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 1)
+        THEN
+            v_product_code = '';
+
+            SELECT op.product_code AS v_product_code
+            FROM   op_products op,
+                   ean_codes ean,
+                   manufacturer_supplier_codes man
+            WHERE ean.product_code = op.product_code
+            AND   op.supplier_code = man.supplier_code
+            AND   ean.seq_no = 1
+            AND   man.agency_supplier = 1
+            AND ean.ean_code = :v_valid_recs_arr[v_loop_cnt].ean_code;
+
+            INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+            IF (IIerrorno != gc_success)
+            THEN
+                ROLLBACK;
+                MESSAGE '-20- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+                CALLPROC lp_create_error_file();
+                v_mcs_res = CALLPROC close_isam();
+                RETURN gc_fail;
+            ENDIF;
+
+            IF (IIrowcount <= 0)
+            THEN
+                CALLPROC lp_display_message(lpv_message =
+                                            'Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                            ' ' + v_valid_recs_arr[v_loop_cnt].ean_code +
+                                            ' - is not a valid AZ product.');
+
+                v_valid_recs_arr[v_loop_cnt].processed_flag = 44;
+
+                CALLPROC lp_add_to_error_report();
+            ENDIF;
+        ENDIF;
+
+        /* If Product Code valid...*/
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 1)
+        THEN
+            /* Validate az_channel (could exist more than once)...*/
+            v_count = 0;
+
+            SELECT COUNT(*) AS v_count
+            FROM az_channel
+            WHERE az_channel = :v_valid_recs_arr[v_loop_cnt].az_channel;
+
+            INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+            IF (IIerrorno != gc_success)
+            THEN
+                ROLLBACK;
+                MESSAGE '-25- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+                v_mcs_res = CALLPROC close_isam();
+                RETURN gc_fail;
+            ENDIF;
+
+            IF (v_count = 0)
+            THEN
+                CALLPROC lp_display_message(lpv_message =
+                                            'Line: ' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                            ' ' + v_valid_recs_arr[v_loop_cnt].az_channel +
+                                            ' - AZ Channel not recognised.');
+
+                v_valid_recs_arr[v_loop_cnt].processed_flag = 55;
+
+                CALLPROC lp_add_to_error_report();
+            ENDIF;
+
+            /* If Channel record(s) valid...*/
+            /* Update/Insert into agency_price table...*/
+            IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 1)
+            THEN
+                v_az_channel_arr = SELECT *
+                                   FROM   az_channel
+                                   WHERE  az_channel = :v_valid_recs_arr[v_loop_cnt].az_channel
+                                   ORDER BY cust_type, cust_group;
+
+                INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+                IF (IIerrorno != gc_success)
+                THEN
+                    ROLLBACK;
+                    MESSAGE '-30- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+                    CALLPROC lp_create_error_file();
+                    v_mcs_res = CALLPROC close_isam();
+                    RETURN gc_fail;
+                ENDIF;
+
+                v_sub_arr_rowcount = IIrowcount;
+
+                CALLPROC lp_display_message(lpv_message =
+                                            '---- No. of channel records to process : ' + 
+																						VARCHAR(v_sub_arr_rowcount));
+
+                v_sub_loop_cnt = 1;
+
+                WHILE (v_sub_loop_cnt <= v_sub_arr_rowcount)
+                DO
+                    /* First check if record already exists...*/
+                    v_count = 0;
+
+                    SELECT COUNT(*) AS v_count
+                    FROM agency_price
+                    WHERE product_code = :v_product_code
+                    AND cust_type = :v_az_channel_arr[v_sub_loop_cnt].cust_type
+                    AND cust_group = :v_az_channel_arr[v_sub_loop_cnt].cust_group
+                    AND second_cust_type = :v_az_channel_arr[v_sub_loop_cnt].second_cust_type
+                    AND start_date = :v_valid_recs_arr[v_loop_cnt].start_date;
+
+                    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+                    IF (IIerrorno != gc_success)
+                    THEN
+                        ROLLBACK;
+                        MESSAGE '-35- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+                        CALLPROC lp_create_error_file();
+                        v_mcs_res = CALLPROC close_isam();
+                        RETURN gc_fail;
+                    ENDIF;
+
+                    /* Retrieve required data from array...*/
+                    v_price      = FLOAT8(v_valid_recs_arr[v_loop_cnt].price);
+                    v_start_date = v_valid_recs_arr[v_loop_cnt].start_date;
+                    v_end_date   = IFNULL(v_valid_recs_arr[v_loop_cnt].end_date, '');
+
+					          /* Either UPDATE existing record or INSERT new record...*/
+                    IF (v_count > 0)
+                    THEN
+                        v_update_datetime = DATE('now');
+                        CALLPROC lp_display_message(lpv_message =
+                                    'Selected Channel :' + VARCHAR(v_az_channel_arr[v_sub_loop_cnt].az_channel));
+
+                        UPDATE agency_price
+                        SET price = :v_price,
+                            start_date = :v_start_date,
+                            end_date = :v_end_date,
+                            update_datetime = :v_update_datetime
+                        WHERE product_code = :v_product_code
+                        AND cust_type = :v_az_channel_arr[v_sub_loop_cnt].cust_type
+                        AND cust_group = :v_az_channel_arr[v_sub_loop_cnt].cust_group
+                        AND second_cust_type = :v_az_channel_arr[v_sub_loop_cnt].second_cust_type
+                        AND start_date = :v_valid_recs_arr[v_loop_cnt].start_date;
+
+                        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+                        IF (IIerrorno != gc_success)
+                        THEN
+                            ROLLBACK;
+                            MESSAGE '-40- INGRES error in UPDATE ' + IIerrortext WITH STYLE = POPUP;
+                            CALLPROC lp_create_error_file();
+                            v_mcs_res = CALLPROC close_isam();
+                            RETURN gc_fail;
+                        ENDIF;
+
+                        /* Call MCS procedure to update Agency Record...*/
+                        IF (lp_call_mcs (lpv_mode = 'U',
+                                         lpv_product_code = v_product_code,
+                                         lpv_price = v_price,
+                                         lpv_cust_grp = v_az_channel_arr[v_sub_loop_cnt].cust_group,
+                                         lpv_cust_type = v_az_channel_arr[v_sub_loop_cnt].cust_type,
+                                         lpv_second_cust_type = v_az_channel_arr[v_sub_loop_cnt].second_cust_type,
+                                         lpv_start_date = v_start_date,
+                                         lpv_end_date = v_end_date,
+                                         lpv_update_datetime = v_update_datetime) != gc_success)
+                        THEN
+                            v_mcs_res = CALLPROC close_isam();
+                            RETURN gc_fail;
+                        ENDIF;
+                    ELSE
+                        CALLPROC lp_display_message(lpv_message =
+                                    'Selected Channel :' + VARCHAR(v_az_channel_arr[v_sub_loop_cnt].az_channel));
+                        v_update_datetime = DATE('now');
+
+                        INSERT INTO agency_price
+                            (product_code,
+                             cust_type,
+                             cust_group,
+                             second_cust_type,
+                             price,
+                             start_date,
+                             end_date,
+                             update_datetime)
+                        VALUES
+                            (:v_product_code,
+                             :v_az_channel_arr[v_sub_loop_cnt].cust_type,
+                             :v_az_channel_arr[v_sub_loop_cnt].cust_group,
+                             :v_az_channel_arr[v_sub_loop_cnt].second_cust_type,
+                             :v_price,
+                             :v_start_date,
+                             :v_end_date,
+                             :v_update_datetime);
+
+                        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+                        IF (IIerrorno != gc_success)
+                        THEN
+                            ROLLBACK;
+                            MESSAGE '-45- INGRES error in INSERT ' + IIerrortext WITH STYLE = POPUP;
+                            CALLPROC lp_create_error_file();
+                            v_mcs_res = CALLPROC close_isam();
+                            RETURN gc_fail;
+                        ENDIF;
+
+                        /* Call MCS procedure to insert Agency Record...*/
+                        IF (lp_call_mcs (lpv_mode = 'I',
+                                         lpv_product_code = v_product_code,
+                                         lpv_price = v_price,
+                                         lpv_cust_grp = v_az_channel_arr[v_sub_loop_cnt].cust_group,
+                                         lpv_cust_type = v_az_channel_arr[v_sub_loop_cnt].cust_type,
+                                         lpv_second_cust_type = v_az_channel_arr[v_sub_loop_cnt].second_cust_type,
+                                         lpv_start_date = v_start_date,
+                                         lpv_end_date = v_end_date,
+                                         lpv_update_datetime = v_update_datetime) != gc_success)
+                        THEN
+                            v_mcs_res = CALLPROC close_isam();
+                            RETURN gc_fail;
+                        ENDIF;
+                    ENDIF;
+
+                    v_sub_loop_cnt = v_sub_loop_cnt + 1;
+
+                ENDWHILE;
+            ENDIF;  
+        ENDIF;  
+
+        /* UPDATE the az_channel_pricing record...*/
+        UPDATE az_channel_pricing
+        SET    processed_flag = :v_valid_recs_arr[v_loop_cnt].processed_flag,
+               processed_date = :v_update_datetime
+        WHERE  line_number = :v_valid_recs_arr[v_loop_cnt].line_number
+        AND    ean_code = :v_valid_recs_arr[v_loop_cnt].ean_code
+        AND    load_date = :v_valid_recs_arr[v_loop_cnt].load_date;
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-45- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            v_mcs_res = CALLPROC close_isam();
+            RETURN gc_fail;
+        ENDIF;
+
+        v_loop_cnt = v_loop_cnt + 1;
+    ENDWHILE;
+
+    COMMIT;
+
+    /* If error lines were generated then...*/
+    IF (v_error_rec_cnt > 0)
+    THEN
+        CALL SYSTEM 'echo ' + ' ' + 
+                    ' >> /aahdb/temp/control/data/agency_price_load_error_report';
+
+        /* Move the error records to the rejects table...*/
+        INSERT INTO az_channel_pricing_rejects
+        SELECT line_number,
+               ean_code,
+               az_channel,
+               price,
+               start_date,
+               end_date,
+               load_date,
+               processed_date,
+               1,
+               original_file_name,
+               processed_flag,
+               ' '
+        FROM az_channel_pricing
+        WHERE processed_flag != 1;
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-50- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            v_mcs_res = CALLPROC close_isam();
+            RETURN gc_fail;
+        ENDIF;
+
+        /* Update the reject reason for all lines inserted today...*/
+        IF (lp_update_rejects () != gc_success)
+        THEN
+            CALLPROC lp_create_error_file();
+            v_mcs_res = CALLPROC close_isam();
+        ENDIF;
+
+        /* Now delete the error records from the az_channel_pricing table...*/
+        DELETE FROM az_channel_pricing
+        WHERE processed_flag in (11, 22, 33, 44, 55);
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-56- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            v_mcs_res = CALLPROC close_isam();
+            RETURN gc_fail;
+        ENDIF;
+
+        COMMIT;
+    ELSE
+        /* Fetch ALL Email IDs */
+        IIint = CALLPROC ARRAYCLEAR(v_email_array);
+
+        v_email_array = SELECT *
+                        FROM  agency_interface_email
+                        WHERE agency_supplier = 1
+                        AND   interface_name = 'AGENPRICE'
+                        ORDER BY email ASC;
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-60- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            RETURN gc_fail;
+        ENDIF;
+
+        IF (IIrowcount <= 0)
+        THEN
+            CALLPROC lp_display_message(lpv_message = 'Error - No email contacts found ...');
+            CALLPROC lp_create_error_file();
+            RETURN gc_fail;
+        ENDIF;
+
+        /* Send email confirmation if no line errors...*/
+        IF (v_error_rec_cnt = 0)
+        THEN
+            v_email_to = '';
+
+            UNLOADTABLE v_email_array
+            {
+                v_email_to = SQUEEZE(v_email_to) + '  ' + v_email_array.email + ' ';
+            };
+
+            CALLPROC lp_display_message(lpv_message = 'Sending confirmation email...');
+
+            v_mail_title = 'Agency Price Load Confirmation - ' + TRIM(v_original_file_name);
+            v_mail_title = '''' + TRIM(:v_mail_title) + '''';
+
+            v_system_cmd = 'echo  ' +
+                           ' | mailx -r DoNotReply@aah.co.uk -s ' + TRIM(:v_mail_title)
+                           + ' ' + TRIM(:v_email_to);
+
+            CALL SYSTEM v_system_cmd;
+        ENDIF;
+    ENDIF;
+
+    CALLPROC lp_display_message(lpv_message = 
+                                'az_channel_pricing records have been processed...');
+
+    v_mcs_res = CALLPROC close_isam();
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to display message
+*******************************************************/
+PROCEDURE lp_display_message
+(
+    lpv_message = VARCHAR(120) 
+)=
+DECLARE date_time = VARCHAR(20) NOT NULL,
+{
+
+    date_time = VARCHAR(DATE('now'));
+		lpv_message = date_time + ' - ' + IFNULL(lpv_message,'Null message');
+
+    CALL SYSTEM 'echo ' + VARCHAR(lpv_message) +
+                ' >> /aahdb/logs/current/agency_price_load.log';
+    RETURN;
+}
+
+/************************************************************************
+* Procedure to create error file. 
+* The errorfile is checked for by the calling shell script.
+*************************************************************************/
+PROCEDURE lp_create_error_file() =
+{
+    IF (v_err_file_created = gc_no)
+    THEN
+        CALL SYSTEM 'touch /aahdb/temp/control/data/agency_price_load.error';
+        v_err_file_created = gc_yes;
+    ENDIF;
+
+    RETURN;
+}
+
+/************************************************************************
+* Procedure to add error record details in a file.
+* This file will be sent to AZ via email.
+*************************************************************************/
+PROCEDURE lp_add_to_error_report() =
+DECLARE
+    lv_error_details = VARCHAR(150) NOT NULL;
+{
+    v_error_rec_cnt = v_error_rec_cnt + 1;
+
+    IF (v_error_rec_cnt = 1)
+    THEN
+        CALL SYSTEM 'touch /aahdb/temp/control/data/agency_price_load_error_report';
+
+        CALL SYSTEM 'echo ' + ' ' + 
+                    ' >> /aahdb/temp/control/data/agency_price_load_error_report';
+
+        CALL SYSTEM 'echo ' + UPPERCASE(v_original_file_name) + 
+                    ' >> /aahdb/temp/control/data/agency_price_load_error_report';
+
+        CALL SYSTEM 'echo ' + ' ' + 
+                    ' >> /aahdb/temp/control/data/agency_price_load_error_report';
+
+        CALL SYSTEM 'echo ' + 'The following problems were found with this file:' + 
+                    ' >> /aahdb/temp/control/data/agency_price_load_error_report';
+
+        CALL SYSTEM 'echo ' + 'LINE Problem Description ' + 
+                    ' >> /aahdb/temp/control/data/agency_price_load_error_report';
+    ENDIF;
+
+    IF (v_rejects_done = gc_no)
+    THEN
+        lv_error_details = VARCHAR(v_reject_recs_arr[v_loop_cnt].line_number) 
+                           + '    '
+                           + VARCHAR(v_reject_recs_arr[v_loop_cnt].reject_reason);
+    ELSE
+        IF (v_valid_recs_arr[v_loop_cnt].line_number < 10)
+        THEN
+            lv_error_details = '000';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].line_number < 100)
+        THEN
+            lv_error_details = '00';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].line_number < 1000)
+        THEN
+            lv_error_details = '0';
+        ENDIF;
+
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 11)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'EAN Code is not numeric';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].processed_flag = 22)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'End Date has passed';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].processed_flag = 33)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'End Date is before Start Date';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].processed_flag = 44)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'Product is not an AZ product';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].processed_flag = 55)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'Channel not recognised';
+        ENDIF;
+    ENDIF;
+ 
+    CALL SYSTEM 'echo ' + VARCHAR(lv_error_details) +
+                ' >> /aahdb/temp/control/data/agency_price_load_error_report';
+
+    RETURN;
+}
+
+/*******************************************************
+* Call MCS to either
+* a) INSERT the Agency Record
+* a) UPDATE the Agency record
+*******************************************************/
+PROCEDURE lp_call_mcs(
+    lpv_mode           = CHAR(1)  NOT NULL WITH DEFAULT,
+    lpv_product_code   = CHAR(8)  NOT NULL WITH DEFAULT,
+    lpv_price          = FLOAT8   NOT NULL WITH DEFAULT,
+    lpv_cust_grp       = INTEGER4 NOT NULL WITH DEFAULT,
+    lpv_cust_type      = INTEGER4 NOT NULL WITH DEFAULT,
+    lpv_second_cust_type = INTEGER4 NOT NULL WITH DEFAULT,
+    lpv_start_date     = DATE     NOT NULL WITH DEFAULT,
+    lpv_end_date       = DATE     NOT NULL WITH DEFAULT,
+    lpv_update_datetime = DATE    NOT NULL WITH DEFAULT,
+)=
+DECLARE lv_mcsres        = INTEGER1 NOT NULL WITH DEFAULT,
+        lv_char_end_date = CHAR(19) NOT NULL WITH DEFAULT,
+{
+/* DEBUG Start.... *
+    IIchar = varchar(lpv_mode) + ' |' + varchar(lpv_product_code) + ' |' + varchar(lpv_price);
+    MESSAGE 'Ingres Mode, Code, Price is | ' + IIchar with style = popup;
+
+    IIchar = varchar(lpv_cust_grp) + ' |' + varchar(lpv_cust_type) + ' |' + varchar(lpv_start_date);
+    MESSAGE 'Ingres Grp, Type, StartDate is | ' + IIchar with style = popup;
+
+    IIchar = varchar(lpv_end_date) + ' |' + varchar(lpv_update_datetime);
+    MESSAGE 'Ingres End Date, UpdateDT is | ' + IIchar with style = popup;
+* DEBUG Finish.... */
+
+    IF (lpv_end_date = '')
+    THEN
+        lpv_end_date = '31/12/9999 00:00:00';
+    ENDIF;
+
+    lv_char_end_date = VARCHAR(lpv_end_date);
+    lv_char_end_date = TRIM(lv_char_end_date);
+
+    lv_mcsres = CALLPROC mcs_agency_price_out(lpv_mode,
+                                              lpv_product_code,
+                                              lpv_price,
+                                              lpv_cust_grp,
+                                              lpv_cust_type,
+                                              lpv_second_cust_type,
+                                              lpv_start_date,
+                                              lv_char_end_date,
+                                              lpv_update_datetime);
+
+    IF (lv_mcsres != 0)
+    THEN
+        MESSAGE 'Failed to send to message control. '
+              + 'Error result '
+              + TRIM(CHAR(lv_mcsres))
+              + '. Send will be retried later.'
+              WITH STYLE = POPUP;
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/************************************************************************
+* Procedure to update az_channel_pricing_rejects reason_code
+*************************************************************************/
+PROCEDURE lp_update_rejects() =
+{
+    UPDATE az_channel_pricing_rejects
+    SET reject_reason = 'EAN Code is not numeric' 
+    WHERE reject_code = 11
+    AND DATE_TRUNC('day', DATE(processed_date)) = DATE('today');
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-51- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+        RETURN gc_fail;
+    ENDIF;
+
+    UPDATE az_channel_pricing_rejects
+    SET reject_reason = 'End Date has passed'
+    WHERE reject_code = 22
+    AND DATE_TRUNC('day', DATE(processed_date)) = DATE('today');
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-52- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+        RETURN gc_fail;
+    ENDIF;
+
+    UPDATE az_channel_pricing_rejects
+    SET reject_reason = 'End Date is before Start Date'
+    WHERE reject_code = 33
+    AND DATE_TRUNC('day', DATE(processed_date)) = DATE('today');
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-53- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+        RETURN gc_fail;
+    ENDIF;
+
+    UPDATE az_channel_pricing_rejects
+    SET reject_reason = 'Product is not an AZ product'
+    WHERE reject_code = 44
+    AND DATE_TRUNC('day', DATE(processed_date)) = DATE('today');
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-54- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+        RETURN gc_fail;
+    ENDIF;
+
+    UPDATE az_channel_pricing_rejects
+    SET reject_reason = 'Channel not recognised'
+    WHERE reject_code = 55
+    AND DATE_TRUNC('day', DATE(processed_date)) = DATE('today');
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-55- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+        RETURN gc_fail;
+    ENDIF;
+
+    RETURN gc_success;
+}

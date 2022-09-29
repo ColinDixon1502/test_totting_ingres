@@ -1,0 +1,966 @@
+/*******************************************************
+*  Procedure - agency_customer_price_load.osq
+*  Author    - J Hunter 
+*
+*  Date      - 30-June-2017
+*
+*  Project   - Sanofi 
+*  Purpose   - Procedure to:
+*              Load agency (Sanofi at the moment) price files
+*              into the (Sanofi) agency customer pricing table 
+*              Call MCS to update RemTP
+*              Generate email success and error files
+*              (Email sent in calling script)
+*
+*  Parameters IN - File name
+*
+********************************************************
+* Ver | Date     |Coded| Description
+***** |**********|*****|*********************************
+* 1.0 |30/06/2017| JNH | Original Version
+********************************************************/
+PROCEDURE agency_customer_price_load(
+pv_filename  = VARCHAR(50) NOT NULL;
+) =
+DECLARE
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+
+    IIerrorno     = INTEGER       NOT NULL WITH DEFAULT,
+    IIrowcount    = INTEGER       NOT NULL WITH DEFAULT,
+    IIerrortext   = VARCHAR (256) NOT NULL WITH DEFAULT,
+
+/*******************************************************
+** PROCEDURE SPECIFIC VARIABLES
+*******************************************************/
+
+    IIchar           = VARCHAR(32)  NOT NULL WITH DEFAULT,
+    IIint            = INTEGER      NOT NULL WITH DEFAULT,
+
+    /* Remember, ABF CHAR(x) variables are equivalent to C Char(x+1) */
+    /* variables - don't need to increase ABF char lengths by 1 */
+    /* because the null is automatically placed at the end and */
+    /* ABF reserves space for this WITHOUT having to increase */
+    /* the char array size by 1 */
+    
+    v_original_file_name = VARCHAR(50) NOT NULL WITH DEFAULT,
+    v_rejects_done     = CHAR(1)      NOT NULL WITH DEFAULT,
+    v_err_file_created = CHAR(1)      NOT NULL WITH DEFAULT,
+    v_loop_cnt         = INTEGER(4)   NOT NULL WITH DEFAULT,
+    v_sub_loop_cnt     = INTEGER(4)   NOT NULL WITH DEFAULT,
+    v_sanofi_id        = CHAR(25)     NOT NULL WITH DEFAULT,
+    v_aah_branch       = CHAR(4)      NOT NULL WITH DEFAULT,
+    v_aah_account      = CHAR(9)     NOT NULL WITH DEFAULT,
+    v_ean_code         = CHAR(14)     NOT NULL WITH DEFAULT,
+    v_pip_code         = CHAR(10), 
+    v_product_code     = CHAR(8)      NOT NULL WITH DEFAULT,
+    v_error_rec_cnt    = INTEGER(4)   NOT NULL WITH DEFAULT,
+    v_price            = FLOAT8       NOT NULL WITH DEFAULT,
+    v_start_date       = DATE         NOT NULL WITH DEFAULT,
+    v_end_date         = DATE         NOT NULL WITH DEFAULT,
+    v_desc             = CHAR(32),
+    v_mcs_res          = INTEGER1     NOT NULL WITH DEFAULT,
+    v_count            = INTEGER(4)   NOT NULL WITH DEFAULT,
+    v_arr_rowcount     = INTEGER(4)   NOT NULL WITH DEFAULT,
+    v_line_count       = INTEGER(4)   NOT NULL WITH DEFAULT,
+    v_update_datetime  = DATE         NOT NULL WITH DEFAULT,
+    v_email_to         = VARCHAR(500) NOT NULL WITH DEFAULT,
+    v_system_cmd       = VARCHAR(300) NOT NULL WITH DEFAULT,
+    v_mail_title       = VARCHAR(200) NOT NULL WITH DEFAULT,
+    v_param_string     = VARCHAR(60)  NOT NULL,
+    v_command_str      = VARCHAR(100) NOT NULL,
+    v_command_int      = INTEGER(2),
+    v_reject_recs_arr  = ARRAY OF TYPE OF TABLE sanofi_pricing_rejects, 
+    v_valid_recs_arr   = ARRAY OF TYPE OF TABLE sanofi_pricing, 
+    v_email_array      = ARRAY OF TYPE OF TABLE agency_interface_email,
+    v_ret_code         = INTEGER(4),
+/*******************************************************
+** LOCAL PROCEDURES
+*******************************************************/
+
+    lp_display_message            = PROCEDURE RETURNING NONE;
+    lp_create_error_file          = PROCEDURE RETURNING NONE;
+    lp_add_to_error_report        = PROCEDURE RETURNING NONE;
+    lp_call_acct_pricing_mcs      = PROCEDURE RETURNING INTEGER1;
+    lp_update_rejects             = PROCEDURE RETURNING INTEGER1;
+
+/*******************************************************
+** MAIN PROCEDURE - agency_customer_price_load
+*******************************************************/
+{
+    v_rejects_done = gc_no;
+    v_err_file_created = gc_no;
+    v_error_rec_cnt = 0;
+    v_line_count   = 0;
+    v_arr_rowcount = 0;
+
+    v_param_string       = CALLPROC CommandLineParameters();
+    v_command_str        = SQUEEZE(v_param_string);
+    v_command_int        = LOCATE(v_command_str, ' ');
+
+    pv_filename          = IFNULL(LEFT(v_command_str, (v_command_int - 1)), '');
+     
+    /* Process rejects table first...*/
+    /* Select unprocessed records if any...*/
+    v_reject_recs_arr = SELECT *
+                        FROM   sanofi_pricing_rejects
+                        WHERE  IFNULL(processed_flag,0) = 0
+                        AND    original_file_name = :pv_filename
+                        ORDER BY line_number ASC;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-05- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_create_error_file();
+        RETURN gc_fail;
+    ENDIF;
+
+    COMMIT;
+
+    IF (IIrowcount <= 0)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 
+                                    'No unprocessed records found in sanofi_pricing_rejects...');
+    ELSE
+        v_original_file_name = v_reject_recs_arr[1].original_file_name;
+        v_arr_rowcount = IIrowcount;
+        v_line_count   = v_arr_rowcount;
+
+        CALLPROC lp_display_message(lpv_message =
+                                    'No. of sanofi_pricing_rejects records to process : ' 
+                                    + VARCHAR(v_arr_rowcount));
+
+        /* Add reject lines to error report...*/
+        v_loop_cnt = 1;
+
+        WHILE (v_loop_cnt <= v_arr_rowcount)
+        DO
+            IF (v_line_count = 1 AND v_reject_recs_arr[1].reject_code = 1)
+            THEN
+                /* Error Code 1 = Valid Blank File */
+                /* So no error report */
+                ;
+            ELSE
+                CALLPROC lp_add_to_error_report();
+            ENDIF;
+            v_loop_cnt = v_loop_cnt + 1;
+        ENDWHILE;
+
+        /* Now mark the unprocessed lines as processed...*/
+        UPDATE sanofi_pricing_rejects
+        SET processed_flag = 1,
+            processed_date = DATE('now')
+        WHERE IFNULL(processed_flag,0) = 0
+        AND   original_file_name = :pv_filename;
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-10- INGRES error in UPDATE ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            RETURN gc_fail;
+        ENDIF;
+
+        COMMIT;
+
+        CALLPROC lp_display_message(lpv_message = 
+                                    VARCHAR(v_line_count) + ' sanofi_pricing_rejects records have been processed...');
+
+    ENDIF;
+
+    v_rejects_done = gc_yes;
+    v_arr_rowcount = 0;
+    
+    /* Process valid table next...*/
+    /* Select unprocessed records if any...*/
+    v_valid_recs_arr = SELECT *
+                       FROM   sanofi_pricing
+                       WHERE  IFNULL(processed_flag,0) = 0
+                       AND    original_file_name = :pv_filename
+                       ORDER BY line_number ASC;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-15- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+        CALLPROC lp_create_error_file();
+        RETURN gc_fail;
+    ENDIF;
+
+    IF (IIrowcount <= 0)
+    THEN
+        CALLPROC lp_display_message(lpv_message = 
+                                    'No unprocessed records found in sanofi_pricing. Exiting ...');
+        IF (v_line_count = 0)
+        THEN
+            /* No rejects or staging table records found */
+            /* In other words, no file found */
+            /* Need to send email to Application Maintenance */
+            /* (or Ops) and Sanofi */
+
+            CALL SYSTEM 'echo ' + 'NO FILE FOUND ' +
+                    ' > /aahdb/temp/control/data/agency_cust_price_err_report';
+
+            RETURN gc_success;
+        ENDIF;
+
+        IF (v_line_count = 1 AND v_reject_recs_arr[1].reject_code = 1)
+        THEN
+            /* Error Code 1 = Valid Blank File */
+            v_line_count = 0;  /* Needed because v_error_rec_cnt set to 0 */
+        ELSE
+            CALL SYSTEM 'echo ' + ' ' + 
+                    ' >> /aahdb/temp/control/data/agency_cust_price_err_report';
+
+            CALL SYSTEM 'echo ' + VARCHAR(v_line_count - v_error_rec_cnt) + ' Lines were processed successfully ' +
+                    ' >> /aahdb/temp/control/data/agency_cust_price_err_report';
+
+            RETURN gc_success;
+        ENDIF;
+    ELSE
+        v_original_file_name = v_valid_recs_arr[1].original_file_name;
+        v_arr_rowcount = IIrowcount;
+        v_line_count   = v_line_count + v_arr_rowcount;
+    ENDIF;
+
+    CALLPROC lp_display_message(lpv_message =
+                                'No. of sanofi_pricing records to process : ' 
+                                + VARCHAR(v_arr_rowcount));
+
+    COMMIT;
+
+    v_mcs_res = CALLPROC open_isam();
+
+    /* Validate the selected records...*/
+    v_loop_cnt = 1;
+    v_update_datetime = DATE('now');
+
+    WHILE (v_loop_cnt <= v_arr_rowcount)
+    DO
+        CALLPROC lp_display_message(lpv_message =
+                                    'Processing Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number));
+
+        v_valid_recs_arr[v_loop_cnt].processed_flag = 1;
+
+        /* Validate Sanofi id. - ensure there is an AAH branch and account no */
+        v_sanofi_id = '';
+
+        SELECT ssa.supplier_account_no AS v_sanofi_id,
+               ssa.branch AS v_aah_branch,
+               ssa.account_no AS v_aah_account
+        FROM   saccts_supplier_acctno ssa
+        WHERE ssa.supplier_account_no = :v_valid_recs_arr[v_loop_cnt].sanofi_cust_id
+        AND   ssa.sequence_no = 41;
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-20- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            v_mcs_res = CALLPROC close_isam();
+            RETURN gc_fail;
+        ENDIF;
+
+        IF (IIrowcount <= 0)
+        THEN
+            CALLPROC lp_display_message(lpv_message =
+                                        'Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                        ' Sanofi Id:  ' + 
+                                        v_valid_recs_arr[v_loop_cnt].sanofi_cust_id +
+                                        ' - is not a valid Sanofi account number, there is no AAH equivalent account.');
+            v_valid_recs_arr[v_loop_cnt].processed_flag = 100;
+            CALLPROC lp_add_to_error_report();
+        ENDIF;
+
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 1)
+        THEN
+            /* Validate Ean Code (numeric)...*/
+
+            SELECT e.ean_code AS v_ean_code
+            FROM   ean_codes e 
+            WHERE  e.ean_code = :v_valid_recs_arr[v_loop_cnt].ean_code
+            AND    e.seq_no = 1;
+
+            INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+            IF (IIerrorno != gc_success)
+            THEN
+                ROLLBACK;
+                MESSAGE '-25- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+                CALLPROC lp_create_error_file();
+                v_mcs_res = CALLPROC close_isam();
+                RETURN gc_fail;
+            ENDIF;
+
+            IF (IIrowcount <= 0)
+            THEN
+                CALLPROC lp_display_message(lpv_message =
+                                        'Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                        'EAN code: ' +
+                                        v_valid_recs_arr[v_loop_cnt].ean_code +
+                                        ' - does not exist in Ingres database.');
+                v_valid_recs_arr[v_loop_cnt].processed_flag = 105;
+                CALLPROC lp_add_to_error_report();
+            ENDIF;
+        ENDIF;
+
+        /* Ignore the pip_code - we won't even error if the given pip_code */
+        /* differs from that of the product with the given ean_code */
+        /* Darren Imrie said ignore pip_code, honest Guv */
+       
+        /* Price field will have been checked by Masai - digits and */
+        /* one, but only one, decimal point. */
+        /* But let's make sure here */
+
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 1)
+        THEN
+            v_ret_code = CALLPROC check_numeric(val_in          = v_valid_recs_arr[v_loop_cnt].price,
+                                                int_only        = 'N',
+                                                allow_sign      = 'N',
+                                                suppress_errors = 'Y');
+ 
+            IF (v_ret_code !=0)
+            THEN
+                CALLPROC lp_display_message(lpv_message =
+                                        'Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                        'Price: ' +
+                                        v_valid_recs_arr[v_loop_cnt].price +
+                                        ' - is not a valid value.');
+                v_valid_recs_arr[v_loop_cnt].processed_flag = 125;
+                CALLPROC lp_add_to_error_report();
+            ENDIF;
+        ENDIF;
+
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 1)
+        THEN
+            /* Start date must be supplied - cannot be NULL or space */
+            IF (    IFNULL(v_valid_recs_arr[v_loop_cnt].start_date, '') = ''
+                 OR v_valid_recs_arr[v_loop_cnt].start_date = ' ')
+            THEN
+                CALLPROC lp_display_message(lpv_message =
+                                                'Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                                ' Start date cannot be empty. ');
+                v_valid_recs_arr[v_loop_cnt].processed_flag = 110;
+                CALLPROC lp_add_to_error_report();
+            ENDIF;
+
+            /* Validate START date - must not be greater than END date...*/
+            IF (    IFNULL(v_valid_recs_arr[v_loop_cnt].end_date, '') != ''
+                 OR v_valid_recs_arr[v_loop_cnt].end_date != ' ')
+                
+            THEN
+                IF (v_valid_recs_arr[v_loop_cnt].start_date >
+                    v_valid_recs_arr[v_loop_cnt].end_date)
+                THEN
+                    CALLPROC lp_display_message(lpv_message =
+                                                'Line: ' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                                ' Start Date: ' +  
+                                                VARCHAR(v_valid_recs_arr[v_loop_cnt].start_date) +
+                                                ' - start_date is greater than end_date.');
+    
+                    v_valid_recs_arr[v_loop_cnt].processed_flag = 115;
+                    CALLPROC lp_add_to_error_report();
+                ENDIF;
+            ENDIF;
+        ENDIF;
+
+        /* Validate product - ensure it is has a Sanofi supplier code and */
+        /* that the supplier code is in the manufacturer_supplier_codes */
+        /* table for agency id 13 */
+       
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 1)
+        THEN
+            v_product_code = '';
+
+            SELECT op.product_code AS v_product_code
+            FROM   op_products op,
+                   ean_codes ean,
+                   manufacturer_supplier_codes man
+            WHERE ean.product_code = op.product_code
+            AND   op.supplier_code = man.supplier_code
+            AND   ean.seq_no = 1
+            AND   man.agency_supplier =13 
+            AND ean.ean_code = :v_valid_recs_arr[v_loop_cnt].ean_code;
+
+            INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+            IF (IIerrorno != gc_success)
+            THEN
+                ROLLBACK;
+                MESSAGE '-40- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+                CALLPROC lp_create_error_file();
+                v_mcs_res = CALLPROC close_isam();
+                RETURN gc_fail;
+            ENDIF;
+
+            IF (IIrowcount <= 0)
+            THEN
+                CALLPROC lp_display_message(lpv_message =
+                                            'Line:' + VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number) +
+                                            ' EAN Code: ' + v_valid_recs_arr[v_loop_cnt].ean_code +
+                                            ' is product ' + v_product_code +
+                                            ' which is not a Sanofi DTP product.');
+
+                v_valid_recs_arr[v_loop_cnt].processed_flag = 120;
+
+                CALLPROC lp_add_to_error_report();
+            ENDIF;
+        ENDIF;
+
+        /* Update/Insert into agency_price table...*/
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 1)
+        THEN
+            /* Check if there is an existing entry with the same start */
+            /* date for the given customer and product. */
+            /* If there is, update it. */
+
+            /* Retrieve required data from array...*/
+            v_price    = FLOAT8(v_valid_recs_arr[v_loop_cnt].price);
+            v_desc     = IFNULL(v_valid_recs_arr[v_loop_cnt].description, ''); 
+            v_end_date = IFNULL(v_valid_recs_arr[v_loop_cnt].end_date, '');
+            v_start_date = v_valid_recs_arr[v_loop_cnt].start_date;
+
+            SELECT COUNT(*) as v_count
+            FROM agency_customer_pricing
+            WHERE agency_supplier = 13 
+            AND   branch         = :v_aah_branch
+            AND   account_no     = :v_aah_account
+            AND   product_code   = :v_product_code
+            AND   start_date     = :v_start_date;
+
+            INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+            IF (IIerrorno != gc_success)
+            THEN
+                ROLLBACK;
+                MESSAGE '-45- INGRES error in SELECT ' + IIerrortext WITH STYLE = POPUP;
+                CALLPROC lp_create_error_file();
+                v_mcs_res = CALLPROC close_isam();
+                RETURN gc_fail;
+            ENDIF;
+
+            /* Either UPDATE existing record or INSERT new record...*/
+            IF (v_count > 0)
+            THEN
+                UPDATE agency_customer_pricing
+                SET price           = :v_price,
+                    description     = :v_desc,
+                    end_date        = :v_end_date,
+                    update_datetime = :v_update_datetime
+                WHERE agency_supplier = 13
+                AND   branch          = :v_aah_branch
+                AND   account_no      = :v_aah_account
+                AND   product_code    = :v_product_code
+                AND   start_date      = :v_start_date;
+
+                INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+                IF (IIerrorno != gc_success)
+                THEN
+                    ROLLBACK;
+                    MESSAGE '-50- INGRES error in UPDATE ' + IIerrortext WITH STYLE = POPUP;
+                    CALLPROC lp_create_error_file();
+                    v_mcs_res = CALLPROC close_isam();
+                    RETURN gc_fail;
+                ENDIF;
+
+                /* Call MCS procedure to update Agency Record...*/
+                IF (lp_call_acct_pricing_mcs (lpv_mode = 'U',
+                                              lpv_product_code    = v_product_code,
+                                              lpv_branch_id       = v_aah_branch,
+                                              lpv_account_no      = v_aah_account,
+                                              lpv_price           = v_price,
+                                              lpv_start_date      = v_start_date,
+                                              lpv_end_date        = v_end_date,
+                                              lpv_description     = v_desc,
+                                              lpv_update_datetime = v_update_datetime) != gc_success)
+                THEN
+                    v_mcs_res = CALLPROC close_isam();
+                    MESSAGE '-51- message cannot be sent to RemTP' WITH STYLE = POPUP;
+                    CALLPROC lp_create_error_file();
+                    RETURN gc_fail;
+                ENDIF;
+            ELSE
+                INSERT INTO agency_customer_pricing
+                    (agency_supplier,
+                     branch,
+                     account_no,
+                     product_code,
+                     description,
+                     price,
+                     start_date,
+                     end_date,
+                     update_datetime)
+                VALUES
+                    (13,
+                     :v_aah_branch,
+                     :v_aah_account,
+                     :v_product_code,
+                     :v_desc,
+                     :v_price,
+                     :v_start_date,
+                     :v_end_date,
+                     :v_update_datetime);
+
+                INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+                IF (IIerrorno != gc_success)
+                THEN
+                    ROLLBACK;
+                    MESSAGE '-60- INGRES error in INSERT ' + IIerrortext WITH STYLE = POPUP;
+                    CALLPROC lp_create_error_file();
+                    v_mcs_res = CALLPROC close_isam();
+                    RETURN gc_fail;
+                ENDIF;
+
+                /* Call MCS procedure to insert Agency Record...*/
+                IF (lp_call_acct_pricing_mcs (lpv_mode = 'I',
+                                              lpv_branch_id       = v_aah_branch,
+                                              lpv_account_no      = v_aah_account,
+                                              lpv_product_code    = v_product_code,
+                                              lpv_price           = v_price,
+                                              lpv_start_date      = v_start_date,
+                                              lpv_end_date        = v_end_date,
+                                              lpv_description     = v_desc,
+                                              lpv_update_datetime = v_update_datetime) != gc_success)
+                THEN
+                    v_mcs_res = CALLPROC close_isam();
+                    MESSAGE '-61- message cannot be sent to RemTP' WITH STYLE = POPUP;
+                    CALLPROC lp_create_error_file();
+                    RETURN gc_fail;
+                ENDIF;
+            ENDIF;
+        ENDIF;  
+
+        /* UPDATE the sanofi_pricing record...*/
+        UPDATE sanofi_pricing
+        SET    processed_flag = :v_valid_recs_arr[v_loop_cnt].processed_flag,
+               processed_date = :v_update_datetime
+        WHERE  processed_flag = 0 
+        AND    original_file_name = :pv_filename
+        AND    line_number    = :v_valid_recs_arr[v_loop_cnt].line_number
+        AND    load_date      = :v_valid_recs_arr[v_loop_cnt].load_date;
+        
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-62- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            v_mcs_res = CALLPROC close_isam();
+            RETURN gc_fail;
+        ENDIF;
+
+        v_loop_cnt = v_loop_cnt + 1;
+
+    ENDWHILE;
+   
+    IF (v_error_rec_cnt > 0)
+    THEN
+        CALL SYSTEM 'echo ' + ' ' + 
+                    ' >> /aahdb/temp/control/data/agency_cust_price_err_report';
+
+        CALL SYSTEM 'echo ' + VARCHAR(v_line_count - v_error_rec_cnt) + ' Lines were processed successfully ' +
+                ' >> /aahdb/temp/control/data/agency_cust_price_err_report';
+
+        /* Move the error records to the rejects table...*/
+        INSERT INTO sanofi_pricing_rejects
+        SELECT line_number,
+               sanofi_cust_id,
+               ean_code,
+               pip_code,
+               price,
+               '',
+               '',
+               start_date,
+               end_date,
+               description,
+               load_date,
+               processed_date,
+               1,
+               original_file_name,
+               processed_flag,
+               ' '
+        FROM sanofi_pricing
+        WHERE processed_flag != 1
+        AND   original_file_name = :pv_filename;
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-65- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            v_mcs_res = CALLPROC close_isam();
+            RETURN gc_fail;
+        ENDIF;
+
+        /* Update the reject reason for all lines inserted today...*/
+        IF (lp_update_rejects () != gc_success)
+        THEN
+            CALLPROC lp_create_error_file();
+            v_mcs_res = CALLPROC close_isam();
+        ENDIF;
+
+        /* Now delete the error records from the sanofi_pricing table...*/
+        DELETE FROM sanofi_pricing
+        WHERE processed_flag in (100, 105, 110, 115, 120, 125)
+        AND   original_file_name = :pv_filename;         /* Play safe! */
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-80- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            v_mcs_res = CALLPROC close_isam();
+            RETURN gc_fail;
+        ENDIF;
+
+    ELSE
+        /* Fetch ALL Email IDs */
+        IIint = CALLPROC ARRAYCLEAR(v_email_array);
+
+        v_email_array = SELECT *
+                        FROM  agency_interface_email
+                        WHERE agency_supplier = 13 
+                        AND   interface_name = 'AGENPRICE'
+                        ORDER BY email ASC;
+
+        INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+        IF (IIerrorno != gc_success)
+        THEN
+            ROLLBACK;
+            MESSAGE '-85- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+            CALLPROC lp_create_error_file();
+            RETURN gc_fail;
+        ENDIF;
+
+        IF (IIrowcount <= 0)
+        THEN
+            CALLPROC lp_display_message(lpv_message = 'Error - No email contacts found ...');
+            CALLPROC lp_create_error_file();
+            RETURN gc_fail;
+        ENDIF;
+
+        /* Send email confirmation if no line errors...*/
+        IF (v_error_rec_cnt = 0)
+        THEN
+            v_email_to = '';
+
+            UNLOADTABLE v_email_array
+            {
+                v_email_to = SQUEEZE(v_email_to) + '  ' + v_email_array.email + ' ';
+            };
+
+            CALLPROC lp_display_message(lpv_message = 'Sending confirmation email...');
+
+            v_mail_title = 'Agency Price Load Confirmation - ' + TRIM(v_original_file_name);
+            v_mail_title = '''' + TRIM(:v_mail_title) + '''';
+
+            v_system_cmd = 'echo  ' +
+                           ' | mailx -r DoNotReply@aah.co.uk -s ' + TRIM(:v_mail_title)
+                           + ' ' + TRIM(:v_email_to);
+
+            CALL SYSTEM v_system_cmd;
+        ENDIF;
+    ENDIF;
+
+    COMMIT;
+
+    CALLPROC lp_display_message(lpv_message = 
+                                VARCHAR(v_line_count - v_error_rec_cnt) + ' sanofi_pricing records have been processed...');
+
+    v_mcs_res = CALLPROC close_isam();
+
+    RETURN gc_success;
+}
+
+/*******************************************************
+* Procedure to display message
+*******************************************************/
+PROCEDURE lp_display_message
+(
+    lpv_message = VARCHAR(200) 
+)=
+DECLARE date_time = VARCHAR(20) NOT NULL,
+{
+
+    date_time = VARCHAR(DATE('now'));
+		lpv_message = date_time + ' - ' + IFNULL(lpv_message,'Null message');
+
+    CALL SYSTEM 'echo ' + VARCHAR(lpv_message) +
+                ' >> /aahdb/logs/current/agency_customer_price_load.log';
+    RETURN;
+}
+
+/************************************************************************
+* Procedure to create error file. 
+* The errorfile is checked for by the calling shell script.
+*************************************************************************/
+PROCEDURE lp_create_error_file() =
+{
+    IF (v_err_file_created = gc_no)
+    THEN
+        CALL SYSTEM 'touch /aahdb/temp/control/data/agency_customer_price_load.error';
+        v_err_file_created = gc_yes;
+    ENDIF;
+
+    RETURN;
+}
+
+/************************************************************************
+* Procedure to add error record details in a file.
+* This file will be sent to Sanofi via email.
+*************************************************************************/
+PROCEDURE lp_add_to_error_report() =
+DECLARE
+    lv_error_details = VARCHAR(150) NOT NULL;
+{
+    v_error_rec_cnt = v_error_rec_cnt + 1;
+
+    IF (v_error_rec_cnt = 1)
+    THEN
+        CALL SYSTEM 'touch /aahdb/temp/control/data/agency_cust_price_err_report';
+
+        CALL SYSTEM 'echo ' + ' ' + 
+                    ' >> /aahdb/temp/control/data/agency_cust_price_err_report';
+
+        CALL SYSTEM 'echo ' + UPPERCASE(v_original_file_name) + 
+                    ' >> /aahdb/temp/control/data/agency_cust_price_err_report';
+
+        CALL SYSTEM 'echo ' + 'The following problems were found with this file:' + 
+                    ' >> /aahdb/temp/control/data/agency_cust_price_err_report';
+
+        CALL SYSTEM 'echo ' + ' ' + 
+                    ' >> /aahdb/temp/control/data/agency_cust_price_err_report';
+
+        CALL SYSTEM 'echo ' + 'LINE Problem Description ' + 
+                    ' >> /aahdb/temp/control/data/agency_cust_price_err_report';
+    ENDIF;
+
+    IF (v_rejects_done = gc_no)
+    THEN
+        IF (v_reject_recs_arr[v_loop_cnt].line_number < 10)
+        THEN
+            lv_error_details = '000';
+        ELSEIF (v_reject_recs_arr[v_loop_cnt].line_number < 100)
+        THEN
+            lv_error_details = '00';
+        ENDIF;
+
+        lv_error_details = VARCHAR(lv_error_details) +
+                           VARCHAR(v_reject_recs_arr[v_loop_cnt].line_number) 
+                           + '    '
+                           + VARCHAR(v_reject_recs_arr[v_loop_cnt].reject_reason);
+    ELSE
+        IF (v_valid_recs_arr[v_loop_cnt].line_number < 10)
+        THEN
+            lv_error_details = '000';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].line_number < 100)
+        THEN
+            lv_error_details = '00';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].line_number < 1000)
+        THEN
+            lv_error_details = '0';
+        ENDIF;
+
+        IF (v_valid_recs_arr[v_loop_cnt].processed_flag = 100)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'Invalid Sanofi Customer Id.';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].processed_flag = 105)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'EAN Code does not exist';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].processed_flag = 110)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'No Start Date';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].processed_flag = 115)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'Start Date is later than End Date';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].processed_flag = 120)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'Not a Sanofi DTP Product';
+        ELSEIF (v_valid_recs_arr[v_loop_cnt].processed_flag = 125)
+        THEN
+            lv_error_details = VARCHAR(lv_error_details) +
+                               VARCHAR(v_valid_recs_arr[v_loop_cnt].line_number)
+                               + '    '
+                               + 'Not a valid price';
+        ENDIF;
+    ENDIF;
+ 
+    CALL SYSTEM 'echo ' + VARCHAR(lv_error_details) +
+                ' >> /aahdb/temp/control/data/agency_cust_price_err_report';
+
+    RETURN;
+}
+
+/*******************************************************
+* Call MCS to either
+* a) INSERT the Agency Record
+* b) UPDATE the Agency Record
+*******************************************************/
+PROCEDURE lp_call_acct_pricing_mcs(
+    lpv_mode            = CHAR(1)  NOT NULL WITH DEFAULT,
+    lpv_product_code    = CHAR(8)  NOT NULL WITH DEFAULT,
+    lpv_branch_id       = CHAR(4)  NOT NULL WITH DEFAULT,
+    lpv_account_no      = CHAR(9)  NOT NULL WITH DEFAULT,
+    lpv_price           = FLOAT8   NOT NULL WITH DEFAULT,
+    lpv_start_date      = DATE     NOT NULL WITH DEFAULT,
+    lpv_end_date        = DATE     NOT NULL WITH DEFAULT,
+    lpv_description     = CHAR(32),
+    lpv_update_datetime = DATE     NOT NULL WITH DEFAULT,
+)=
+DECLARE lv_mcsres        = INTEGER1 NOT NULL WITH DEFAULT,
+        lv_char_end_date = CHAR(19) NOT NULL WITH DEFAULT,
+{
+/* DEBUG Start.... *
+    IIchar = varchar(lpv_mode) + ' |' + varchar(lpv_product_code) + ' |' + varchar(lpv_price);
+    MESSAGE 'Ingres Mode, Code, Price is | ' + IIchar with style = popup;
+
+    IIchar = varchar(lpv_branch_id) + ' |' + varchar(lpv_account_no) + ' |' + varchar(lpv_start_date);
+    MESSAGE 'Ingres Branch, Acount, StartDate is | ' + IIchar with style = popup;
+
+    IIchar = varchar(lpv_end_date) + ' |' + varchar(lpv_update_datetime);
+    MESSAGE 'Ingres End Date, UpdateDT is | ' + IIchar with style = popup;
+* DEBUG Finish.... */
+
+    IF (lpv_end_date = '')
+    THEN
+        lpv_end_date = '31/12/9999 00:00:00';
+    ENDIF;
+
+    lv_char_end_date = VARCHAR(lpv_end_date);
+    lv_char_end_date = TRIM(lv_char_end_date);
+
+    lv_mcsres = CALLPROC mcs_account_price_out(lpv_mode,
+                                               lpv_product_code,
+                                               lpv_branch_id,
+                                               lpv_account_no, 
+                                               lpv_price,
+                                               lpv_start_date,
+                                               lv_char_end_date,
+                                               lpv_description,
+                                               lpv_update_datetime);
+    IF (lv_mcsres != 0)
+    THEN
+        MESSAGE 'Failed to send to message control. '
+              + 'Error result '
+              + TRIM(CHAR(lv_mcsres))
+              WITH STYLE = POPUP;
+              RETURN gc_fail;
+    ENDIF;
+
+    RETURN gc_success;
+}
+
+/************************************************************************
+* Procedure to update sanofi_pricing_rejects reason_code
+*************************************************************************/
+PROCEDURE lp_update_rejects() =
+{
+    UPDATE sanofi_pricing_rejects
+    SET reject_reason = 'Invalid Sanofi Customer Id.' 
+    WHERE reject_code = 100 
+    AND DATE_TRUNC('day', DATE(processed_date)) = DATE('today')
+    AND   original_file_name = :pv_filename;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-70- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+        RETURN gc_fail;
+    ENDIF;
+
+    UPDATE sanofi_pricing_rejects
+    SET reject_reason = 'EAN code does not exist'
+    WHERE reject_code = 105
+    AND DATE_TRUNC('day', DATE(processed_date)) = DATE('today')
+    AND   original_file_name = :pv_filename;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-71- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+        RETURN gc_fail;
+    ENDIF;
+
+    UPDATE sanofi_pricing_rejects
+    SET reject_reason = 'No Start Date'
+    WHERE reject_code = 110 
+    AND DATE_TRUNC('day', DATE(processed_date)) = DATE('today')
+    AND   original_file_name = :pv_filename;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-72- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+        RETURN gc_fail;
+    ENDIF;
+
+    UPDATE sanofi_pricing_rejects
+    SET reject_reason = 'Start Date > End Date'
+    WHERE reject_code = 115 
+    AND DATE_TRUNC('day', DATE(processed_date)) = DATE('today')
+    AND   original_file_name = :pv_filename;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-73- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+        RETURN gc_fail;
+    ENDIF;
+
+    UPDATE sanofi_pricing_rejects
+    SET reject_reason = 'Not a Sanofi DTP Product'
+    WHERE reject_code = 120 
+    AND DATE_TRUNC('day', DATE(processed_date)) = DATE('today')
+    AND   original_file_name = :pv_filename;
+
+    INQUIRE_INGRES (IIerrorno = ERRORNO, IIerrortext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+    IF (IIerrorno != gc_success)
+    THEN
+        ROLLBACK;
+        MESSAGE '-74- INGRES error ' + IIerrortext WITH STYLE = POPUP;
+        RETURN gc_fail;
+    ENDIF;
+
+    RETURN gc_success;
+}

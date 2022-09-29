@@ -1,0 +1,164 @@
+/****************************************************************************/
+/*  Frame  - Agency Supplier Email Address                                  */
+/*  Author - Matthew Toyer                                                  */
+/*                                                                          */
+/*  Date   - June 2007                                                      */
+/*  Type   - Online Frame                                                   */
+/*                                                                          */
+/*  Source - agency_supplier_email_address01.osq                            */
+/*  Form   - agency_supplier_email_address01                                */
+/*                                                                          */
+/*  Parameters expected - None.                                             */
+/*                                                                          */
+/****************************************************************************/
+/*  Version | Date     | Coded | Description of changes made                */
+/***********|**********|*******|*********************************************/
+/*  1.0     | 01.06.07 | MBT   | Original Code                              */
+/***********|**********|*******|*********************************************/
+INITIALIZE() =
+DECLARE
+			h_count				= INTEGER4 NOT NULL WITH DEFAULT;
+      max_no        = INTEGER4 NOT NULL WITH DEFAULT;
+      lv_orig_email = VARCHAR(128) NOT NULL WITH DEFAULT;
+BEGIN
+  SET_FORMS FRS(TIMEOUT = :gc_timeout);     
+	SET_FORMS FIELD '' (
+									DISPLAYONLY('agency_supplier') = 1,
+									UNDERLINE('agency_supplier')		= 0,
+									INTENSITY('agency_supplier')		= 0,
+									DISPLAYONLY('supplier_group') = 1,
+									UNDERLINE('supplier_group')		= 0,
+									INTENSITY('supplier_group')		= 0
+													);
+  lv_orig_email = supplier_email_addr;
+END
+
+FIELD 'supplier_email_addr' =
+BEGIN
+
+		IF :supplier_email_addr = ''
+		THEN
+			MESSAGE 'Invalid Email Address ...please enter a valid Email Address.'
+							WITH STYLE=POPUP;
+			RESUME;
+		ENDIF;
+
+		RESUME NEXT;
+
+END
+
+ON TIMEOUT =
+BEGIN
+    CALLPROC timeout_popup();
+END
+
+'Save',KEY frskey4	=
+BEGIN
+
+		IF :purpose = 'INSERT'
+		THEN
+
+				SELECT 
+					h_count = count(*)
+				FROM	
+				  agency_supplier_email_address
+				WHERE
+					agency_supplier	= :agency_supplier
+        AND supplier_group = :supplier_group
+        AND TRIM(supplier_email_addr) = TRIM(:supplier_email_addr);
+
+        INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+        IF (g_error != 0)
+        THEN
+           MESSAGE 'Error occured initializing agency_supplier_email_address details..!' + X'0A'
+                 + 'Error: ' + VARCHAR(:g_err_text)
+                    WITH STYLE=POPUP;
+           RETURN -1;
+        ENDIF;
+   
+        COMMIT;
+
+				IF :h_count >= 1
+				THEN
+						MESSAGE 'The Email ' + VARCHAR(:supplier_email_addr) + '  already been defined.'
+									+ X'0A' + 'Cannot Save.'
+									WITH STYLE=POPUP;
+						RESUME;
+				ENDIF;
+
+				IF :supplier_email_addr = ''
+				THEN
+						MESSAGE 'Please key in Supplier Email Address for Agency Supplier ' + VARCHAR(:agency_supplier)
+										WITH STYLE=POPUP;
+						RESUME FIELD 'supplier_email_addr';
+				ENDIF;
+
+				MESSAGE 'Saving..';
+				INSERT INTO
+							agency_supplier_email_address(
+								agency_supplier,
+								supplier_group,
+								supplier_email_addr,
+                audit_date,
+                branch_id,
+                user_id
+									)
+				VALUES(
+								:agency_supplier,
+								:supplier_group,
+								:supplier_email_addr,
+                DATE('now'),
+                :gv_branch_id,
+                :gv_user_id);
+
+				INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+				IF :g_error != 0
+				THEN
+					MESSAGE 'Error occured saving details for agency_supplier_email_address ' + VARCHAR(:agency_supplier)
+								+ X'0A' + 'Error:' + VARCHAR(:g_err_text)
+									WITH STYLE=POPUP;
+          ROLLBACK;
+					RETURN -1;
+				ENDIF;
+        COMMIT;
+				RETURN 0;
+
+		ELSEIF :purpose = 'UPDATE'
+		THEN
+				MESSAGE 'Saving..';
+				UPDATE
+				  agency_supplier_email_address
+				SET
+					supplier_email_addr	= TRIM(:supplier_email_addr),
+          audit_date = DATE('now'),
+          branch_id = :gv_branch_id,
+          user_id = :gv_user_id
+				WHERE
+					  agency_supplier = :agency_supplier
+				AND	supplier_group = :supplier_group
+        AND TRIM(supplier_email_addr) = TRIM(:lv_orig_email);
+
+				INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+				IF :g_error != 0
+				THEN
+					MESSAGE 'Error occured updating agency_supplier_email_addr ' + VARCHAR(:agency_supplier)
+								+	X'0A' + 'Error:' + VARCHAR(:g_err_text)
+								WITH STYLE=POPUP;
+          ROLLBACK;
+					RETURN -1;
+				ENDIF;
+        COMMIT;
+				RETURN 0;
+		ELSE
+				MESSAGE 'This frame is called with invlaid option..cannot Save'
+							WITH STYLE=POPUP;
+				RESUME;
+		ENDIF;
+
+END
+
+'Exit',KEY frskey3	=
+BEGIN
+	RETURN 1;
+END

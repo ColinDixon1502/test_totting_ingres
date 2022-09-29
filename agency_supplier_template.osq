@@ -1,0 +1,612 @@
+/****************************************************************************/
+/*  Frame  - Agency Supplier Template                                       */
+/*  Author - Matthew Toyer                                                  */
+/*                                                                          */
+/*  Date   - June 2007                                                      */
+/*  Type   - Online Frame                                                   */
+/*                                                                          */
+/*  Source - agency_supplier_template.osq                                   */
+/*  Form   - agency_supplier_template                                       */
+/*                                                                          */
+/*  Parameters expected - None.                                             */
+/*                                                                          */
+/****************************************************************************/
+/*  Version | Date     | Coded | Description of changes made                */
+/***********|**********|*******|*********************************************/
+/*  1.0     | 01/06/07 | MBT   | Original Code                              */
+/***********|**********|*******|*********************************************/
+initialize() =
+DECLARE
+		h_rows		 = INTEGER4 NOT NULL WITH DEFAULT;
+		pi_retval	 = INTEGER4 NOT NULL WITH DEFAULT;
+		pc_char		 = CHAR(1)  NOT NULL WITH DEFAULT;
+		IIint	     = INTEGER4 NOT NULL WITH DEFAULT;
+    field_name = CHAR(24) NOT NULL WITH DEFAULT;
+    table_owner = VARCHAR(32) NOT NULL WITH DEFAULT;
+		dup_check	 = INTEGER4 NOT NULL WITH DEFAULT;
+
+    get_details = PROCEDURE RETURNING INTEGER NOT NULL;
+    lp_val_agency_supplier = PROCEDURE RETURNING INTEGER NOT NULL;
+    lp_val_supplier_group = PROCEDURE RETURNING INTEGER NOT NULL;
+    lp_val_table_name = PROCEDURE RETURNING INTEGER NOT NULL;
+    lp_val_column_name = PROCEDURE RETURNING INTEGER NOT NULL;
+BEGIN
+
+	SET_FORMS FRS(TIMEOUT = :gc_timeout);
+
+  SET_FORMS FRS (ACTIVATE(previousfield) = 1);
+
+  SET_FORMS FRS(MAP(FRSKEY1)='pf1');
+  SET_FORMS FRS(LABEL(FRSKEY1)='F1');
+  SET_FORMS FRS(MAP(FRSKEY7)='pf3');
+  SET_FORMS FRS(LABEL(FRSKEY7)='F3');
+  SET_FORMS FRS(MAP(FRSKEY8)='pf4');
+  SET_FORMS FRS(LABEL(FRSKEY8)='F4');
+  SET_FORMS FRS(MAP(FRSKEY9)='pf5');
+  SET_FORMS FRS(LABEL(FRSKEY9)='F5');
+  SET_FORMS FRS(MAP(FRSKEY14)='pf6');
+  SET_FORMS FRS(LABEL(FRSKEY14)='F6');
+  SET_FORMS FRS(MAP(FRSKEY11)='pf7');
+  SET_FORMS FRS(LABEL(FRSKEY11)='F7');
+  SET_FORMS FRS(MAP(FRSKEY12)='pf8');
+  SET_FORMS FRS(LABEL(FRSKEY12)='F8');
+  SET_FORMS FRS(MAP(FRSKEY13)='pf9');
+  SET_FORMS FRS(LABEL(FRSKEY13)='F9');
+  SET_FORMS FRS(MAP(FRSKEY10)='pf10');
+  SET_FORMS FRS(LABEL(FRSKEY10)='F10');
+  SET_FORMS FRS(MAP(FRSKEY4)='pf11');
+  SET_FORMS FRS(LABEL(FRSKEY4)='F11');
+  SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+  SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+  SET_FORMS FRS(MAP(menu10)='pf22');
+  SET_FORMS FRS(LABEL(menu10)='Alt&F3');
+  SET_FORMS FRS(MAP(FRSKEY28)='pf17');
+  SET_FORMS FRS(LABEL(FRSKEY28)='End');
+
+  IF gv_user_id = '' 
+  THEN
+     gv_user_id = 'jt';
+  ENDIF;
+  IF gv_branch_id = ''
+  THEN
+     gv_branch_id = '409V';
+  ENDIF; 
+
+  gv_boxid = get_nodename();
+  IF gv_boxid = 'ares'
+  THEN
+     table_owner = 'imsdev';
+  ELSE 
+     table_owner = 'imsprod';
+  ENDIF;
+
+  RESUME FIELD agency_supplier;
+END
+
+ON TIMEOUT =
+BEGIN
+		CALLPROC timeout_popup();
+END
+
+AFTER FIELD 'agency_supplier'=
+{
+  IIint = CALLPROC lp_val_agency_supplier();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  RESUME NEXT;
+}
+
+AFTER FIELD 'supplier_group'=
+{
+  IIint = CALLPROC lp_val_supplier_group();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  RESUME NEXT;
+}
+
+AFTER FIELD 'table_name'=
+{
+  IF table_name != ''
+  THEN
+     IIint = CALLPROC lp_val_table_name();
+     IF IIint != 0
+     THEN
+        RESUME; 
+     ENDIF;
+  ENDIF;
+  RESUME NEXT;
+}
+
+AFTER FIELD 'column_name'=
+{
+  IF column_name != ''
+  THEN
+     IIint = CALLPROC lp_val_column_name();
+     IF IIint != 0
+     THEN
+        RESUME; 
+     ENDIF;
+  ENDIF;
+  RESUME NEXT;
+}
+
+'Delete',KEY frskey13	=
+BEGIN
+    IF g_rows = 0
+    THEN
+       MESSAGE 'Cusror must be on an agency before using '
+             + 'the ' + '''Delete''' + ' key' WITH STYLE = POPUP;
+       RESUME;
+    ENDIF;
+
+		IF :iitf.table_name = '' OR :iitf.column_name = ''
+		THEN
+				MESSAGE 'Cannot delete this code..!'
+								WITH STYLE=POPUP;
+				RESUME;
+		ENDIF;
+
+		pc_char = PROMPT 'Do you wish to delete ' + X'0A'
+										+ VARCHAR(:iitf.table_name) + ' - ' + VARCHAR(:iitf.column_name)
+										+ ' ?'
+										WITH STYLE=POPUP;
+
+		IF UPPERCASE(:pc_char) != 'Y'
+		THEN
+				RESUME;
+		ENDIF;
+
+		MESSAGE 'Deleting..';
+		DELETE FROM
+			    agency_supplier_template	
+		WHERE
+				table_name = :iitf.table_name
+    AND column_name = :iitf.column_name;
+		INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT);
+
+		IF :g_error != 0
+		THEN
+        ROLLBACK;
+				MESSAGE 'Error occured deleting :' + VARCHAR(:iitf.table_name)
+								WITH STYLE=POPUP;
+				RESUME;
+		ENDIF;
+
+    COMMIT;
+
+    IIint = get_details();
+    IF IIint != 0
+    THEN
+       RETURN;
+    ENDIF;
+END
+
+'Choices',KEY frskey10	=
+BEGIN
+
+  SET_FORMS FRS(LABEL(FRSKEY9)='F12');
+
+  field_name = '';
+
+  INQUIRE_FORMS FORM (field_name = FIELD);
+
+	IF field_name = 'agency_supplier'
+  THEN
+      callproc mapst();
+      IIint = CALLFRAME look_up(
+        II_QUERY  =
+              SELECT agency_supplier,
+                     supplier_name 
+              FROM   agency_supplier;
+        II_FIELD1       = 'agency_supplier',
+        II_FIELD2       = 'supplier_name',
+        II_FIELD_TITLE1 = 'Agency Supplier',
+        II_FIELD_TITLE2 = 'Description',
+        agency_supplier = BYREF(agency_supplier),
+        supplier_name   = BYREF(supplier_name),
+        II_ROWS         = 10);
+      COMMIT;
+      REDISPLAY;
+      callproc mapend();
+
+      IF IIint = 0
+      THEN
+        RESUME;
+			ELSE
+				RESUME NEXT;
+      ENDIF;
+
+	ELSEIF field_name = 'supplier_group'
+  THEN
+      callproc mapst();
+      IIint = CALLFRAME look_up(
+        II_QUERY  =
+              SELECT supplier_group,
+                     supplier_group_name 
+              FROM   agency_supplier_email_group
+              WHERE  agency_supplier = :agency_supplier;
+        II_FIELD1       = 'supplier_group',
+        II_FIELD2       = 'supplier_group_name',
+        II_FIELD_TITLE1 = 'Supplier Group',
+        II_FIELD_TITLE2 = 'Description',
+        supplier_group  = BYREF(supplier_group),
+        supplier_group_name = BYREF(supplier_group_name),
+        II_ROWS         = 10);
+      COMMIT;
+      REDISPLAY;
+      callproc mapend();
+
+      IF IIint = 0
+      THEN
+         RESUME;
+			ELSE
+         IIint = get_details();
+         IF IIint != 0
+         THEN
+            RETURN;
+         ENDIF;
+				 RESUME NEXT;
+      ENDIF;
+
+	ELSEIF field_name = 'table_name'
+  THEN
+      callproc mapst();
+      IIint = CALLFRAME look_up(
+        II_QUERY  =
+              SELECT table_name 
+              FROM   iitables
+              WHERE  table_name NOT LIKE 'ii%' 
+              ORDER BY table_name;
+        II_FIELD1       = 'table_name',
+        II_FIELD_TITLE1 = 'Table Name',
+        table_name = BYREF(table_name),
+        II_ROWS         = 10);
+      COMMIT;
+      REDISPLAY;
+      callproc mapend();
+
+      IF IIint = 0
+      THEN
+         RESUME;
+			ELSE
+				 RESUME NEXT;
+      ENDIF;
+
+	ELSEIF field_name = 'column_name'
+  THEN
+      callproc mapst();
+      IIint = CALLFRAME look_up(
+        II_QUERY  =
+              SELECT column_name 
+              FROM   iicolumns
+              WHERE table_name = :table_name;
+        II_FIELD1       = 'column_name',
+        II_FIELD_TITLE1 = 'Column Name',
+        column_name = BYREF(column_name),
+        II_ROWS         = 10);
+      COMMIT;
+      REDISPLAY;
+      callproc mapend();
+
+      IF IIint = 0
+      THEN
+         RESUME;
+			ELSE
+				 RESUME NEXT;
+      ENDIF;
+
+	ELSE
+
+      MESSAGE 'Function not available on this field.' WITH STYLE = POPUP;
+
+      SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+      SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+      SET_FORMS FRS(MAP(FRSKEY9)='pf5');
+      SET_FORMS FRS(LABEL(FRSKEY9)='F5');
+
+      RESUME;
+
+	ENDIF;
+END
+
+'Save',KEY frskey4 =
+BEGIN
+  IIint = CALLPROC lp_val_agency_supplier();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  IIint = CALLPROC lp_val_supplier_group();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  IIint = CALLPROC lp_val_table_name();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  IIint = CALLPROC lp_val_column_name();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+
+  IF table_name = ''
+  THEN
+     MESSAGE 'Please enter table name.' 
+        WITH STYLE = POPUP;     
+     RESUME FIELD table_name;
+  ENDIF;
+
+  IF column_name = ''
+  THEN
+     MESSAGE 'Please enter column name.' 
+        WITH STYLE = POPUP;     
+     RESUME FIELD column_name;
+  ENDIF;
+
+  /* check if already added */
+  dup_check = 0;
+  UNLOADTABLE iitf
+  BEGIN
+     IF :iitf.table_name = :table_name
+     AND :iitf.column_name = :column_name
+     THEN
+        MESSAGE 'Duplicate Template.' WITH STYLE = POPUP; 
+        dup_check = 1;
+        ENDLOOP;
+     ENDIF;
+  END;
+
+  IF dup_check = 1
+  THEN
+     RESUME FIELD table_name;
+  ENDIF;
+
+ 
+  INSERT INTO agency_supplier_template
+     (
+     agency_supplier,
+     supplier_group,
+     table_name,
+     column_name
+     )
+  VALUES
+     (
+     :agency_supplier,
+     :supplier_group,
+     :table_name,
+     :column_name
+     );
+
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	IF (g_error != 0)
+	THEN
+      ROLLBACK;
+			MESSAGE 'Error occured inserting agency_supplier_template details..!' + X'0A'
+						+ 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+			RETURN;
+	ENDIF;
+
+  COMMIT;
+
+  IIint = get_details();
+  IF IIint != 0
+  THEN
+     RETURN;
+  ENDIF;
+
+  CLEAR FIELD table_name,column_name;
+  RESUME FIELD table_name;
+  
+END
+
+'Exit',KEY frskey3 =
+BEGIN
+  IF (agency_supplier != 0 AND agency_supplier IS NOT NULL)
+  OR (supplier_group != 0 AND supplier_group IS NOT NULL)
+  OR table_name != ''
+  OR column_name != ''
+  THEN
+     CLEAR FIELD ALL;
+	   CLEAR FIELD iitf; 
+     date = DATE('now');
+     RESUME FIELD agency_supplier;
+  ENDIF;
+	MESSAGE 'exiting..';
+	COMMIT;
+	RETURN;
+END
+
+PROCEDURE get_details()=
+{
+	INITTABLE iitf 'READ';
+
+	CLEAR FIELD  iitf; 
+  date = DATE('now');
+
+	iitf = 
+		SELECT
+				table_name,
+			  column_name	
+		FROM 
+				agency_supplier_template
+    WHERE 
+        agency_supplier = :agency_supplier
+    AND supplier_group = :supplier_group;
+
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	IF (g_error != 0)
+	THEN
+      ROLLBACK;
+			MESSAGE 'Error occured initializing agency_supplier_template details..!' + X'0A'
+						+ 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+			RETURN -1;
+	ENDIF;
+
+  COMMIT;
+
+	IF :g_rows <= 0 
+	THEN
+			MESSAGE 'No Agency Supplier Email Templates present.'
+						WITH STYLE=POPUP;
+	ENDIF;
+
+  RETURN 0;
+}
+
+PROCEDURE lp_val_agency_supplier()=
+{
+  IF agency_supplier = ''
+  THEN
+     CLEAR FIELD supplier_name; 
+     MESSAGE 'Agency Supplier must be entered.' WITH STYLE = POPUP;
+     RETURN 1;
+  ENDIF;
+
+  SELECT supplier_name = supplier_name 
+  FROM agency_supplier
+  WHERE agency_supplier = :agency_supplier;
+
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	IF (g_error != 0)
+	THEN
+      ROLLBACK;
+			MESSAGE 'Error occured initializing agency_supplier details..!' + X'0A'
+						+ 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+			RETURN -1;
+	ENDIF;
+
+  COMMIT;
+
+	IF :g_rows <= 0 
+	THEN
+			MESSAGE 'Please enter a valid Agency Supplier code.'
+						WITH STYLE=POPUP;
+      RETURN 1;
+	ENDIF;
+
+  RETURN 0;
+}
+
+PROCEDURE lp_val_supplier_group()=
+{
+  IF supplier_group = ''
+  THEN
+     CLEAR FIELD supplier_group_name; 
+     MESSAGE 'Supplier Group must be entered.' WITH STYLE = POPUP;
+     RETURN 1;
+  ENDIF;
+
+  SELECT supplier_group_name = supplier_group_name 
+  FROM agency_supplier_email_group
+  WHERE agency_supplier = :agency_supplier
+  AND   supplier_group  = :supplier_group;
+
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	IF (g_error != 0)
+	THEN
+      ROLLBACK;
+			MESSAGE 'Error occured initializing agency_supplier_email_group details..!' + X'0A'
+						+ 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+			RETURN -1;
+	ENDIF;
+
+  COMMIT;
+
+	IF :g_rows <= 0 
+	THEN
+			MESSAGE 'Please enter a valid Agency Supplier Group code.'
+						WITH STYLE=POPUP;
+      RETURN 1;
+	ENDIF;
+
+  IIint = get_details();
+  IF IIint != 0
+  THEN
+     RETURN IIint;
+  ENDIF;
+
+  RETURN 0;
+}
+
+PROCEDURE lp_val_table_name()=
+{
+  SELECT table_name = table_name 
+  FROM iitables 
+  WHERE table_name = :table_name 
+  AND table_owner = :table_owner;
+
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	IF (g_error != 0)
+	THEN
+     ROLLBACK;
+		 MESSAGE 'Error occured selecting table details..!' + X'0A'
+					 + 'Error: ' + VARCHAR(:g_err_text)
+				WITH STYLE=POPUP;
+		 RETURN -1;
+	ENDIF;
+
+  COMMIT;
+
+	IF :g_rows <= 0 
+	THEN
+		 MESSAGE 'Please enter a valid table.'
+		    WITH STYLE=POPUP;
+     RETURN 1;
+	ENDIF;
+ 
+  RETURN 0;
+}
+
+PROCEDURE lp_val_column_name()=
+{
+  IF column_name != '' AND table_name = ''
+  THEN
+     MESSAGE 'Please enter a table name first.' 
+        WITH STYLE = POPUP;
+     RETURN 1;
+  ENDIF;
+
+  SELECT column_name = column_name 
+  FROM iicolumns
+  WHERE table_name = :table_name 
+  AND table_owner = :table_owner
+  AND column_name = :column_name;
+
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	IF (g_error != 0)
+	THEN
+     ROLLBACK;
+		 MESSAGE 'Error occured selecting column details..!' + X'0A'
+				   + 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+		 RETURN -1;
+	ENDIF;
+
+  COMMIT;
+
+	IF :g_rows <= 0 
+	THEN
+		 MESSAGE 'Please enter a valid column.'
+				WITH STYLE=POPUP;
+     RETURN 1;
+	ENDIF;
+
+  RETURN 0;
+}

@@ -1,0 +1,95 @@
+/****************************************************************************/
+/*  Frame  - Agency Supplier Email Audit Popup                              */
+/*  Author - Matthew Toyer                                                  */
+/*                                                                          */
+/*  Date   - June 2007                                                      */
+/*  Type   - Online Frame                                                   */
+/*                                                                          */
+/*  Source - agency_supplier_email_audit01.osq                              */
+/*  Form   - agency_supplier_email_audit01                                  */
+/*                                                                          */
+/*  Parameters expected - in_table_name   (Account Amendment Details)       */
+/*                        in_user_details (User Description)                */
+/****************************************************************************/
+/*  Version | Date     | Coded | Description of changes made                */
+/***********|**********|*******|*********************************************/
+/*  1.0     | 01.06.07 | MBT   | Original Code                              */
+/***********|**********|*******|*********************************************/
+
+INITIALIZE(in_table_name = VARCHAR(32) NOT NULL WITH DEFAULT,
+           in_user_details = VARCHAR(255) NOT NULL WITH DEFAULT)=
+BEGIN
+  SET_FORMS FRS(TIMEOUT = :gc_timeout);
+
+  SET_FORMS FRS (ACTIVATE(previousfield) = 1);
+
+  SET_FORMS FRS(MAP(FRSKEY1)='pf1');
+  SET_FORMS FRS(LABEL(FRSKEY1)='F1');
+  SET_FORMS FRS(MAP(FRSKEY7)='pf3');
+  SET_FORMS FRS(LABEL(FRSKEY7)='F3');
+  SET_FORMS FRS(MAP(FRSKEY8)='pf4');
+  SET_FORMS FRS(LABEL(FRSKEY8)='F4');
+  SET_FORMS FRS(MAP(FRSKEY9)='pf5');
+  SET_FORMS FRS(LABEL(FRSKEY9)='F5');
+  SET_FORMS FRS(MAP(FRSKEY14)='pf6');
+  SET_FORMS FRS(LABEL(FRSKEY14)='F6');
+  SET_FORMS FRS(MAP(FRSKEY11)='pf7');
+  SET_FORMS FRS(LABEL(FRSKEY11)='F7');
+  SET_FORMS FRS(MAP(FRSKEY12)='pf8');
+  SET_FORMS FRS(LABEL(FRSKEY12)='F8');
+  SET_FORMS FRS(MAP(FRSKEY13)='pf9');
+  SET_FORMS FRS(LABEL(FRSKEY13)='F9');
+  SET_FORMS FRS(MAP(FRSKEY10)='pf10');
+  SET_FORMS FRS(LABEL(FRSKEY10)='F10');
+  SET_FORMS FRS(MAP(FRSKEY4)='pf11');
+  SET_FORMS FRS(LABEL(FRSKEY4)='F11');
+  SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+  SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+  SET_FORMS FRS(MAP(menu10)='pf22');
+  SET_FORMS FRS(LABEL(menu10)='Alt&F3');
+  SET_FORMS FRS(MAP(FRSKEY28)='pf17');
+  SET_FORMS FRS(LABEL(FRSKEY28)='End');
+
+  CLEAR FIELD ALL;
+  CLEAR FIELD iitf;
+  user_details = :in_user_details;
+
+  INITTABLE iitf READ;
+
+  iitf := SELECT table_name,
+                 column_name,
+                 new_value
+          FROM :in_table_name;
+
+  INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+  IF (g_error != 0)
+  THEN
+      ROLLBACK;
+      MESSAGE 'Error occured initializing ' + TRIM(:in_table_name) + ' details..!' + X'0A'
+            + 'Error: ' + VARCHAR(:g_err_text)
+              WITH STYLE=POPUP;
+      RETURN;
+  ENDIF;
+
+  COMMIT;
+
+  IF :g_rows <= 0
+  THEN
+      MESSAGE 'No Account changes present.'
+            WITH STYLE=POPUP;
+      RETURN;
+  ENDIF;
+
+END
+
+ON TIMEOUT =
+BEGIN
+    CALLPROC timeout_popup();
+END
+
+'Exit',KEY frskey3 =
+BEGIN
+  MESSAGE 'exiting..';
+  RETURN;
+END

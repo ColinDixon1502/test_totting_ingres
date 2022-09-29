@@ -1,0 +1,3262 @@
+/*
+** SOURCE NAME: agency_supplier_email_notify.osq       
+**
+** PROC NAME:   agency_supplier_email_notify
+**
+** PURPOSE:     Agency Email notification. Send details of New
+**              or amended accounts to agency's email group. 
+**
+** VERSION:     1.0
+**
+** AUTHOR:      Matthew Toyer
+**
+** DATE:        21/05/2007
+**
+** RETURN VALS: 0   OK
+**              1   Error
+**
+*****************************************************************************
+**  Version | Date     | Coded | Description of changes made                *
+************|**********|*******|*********************************************
+**  1.0     | 21.05.07 | MBT   | Original Code                              *
+**--------------------------------------------------------------------------*
+**  1.1     | 17.01.08 | SPH   | Change from email address                  *
+**--------------------------------------------------------------------------*
+**  1.2     | 16.05.08 | Ev    | Add extra mandatory fields WR 2101620      *
+**--------------------------------------------------------------------------*
+**  1.3     | 05.06.08 | CD    | Update row_id on agency_sequence table     *
+**          |          |       | before insert to agency_notification.      *
+**--------------------------------------------------------------------------*
+**  1.4     | 02.07.09 | SH/MT | AZ changes for WR2101867                   *
+**          |          |       | Now no longer require individual emails of *
+**          |          |       | amendments. Instead now just a daily file. *
+**--------------------------------------------------------------------------*
+**  2.0     | 27.10.09 | ISS   | AZ Lynx2 Project: Major re-write of code   *
+**          |          |       | 1.Procedurised the code.                   *
+**          |          |       | 2.Show old value in addition to new value  *
+**          |          |       | in amendments email.                       *
+**          |          |       | 3.Insert specific changed records into     *
+**          |          |       | agency_supplier_changes table for agencies.*
+**          |          |       | 4.Use table agency_interface_email instead *
+**          |          |       | of agency_supplier_email_group.            *
+**          |          |       | 5.Emails can be generated for any agencies.*
+**          |          |       | For AZ these will follow rules explained   *
+**          |          |       | further in this code.                      *
+**          |          |       | Agency must be present in following        *
+**          |          |       | tables:                                    *
+**          |          |       | a) agency_supplier (along with saccts mkr) *
+**          |          |       | b) agency_supplier_mapping                 *
+**          |          |       |    [mapping_type set to 'CUST']            *
+**          |          |       |    [aah_code set to allowable custype_no]  *
+**          |          |       | c) agency_supplier_template                *
+**          |          |       |    (trigger fields in tables for which     *
+**          |          |       |     notification is required)              *
+**          |          |       | d) agency_interface_email                  *
+**          |          |       |    [interface_name set to 'CUS03']         *
+**          |          |       | 6.All validations will be run before array *
+**          |          |       | is created to ensure that data is only     *
+**          |          |       | generated for valid accounts.              *
+**          |          |       | 7.Ability to switch diagnostics -mess_flag *
+**          |          |       | and email - mail_flag on/off in initialise *
+**          |          |       | section of procedure.                      *
+**          |          |       | Can also switch on/off ability to create & *
+**          |          |       | update temp table (agency_sessiontable) to *
+**          |          |       | monitor inserts/updates for debugging.     *
+**--------------------------------------------------------------------------*
+**  2.1     | 07.12.09 | MBT   | AZ 2009 - Lynx2 Project.                   *
+**          |          |       | Include Royal Pharmaceutical Society Num   * 
+**          |          |       | Include General Medical Council Num        *
+**          |          |       | Vat Marker, space set to text "Standard"   *
+**          |          |       | Include AZ Customer Group                  *
+**          |          |       | Change trading status to the same as sales *
+**          |          |       | accounts screen "FREE", "STOP" and "WARN"  *
+**--------------------------------------------------------------------------*
+**  2.2     | 15.12.09 | ISS   | AZ 2009 - Lynx2 Project.                   *
+**          |          |       | 1.Field pricing_group passed in from frame *
+**          |          |       | salesaccounts_fm.                          * 
+**          |          |       | 2.If account is closed send CLOSED ACCOUNT *
+**          |          |       | email and send NEW ACCOUNT email if it has * 
+**          |          |       | been created or re-instated. Any changes   *
+**          |          |       | made to the account prior to closing or    *
+**          |          |       | re-instating it will be discarded.         *
+**--------------------------------------------------------------------------*
+**  2.3     | 21.12.09 | ISS   | AZ 2009 - Lynx2 Project.                   *
+**          |          |       | 1.If no AZ Channel found for cust type/    *
+**          |          |       | cust group combination then use 0 as cust  * 
+**          |          |       | group to get correct AZ channel.           *
+**          |          |       | 2.Display text for old and new stop_warn   *
+**          |          |       | values in daily changes email.             * 
+**--------------------------------------------------------------------------*
+**  2.4     | 04.01.10 | ISS   | AZ 2009 - Lynx2 Project.                   *
+**          |          |       | If account is re-instated or deleted       *
+**          |          |       | ignore E07 mkr so email alert is sent to   * 
+**          |          |       | Astra Zeneca.                              * 
+**--------------------------------------------------------------------------*
+**  2.5     | 05.01.10 | ISS   | AZ 2009 - Lynx2 Project.                   *
+**          |          |       | Include both number and text for custype,  *
+**          |          |       | custgroup and credit_risk in old_value and *
+**          |          |       | new_value.                                 *
+**          |          | PSN   | Only send email notify if not G99 account  *
+**--------------------------------------------------------------------------*
+**  2.6     | 01.02.10 | MBT   | AZ 2009 - Lynx2 Project.                   *
+**          |          |       | 1. Email Subject, removed "Account Amend " *
+**          |          |       | 2. Default Credit Check to "No"            *
+**--------------------------------------------------------------------------*
+**  2.7     | 16.02.10 | MBT   | Helpdesk Call 178862 Emergency fix.        *
+**          |          |       | Non agencies require insert into           * 
+**          |          |       | agency_notification table. (Sanofi)        *
+**--------------------------------------------------------------------------*
+**  2.8     | 15.11.11 | SPH   | Solus -                                    *
+**          |          |       | Exclude 803N accounts from agency          *
+**          |          |       | interfaces.                                *
+**--------------------------------------------------------------------------*
+**  2.9     | 12.06.12 | BB    | Langley Warehouse Migration Project.       *
+**          |          |       | Exclude 608V accounts.                     *
+**--------------------------------------------------------------------------*
+**  3.0     | 26.11.12 | ISS   | HPSM 126855                                *
+**          |          |       | When running on Dev email to logged in user*
+**--------------------------------------------------------------------------*
+**  3.1     | 20.05.13 | MD    | WR 2500121                                 *
+**          |          |       | Include Solus accounts in emails(803N)     *
+**--------------------------------------------------------------------------*
+**  3.2     | 26.09.14 | BB    | Project AZ NDD.                            *
+**          |          |       | Include Secondary Customer Type to get     *
+**          |          |       | correct AZ channel.                        *
+**--------------------------------------------------------------------------*
+**  3.3     | 04.03.16 | CED   | TE 2500363 - AZ/Lilley GMC/GPhC numbers.   *
+**          |          |       | Changed Seq-Nos from 1,9 to 12,13          *
+*****************************************************************************
+*/
+
+PROCEDURE agency_supplier_email_notify (
+  request           = varchar(6) not null,
+  account_branch    = char(4) not null,
+  account_no        = char(9) not null,
+  in_table_name     = varchar(32) not null,
+  sales_accts_rec   = type of table sales_accts,
+  pricing_group     = integer(4) not null,
+  old_pricing_group = integer(4) not null
+)= 
+DECLARE
+
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+  IIint               = INTEGER(4) NOT NULL,
+  IIrowcount          = INTEGER(4) NOT NULL,
+  IIerrorno           = INTEGER(4) NOT NULL,
+  IIerrtext           = CHAR(256)  NOT NULL,
+  row_no              = INTEGER4 NOT NULL,   
+  row_count           = INTEGER4 NOT NULL,   
+  loop                = INTEGER4 NOT NULL,   
+  email_from          = VARCHAR(100) NOT NULL WITH DEFAULT;
+  email_to            = VARCHAR(500) NOT NULL WITH DEFAULT;
+  agency_file         = VARCHAR(100) NOT NULL WITH DEFAULT;
+  system_cmd          = VARCHAR(500) NOT NULL WITH DEFAULT; 
+  param_list          = VARCHAR(500) NOT NULL WITH DEFAULT;
+
+  table_name          = VARCHAR(32) NOT NULL WITH DEFAULT;
+  column_name         = VARCHAR(32) NOT NULL WITH DEFAULT;
+  new_value           = VARCHAR(64) NOT NULL WITH DEFAULT;
+  old_value           = VARCHAR(64) NOT NULL WITH DEFAULT;
+  description         = VARCHAR(100) NOT NULL WITH DEFAULT;
+  man_ind             = INTEGER1 NOT NULL WITH DEFAULT;
+  addr_line1          = VARCHAR(32) NOT NULL WITH DEFAULT;
+  addr_line2          = VARCHAR(32) NOT NULL WITH DEFAULT;
+  addr_line3          = VARCHAR(32) NOT NULL WITH DEFAULT;
+  addr_line4          = VARCHAR(32) NOT NULL WITH DEFAULT;
+  sort_order          = INTEGER4 NOT NULL WITH DEFAULT;
+  custype_text        = VARCHAR(36) NOT NULL WITH DEFAULT;
+  custype_text_old    = VARCHAR(36) NOT NULL WITH DEFAULT;
+  custgroup_text      = VARCHAR(36) NOT NULL WITH DEFAULT;
+  custgroup_text_old  = VARCHAR(36) NOT NULL WITH DEFAULT;
+  user_text           = VARCHAR(255) NOT NULL WITH DEFAULT;
+  email_text          = VARCHAR(255) NOT NULL WITH DEFAULT;
+  table_text          = VARCHAR(500) NOT NULL WITH DEFAULT;
+  status_text         = VARCHAR(32) NOT NULL WITH DEFAULT;
+  vat_status          = VARCHAR(12) NOT NULL WITH DEFAULT;
+  credit_desc         = VARCHAR(32) NOT NULL WITH DEFAULT;
+  credit_desc_old     = VARCHAR(32) NOT NULL WITH DEFAULT;
+  credit_text         = VARCHAR(32) NOT NULL WITH DEFAULT;
+  vat_mkr             = CHAR(2) NOT NULL WITH DEFAULT;
+  az_channel          = CHAR(3) NOT NULL WITH DEFAULT;
+  sequence_no         = INTEGER4 NOT NULL WITH DEFAULT;
+  rowcount            = INTEGER4 NOT NULL WITH DEFAULT;
+  custype_no          = INTEGER1 NOT NULL;
+  second_cust_type    = INTEGER1 NOT NULL;
+  custgroup_no        = INTEGER4 NOT NULL;
+  p_group_check       = INTEGER(4) NOT NULL;
+  p_changes           = INTEGER(4) NOT NULL;
+  p_closed            = INTEGER(4) NOT NULL;
+  p_new               = INTEGER(4) NOT NULL;
+  p_send_mail         = INTEGER(4) NOT NULL;
+  p_insert            = INTEGER(4) NOT NULL;
+  gmc_cnt             = INTEGER(4) NOT NULL;
+  rps_cnt             = INTEGER(4) NOT NULL;
+
+  thischar            = CHAR(1) NOT NULL WITH DEFAULT;
+  now_string          = VARCHAR(25) NOT NULL WITH DEFAULT;
+  now_digits          = VARCHAR(25) NOT NULL WITH DEFAULT;
+  digits1             = VARCHAR(25) NOT NULL WITH DEFAULT;
+  digits2             = VARCHAR(25) NOT NULL WITH DEFAULT;
+  sess_name           = VARCHAR(50) NOT NULL WITH DEFAULT;
+  param_name          = VARCHAR(50) NOT NULL WITH DEFAULT;
+  log_string          = VARCHAR(500); 
+
+  agency_supplier     = INTEGER4 NOT NULL WITH DEFAULT;
+  lv_row_id           = INTEGER4 NOT NULL WITH DEFAULT;
+
+  mkr_status          = INTEGER(1) NOT NULL;
+  hf_purchase_code    = CHAR(4) NOT NULL;
+  hf_delivery_code    = CHAR(2) NOT NULL;
+  lv_sort_order       = SMALLINT NOT NULL;
+  agency              = INTEGER4 NOT NULL WITH DEFAULT;
+  mess_flag           = INTEGER4 NOT NULL WITH DEFAULT;
+  mail_flag           = INTEGER4 NOT NULL WITH DEFAULT;
+  lv_debug            = INTEGER4 NOT NULL WITH DEFAULT;
+  supplier_name       = VARCHAR (32) NOT NULL;
+  form_completed      = DATE NOT NULL;
+  agency_file_name    = CHAR (5) NOT NULL;
+  temp_tabowner       = VARCHAR(32)  NOT NULL,
+  temp_tabname        = VARCHAR(24) NOT NULL,
+  g99_account         = CHAR(1) NOT NULL WITH DEFAULT,
+
+  agency_array        = ARRAY OF TYPE OF TABLE agency_interface_email;
+
+  /*******************************************************
+  ** LOCAL PROCEDURES
+  *******************************************************/
+  create_session_table  = PROCEDURE returning integer not null;
+  get_sales_accts       = PROCEDURE returning integer not null;
+  check_temp_table      = PROCEDURE returning integer not null;
+  get_agency_supplier   = PROCEDURE returning integer not null;
+  insert_session_table  = PROCEDURE returning integer not null;
+  insert_session_table2 = PROCEDURE returning integer not null;
+  update_session_table  = PROCEDURE returning integer not null;
+  lp_send_email         = PROCEDURE returning none;
+  insert_email_audit    = PROCEDURE returning integer not null;
+  lp_write_errlog       = PROCEDURE returning none;
+  insert_notification   = PROCEDURE returning integer not null;
+  insert_notification2  = PROCEDURE returning integer not null;
+  lp_customer_type      = PROCEDURE returning integer not null;
+  lp_customer_group     = PROCEDURE returning integer not null;
+  lp_credit_risk        = PROCEDURE returning integer not null;
+  lp_stop_warn          = PROCEDURE returning integer not null;
+  lp_vat_mkr            = PROCEDURE returning integer not null;
+  lp_acctlinks          = PROCEDURE returning integer not null;
+  lp_rebate_code        = PROCEDURE returning integer not null;
+  insert_agency_changes = PROCEDURE returning integer not null;
+  update_agency_changes = PROCEDURE returning integer not null;
+  non_agency_notification = PROCEDURE returning integer not null;
+  lp_get_dev_email      = PROCEDURE returning integer not null;
+
+{
+  mess_flag = 0; /* 1: Show debugging popups */
+                 /* 0: Don't show debugging popups */
+
+  lv_debug  = 0; /* 1: Create debug table agency_sessiontable */
+                 /* 0: Don't create debug table agency_sessiontable */
+
+  mail_flag = 1; /* 1: Switch email on  */
+                 /* 0: Switch email off */
+
+/*----------------------------------------------------------*/
+/*  Get Dev User's Email Address                            */
+/*----------------------------------------------------------*/
+    gv_boxid  = get_nodename();
+
+    IF (gv_boxid = 'ares') 
+    THEN
+       IIint = CALLPROC lp_get_dev_email();
+    ENDIF;
+
+   IF mess_flag = 1 THEN
+      MESSAGE '-TEST- agency_supplier_email_notify accessed' 
+          with style = popup;
+   ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Check Parameters                                        */
+/*----------------------------------------------------------*/
+    IF request != 'N' AND request != 'U'
+    THEN
+      MESSAGE 'agency_supplier_email_notify - '
+        + 'request parameter must be N(new) or U(update)' 
+      WITH STYLE = POPUP;
+      RETURN 1;
+    ENDIF;
+  
+    IF account_branch = ''
+    THEN
+      MESSAGE 'agency_supplier_email_notify - '
+        + 'account branch parameter must be supplied' 
+      WITH STYLE = POPUP;
+      RETURN 1;
+    ENDIF;
+  
+    IF account_no = ''
+    THEN
+      MESSAGE 'agency_supplier_email_notify - '
+        + 'account number parameter must be supplied' 
+      WITH STYLE = POPUP;
+      RETURN 1;
+    ENDIF;
+  
+    IF in_table_name = '' AND request != 'N'
+    THEN
+      MESSAGE 'agency_supplier_email_notify - '
+        + 'table name parameter must be supplied' 
+     WITH STYLE = POPUP;
+      RETURN 1;
+    ENDIF; 
+
+    SELECT temp_tabowner = dbmsinfo('username');
+
+/*----------------------------------------------------------*/
+/*  Astra Zeneca Rules                                      */
+/*----------------------------------------------------------*/
+/*
+** Agencies: 1=Astra Zeneca, 2=Sanofi, 5=Lilly
+** saccts_mkr: E07=Astra Zeneca, E14=Lilly
+
+** All new accounts (pricing group set to 0) are sent to agencies first to 
+** establish whether the account is allowed to trade by setting the apporiate 
+** account marker.
+**
+** For account changes we need to determine which agencies the account is active for
+** by checking in saccts_mkr table. ie mkr_status should be set to '1'.
+** Will loop through each agency supplier for account that is being changed and 
+** insert/update into appropriate tables. Emails will be sent to recipients for 
+** each agency where the account qualification is met (Email Alert). Finally the 
+** old and new values (for amended) accounts will be inserted into table 
+** supplier_agency_changes to be used to produce a report of all daily account 
+** changes for agencies that trade with the accounts (Daily Email). If several
+** changes are made to the same field only the last change will be the one 
+** included in the daily email report.
+**
+** Below are the set of rules that determine whether the change is sent in an 
+** immediate email or combined with other accounts in a Daily Email.
+**
+*/
+
+/*
++---------+-----------------+-----------+-----------------+--------+-------------+
+|Request  |Account Status   |Pricin|DFD |Trigger Field    |New Val |Email |Daily |
+|         |                 |Group |    |Changed          |        |Alert |Email |
++---------+-----------------+------+----+-----------------+----------------------+
+|U[pdate] |Actively Trading | 0    | N  |Not Pricing Group| New Val| N    | Y    |
+|U[pdate] |Actively Trading | 0    | N  |Pricing Group    | 9999   | N    | N    |
+|C[losed] |Actively Trading | 0    | N  |Delete Account   | DFD    | Y    | N    |
++---------+-----------------+------+----+-----------------+----------------------+
+|U[pdate] |Non Trading      | 9999 | N  |Not Pricing Group| New Val| N    | N    |
+|N[ew]    |Non Trading      | 9999 | N  |Pricing Group    | 0      | Y    | N    |
+|C[losed] |Non Trading      | 9999 | N  |Delete Account   | DFD    | Y    | N    |
++---------+-----------------+------+----+-----------------+----------------------+
+|U[pdate] |Due For Deletion | 9999 | Y  |Not Pricing Group| New Val| N    | N    |
+|N[ew]    |Due For Deletion | 9999 | Y  |Reinstate Account| 0      | Y    | N    |
++---------+-----------------+------+----+-----------------+----------------------+
+|N[ew]    |N/A              | N/A  |N/A |Pricing Group    | 0      | Y    | N    |
+|N[ew]    |N/A              | N/A  |N/A |Pricing Group    | 9999   | N    | N    |
++--------------------------------------------------------------------------------+
+*/
+
+/*----------------------------------------------------------*/
+/*  Set Email From                                          */
+/*----------------------------------------------------------*/
+    email_from = 'DoNotReply@aah.co.uk'; 
+
+/*----------------------------------------------------------*/
+/*  Notification                                            */
+/*----------------------------------------------------------*/
+    IF request = 'N' /* Request Type */ 
+    THEN     
+       /*----------------------------------------------------------*/
+       /*  Insert notification entries                             */
+       /*----------------------------------------------------------*/
+       IIint = CALLPROC insert_notification ();
+       IF IIint != gc_success
+       THEN
+          RETURN 1;
+       ENDIF;
+
+       IF mess_flag = 1 THEN
+          MESSAGE '-ISS- insert_notification insert complete' with style = popup;
+       ENDIF;
+
+    ELSE /* U Update */
+
+       IIint = CALLPROC non_agency_notification();
+       IF IIint != gc_success
+       THEN
+          RETURN 1;
+       ENDIF;
+
+       IF mess_flag = 1 THEN
+          MESSAGE '-ISS- insert_notification update complete' with style = popup;
+       ENDIF;
+
+    ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Create Session Table                                    */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC create_session_table();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Create Temp Table if in Debugging Mode                  */
+/*----------------------------------------------------------*/
+    IF lv_debug = 1 THEN
+      SELECT  table_name AS temp_tabname
+        FROM  iitables
+       WHERE  table_name  = 'agency_sessiontable'
+         AND  table_owner = :temp_tabowner;
+  
+      /**************************
+      ** Check For INGRES Error 
+      ***************************/
+      INQUIRE_INGRES (IIerrorno  = ERRORNO,
+      IIerrtext = ERRORTEXT,
+      IIrowcount = ROWCOUNT);
+  
+      IF IIerrorno != 0 THEN
+        ROLLBACK;
+        MESSAGE '-40- INGRES error selecting from iitables ' + :IIerrtext 
+        WITH STYLE = POPUP;
+        log_string = '-40- INGRES error selecting from iitables ';
+        CALLPROC errorlog(:log_string,'ASEN');
+        RETURN 1;
+      ENDIF;
+  
+        IF IIrowcount = 0 THEN
+          CREATE TABLE agency_sessiontable AS SELECT *
+          FROM :sess_name;
+
+          /**************************
+          ** Check For INGRES Error
+          ***************************/
+          INQUIRE_INGRES (IIerrorno  = ERRORNO,
+          IIerrtext = ERRORTEXT,
+          IIrowcount = ROWCOUNT);
+
+          IF IIerrorno != 0 THEN
+            ROLLBACK;
+            MESSAGE '-41- INGRES error creating agency_sessiontable ' + :IIerrtext
+            WITH STYLE = POPUP;
+            log_string = '-41- INGRES error creating agency_sessiontable ';
+            CALLPROC errorlog(:log_string,'ASEN');
+            RETURN 1;
+          ENDIF;
+        
+            IF mess_flag = 1 THEN
+              MESSAGE '-ISS- [INIT] Created agency_sessiontable ' with style=popup;
+            ENDIF;
+
+        ENDIF;
+
+    ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Get Sales Accounts                                      */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC get_sales_accts();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Check Temp Table                                        */
+/*----------------------------------------------------------*/
+    p_group_check = 0;
+    p_changes = 0;
+    p_send_mail = 0;
+    p_insert = 1;
+    p_closed = 0;
+    p_new = 0;
+
+    /* Check Temp table */
+    IF in_table_name != '' AND request = 'U' 
+    THEN
+      IIint = CALLPROC check_temp_table();
+        IF IIint != gc_success
+        THEN
+          RETURN 1;
+        ENDIF;
+      IF mess_flag = 1 THEN
+        MESSAGE '-ISS- call check_temp_table ' +
+                ' in_table_name: ' + lower(varchar(:in_table_name)) +
+                ' table_name: ' + varchar(:table_name) +
+                ' p_changes: ' + varchar(:p_changes) +
+                ' p_closed: ' + varchar(:p_closed) +
+                ' p_new: ' + varchar(:p_new) +
+                ' p_group_check: ' + varchar(:p_group_check) +
+                ' p_insert: ' + varchar(:p_insert) +
+                ' p_send_mail: ' + varchar(:p_send_mail) with style=popup;
+        ENDIF;
+    ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Get Agency Suppliers                                    */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC get_agency_supplier();
+    IF IIint != gc_success
+    THEN
+      RETURN 1;
+    ENDIF;
+  
+/*----------------------------------------------------------*/
+/*  Notify agencies of New Account                          */
+/*----------------------------------------------------------*/
+  IF account_branch != '606R' AND 
+     account_branch != '608V' AND
+     account_branch != '904Q' /* Exc Branches */ 
+  THEN 
+    IF request = 'N' /* Request Type */ 
+    THEN     
+      email_to = '';
+      row_no = 1;
+    UNLOADTABLE agency_array
+      {
+       SELECT :agency_supplier = a.agency_supplier,
+              :supplier_name = supplier_name,
+              :agency_file_name = lower(left(supplier_name,5)),
+              :email_to = email
+         FROM agency_interface_email a,
+              agency_supplier b
+        WHERE interface_name = 'CUS03'
+          AND a.agency_supplier = b.agency_supplier
+          AND a.agency_supplier = :agency_array.agency_supplier
+     ORDER BY agency_supplier ASC;
+ 
+    agency = :agency_supplier;
+
+    IF (gv_boxid = 'ares') 
+    THEN
+       IIint = CALLPROC lp_get_dev_email();
+    ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Insert into Session Table                               */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC insert_session_table();
+    IF IIint != gc_success
+    THEN
+      RETURN 1;
+    ENDIF;
+
+    IF lv_debug = 1 THEN
+       drop table agency_sessiontable; commit;
+       create table agency_sessiontable as select * from :sess_name; commit;
+       IF mess_flag = 1 THEN
+         MESSAGE '-ISS- [N] inserted into agency_sessiontable ' with style=popup;
+       ENDIF;
+    ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Update Session Table                                    */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC update_session_table();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+     IF lv_debug = 1 THEN
+       drop table agency_sessiontable; commit;
+       create table agency_sessiontable as select * from :sess_name; commit;
+       IF mess_flag = 1 THEN
+         MESSAGE '-ISS- [N] updated agency_sessiontable ' with style=popup;
+       ENDIF;
+     ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Send Email                                              */
+/*----------------------------------------------------------*/
+    /* Only send email alert for new account if pricing_group
+       is set to 0 */
+
+    IF pricing_group = 0
+    THEN
+      IF mess_flag = 1 THEN
+        MESSAGE '-ISS- New customer ' +
+                ' agency_supplier: ' + varchar(:agency_supplier) +
+                ' supplier_name: ' + varchar(:supplier_name) +
+                ' email_to: ' + varchar(:email_to) with style = popup;
+      ENDIF;
+
+      /* AZ Lynx (PSN) - do not perform email notify if account is G99 */
+      g99_account = 'N';
+
+      SELECT 'Y' AS g99_account
+      FROM sales_accts sac,
+           agency_supplier_mapping asm
+      WHERE sac.account_no = :account_no
+      AND sac.branch = :account_branch
+      AND asm.aah_code = char(sac.custype_no)
+      AND sac.branch != '606R'
+      AND sac.branch != '608V'
+      AND sac.branch != '904Q'
+      AND asm.agency_supplier_code = 'G99'
+      AND asm.agency_supplier = 1
+      AND asm.mapping_type = 'CUST';
+ 
+      INQUIRE_INGRES (IIerrorno  = ERRORNO, IIerrtext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+      IF IIerrorno != 0
+      THEN
+          ROLLBACK;
+          MESSAGE '-41A- INGRES error in SELECT ' + :IIerrtext
+          WITH STYLE = POPUP;
+          log_string = '-41A- INGRES error in SELECT ';
+          CALLPROC errorlog(:log_string,'ASEN');
+          RETURN 1;
+      ENDIF;
+
+      IF (g99_account != 'Y')
+      THEN
+          CALLPROC lp_send_email();
+
+          /*----------------------------------------------------------*/
+          /*  Insert into Email Audit Table                           */
+          /*----------------------------------------------------------*/
+          IIint = CALLPROC insert_email_audit ();
+
+          IF IIint != gc_success
+          THEN
+                  RETURN 1;
+          ENDIF;
+      ENDIF;
+          
+    ENDIF;
+    
+      row_no = row_no + 1;
+
+      }; /* End of unload for each new account agency email */
+
+/*----------------------------------------------------------*/
+/*  Write to error log                                      */
+/*----------------------------------------------------------*/
+    CALLPROC lp_write_errlog();
+
+/*----------------------------------------------------------*/
+/*  Notify agencies of account amendment                    */
+/*----------------------------------------------------------*/
+    ELSE /* Request = 'U' */ /* Request Type */ 
+
+       row_no = 1;
+       email_to = '';
+
+       UNLOADTABLE agency_array
+        {
+        SELECT :agency_supplier = a.agency_supplier,
+               :supplier_name = supplier_name,
+               :agency_file_name = lower(left(supplier_name,5)),
+               :email_to = email
+          FROM agency_interface_email a,
+               agency_supplier b
+         WHERE interface_name = 'CUS03'
+           AND a.agency_supplier = b.agency_supplier
+           AND a.agency_supplier = :agency_array.agency_supplier
+      ORDER BY agency_supplier ASC
+
+          { /* Begin Loop 1 */
+             table_text = '';
+                agency  = :agency_supplier;
+    
+           IF (gv_boxid = 'ares') 
+           THEN
+              IIint = CALLPROC lp_get_dev_email();
+           ENDIF;
+
+           IF mess_flag = 1 THEN
+             MESSAGE '-ISS- Loop 1 Amendment delete from session table '
+                  +  ' agency_supplier: ' + varchar(:agency_supplier)
+                  +  ' supplier_name: ' + varchar(:supplier_name)
+                  +  ' in_table_name: ' + lower(varchar(:in_table_name))
+                  +  ' email_to: ' + varchar(:email_to)
+           with style = popup;
+           ENDIF;
+      
+            DELETE FROM :sess_name;
+    
+            /**************************
+            ** Check For INGRES Error
+            ***************************/
+            INQUIRE_INGRES (IIerrorno = ERRORNO,
+            IIerrtext = ERRORTEXT,
+            IIrowcount = ROWCOUNT);
+      
+            IF IIerrorno != 0 THEN
+              ROLLBACK;
+              MESSAGE '-01- INGRES error delete from session table'
+                + :IIerrtext WITH STYLE = POPUP;
+              log_string = '-01- INGRES error delete from session table';
+              CALLPROC errorlog(:log_string,'ASEN');
+              RETURN 1;
+            ENDIF;
+            COMMIT;
+      
+            /* Match Input table against template */
+            SELECT :table_name  = SQUEEZE(TRIM(tmp.table_name)), 
+                   :column_name = SQUEEZE(TRIM(tmp.column_name)),
+                   :old_value   = SQUEEZE(TRIM(tmp.old_value)),
+                   :new_value   = SQUEEZE(TRIM(tmp.new_value)),
+                   :description = et.description,
+                   :man_ind     = et.man_ind,
+                   :sort_order  = et.sort_order 
+              FROM :in_table_name tmp,
+                    agency_supplier_template et
+            WHERE SQUEEZE(TRIM(tmp.table_name)) = SQUEEZE(TRIM(et.table_name))
+              AND  SQUEEZE(TRIM(tmp.column_name)) = SQUEEZE(TRIM(et.column_name))
+              AND  et.agency_supplier  = :agency_supplier
+
+            { /* Begin Loop 2 */
+              table_text = table_text 
+                   + 'table_name='  + TRIM(VARCHAR(:table_name)) + ', ' 
+                   + 'column_name=' + TRIM(VARCHAR(:column_name)) + ', ' 
+                   + 'old_value='   + TRIM(VARCHAR(:old_value)) + ', '
+                   + 'new_value='   + TRIM(VARCHAR(:new_value)) + ', ';
+                
+/*----------------------------------------------------------*/
+/*  Insert mandatory values into session table              */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC insert_session_table2 ();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+     IF lv_debug = 1 THEN
+       drop table agency_sessiontable; commit;
+       create table agency_sessiontable as select * from :sess_name; commit;
+       IF mess_flag = 1 THEN
+         MESSAGE '-ISS- [U] insert into agency_sessiontable ' with style=popup;
+       ENDIF;
+     ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Customer type                                           */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC lp_customer_type ();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Customer group                                          */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC lp_customer_group ();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Credit Risk                                             */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC lp_credit_risk ();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Stop / Warn                                             */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC lp_stop_warn ();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+/*----------------------------------------------------------*/
+/*  VAT Status                                              */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC lp_vat_mkr ();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Account Links                                           */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC lp_acctlinks ();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Credit Terms                                            */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC lp_rebate_code ();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Update Session Table                                    */
+/*----------------------------------------------------------*/
+    IIint = CALLPROC update_session_table();
+      IF IIint != gc_success
+      THEN
+        RETURN 1;
+      ENDIF;
+
+     IF lv_debug = 1 THEN
+       drop table agency_sessiontable; commit;
+       create table agency_sessiontable as select * from :sess_name; commit;
+       IF mess_flag = 1 THEN
+         MESSAGE '-ISS- [U] update agency_sessiontable ' with style=popup;
+       ENDIF;
+     ENDIF;
+
+    /**************************
+    ** Check For INGRES Error 
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+    IIerrtext = ERRORTEXT,
+    IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+      ROLLBACK;
+      MESSAGE '-05- INGRES error selecting agency_template '
+         + :IIerrtext WITH STYLE = POPUP;
+      log_string = '-05- INGRES error selecting agency_template ';
+      CALLPROC errorlog(:log_string,'ASEN');
+      RETURN 1;
+    ENDIF;
+    COMMIT;
+
+/*----------------------------------------------------------*/
+/*  Insert/Update amendments for all Agencies matching      */
+/*  template to agency_supplier_changes table               */
+/*----------------------------------------------------------*/
+
+   /* Only insert into agency_supplier_changes table if
+      account is trading ie pricing_group is set to 0 and
+      trigger field changed is not one of the following:
+      1. Account is changed to DFD.
+      2. Account is changed to non trading. */
+
+    IF mess_flag = 1 THEN
+      MESSAGE '-ISS- Insert/Update amendments ' 
+        + 'old_pricing_group: ' + varchar(:old_pricing_group)
+        + ' email_to: ' + varchar(:email_to) with style=popup;
+    ENDIF;
+
+   IF old_pricing_group = 0 AND p_insert = 1
+   THEN
+    SELECT :custype_text = ct.custype
+      FROM cust_types ct
+     WHERE ct.custype_no = :custype_no;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+    IIerrtext = ERRORTEXT,
+    IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+      ROLLBACK;
+      MESSAGE '-42- INGRES error reading from cust_types'
+        + :IIerrtext WITH STYLE = POPUP;
+      log_string = '-42- INGRES error reading from cust_types';
+      CALLPROC errorlog(:log_string,'ASEN');
+      RETURN 1;
+    ENDIF;
+
+      SELECT sort_order as lv_sort_order,
+             form_completed as form_completed 
+        FROM agency_supplier_changes
+       WHERE request         = 'U'
+         AND agency_supplier = :agency_supplier
+         AND account_branch  = :account_branch
+         AND account_no      = :account_no
+         AND table_name      = :table_name
+         AND column_name     = :column_name;
+
+       /**************************
+       ** Check For INGRES Error 
+       ***************************/
+       INQUIRE_INGRES (IIerrorno  = ERRORNO,
+       IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+        IF IIerrorno != 0 THEN
+          ROLLBACK;
+          MESSAGE '-06- INGRES error selecting from agency_supplier_changes ' 
+             + :IIerrtext WITH STYLE = POPUP;
+          log_string = '-06- INGRES error selecting from agency_supplier_changes';
+          CALLPROC errorlog (log_string, 'ASEN');
+          RETURN 1;
+        ENDIF;
+
+      /*
+      ** If account column has already been amended today just update
+      ** new value, otherwise insert whole record inc old and new value.
+      */
+      IF IIrowcount = 1 THEN /* IF [1] */
+        IF form_completed = date('today') THEN /* IF [2] */
+
+        IF mess_flag = 1 THEN
+              MESSAGE '-ISS- loop 2 [2] callproc update_agency_changes' 
+          + ' agency_supplier: ' + varchar(:agency_supplier)
+          + ' request: U' + ' p_table_name:' + varchar(:table_name) 
+          + ' p_column_name:' + varchar(:column_name) 
+          + ' old_value: ' + varchar(:old_value)
+          + ' new_value: ' + varchar(:new_value)
+          + ' form_completed:' + varchar(:form_completed) 
+          + ' p_sort_order:' + varchar(:lv_sort_order)
+          + ' email_to: ' + varchar(:email_to) with style=popup;
+        ENDIF;
+
+        IIint = CALLPROC update_agency_changes(
+          p_table_name  = :table_name,
+          p_column_name = :column_name,
+          p_sort_order  = :lv_sort_order);
+
+        IF IIint != gc_success
+        THEN
+          RETURN 1;
+        ENDIF;
+
+        ELSE
+
+          IF mess_flag = 1 THEN
+                MESSAGE '-ISS- loop 2 [2] callproc insert_agency_changes' 
+            + ' agency_supplier: ' + varchar(:agency_supplier)
+            + ' request: U' + ' p_table_name:' + varchar(:table_name) 
+            + ' form_completed:' + varchar(:form_completed) 
+            + ' p_column_name:' + varchar(:column_name) 
+            + ' old_value: ' + varchar(:old_value)
+            + ' new_value: ' + varchar(:new_value)
+            + ' p_sort_order:' + varchar(:lv_sort_order)
+            + ' email_to: ' + varchar(:email_to) with style=popup;
+          ENDIF;
+
+          IIint = CALLPROC insert_agency_changes(
+            p_table_name  = :table_name,
+            p_column_name = :column_name,
+            p_sort_order  = :lv_sort_order);
+
+          IF IIint != gc_success
+          THEN
+            RETURN 1;
+          ENDIF;
+
+        ENDIF; /* IF [2] */
+  
+      ELSE
+
+        /*
+        ** Account already amended , just different column.
+        */
+        SELECT ifnull(MAX(sort_order),0) as lv_sort_order
+          FROM agency_supplier_changes
+         WHERE request         = 'U'
+           AND agency_supplier = :agency_supplier
+           AND account_branch  = :account_branch
+           AND account_no      = :account_no;
+        
+        IF IIrowcount > 0 THEN /* IF [3] */
+          IF mess_flag = 1 THEN
+             MESSAGE '-ISS- loop 2 [3] callproc insert_agency_changes'
+          + ' agency_supplier: ' + varchar(:agency_supplier)
+          + ' request: U' + ' p_table_name:' + varchar(:table_name) 
+          + ' form_completed: ' + varchar(:form_completed)
+          + ' p_column_name:' + varchar(:column_name) 
+          + ' old_value: ' + varchar(:old_value)
+          + ' new_value: ' + varchar(:new_value)
+          + ' p_sort_order:' + varchar(:lv_sort_order)
+          + ' email_to: ' + varchar(:email_to) with style=popup;
+          ENDIF;
+
+          IIint = CALLPROC insert_agency_changes(
+            p_table_name  = :table_name,
+            p_column_name = :column_name,
+            p_sort_order  = :lv_sort_order);
+
+          IF IIint != gc_success
+          THEN
+            RETURN 1;
+          ENDIF;
+
+        ELSE
+
+          /*
+          ** Check whether amendment is to a new account created
+          ** today or just a new amendment.
+          */
+          SELECT IIint = 1 
+            FROM agency_supplier_changes
+           WHERE request         = 'N'
+             AND agency_supplier = :agency_supplier
+             AND account_branch  = :account_branch
+             AND account_no      = :account_no;
+        
+          IF IIrowcount = 0 THEN /* Pass [4] */
+            IF mess_flag = 1 THEN
+               MESSAGE '-ISS- loop 2 [4] callproc insert_agency_changes'
+          + ' agency_supplier: ' + varchar(:agency_supplier)
+          + ' request: U' + ' p_table_name:' + varchar(:table_name) 
+          + ' form_completed:' + varchar(:form_completed) 
+          + ' p_column_name:' + varchar(:column_name) 
+          + ' old_value: ' + varchar(:old_value)
+          + ' new_value: ' + varchar(:new_value)
+          + ' p_sort_order:' + varchar(:lv_sort_order)
+          + ' email_to: ' + varchar(:email_to) with style=popup;
+            ENDIF;
+
+            IIint = CALLPROC insert_agency_changes(
+              p_table_name  = :table_name,
+              p_column_name = :column_name,
+              p_sort_order  = 0);
+
+            IF IIint != gc_success
+            THEN
+              RETURN 1;
+            ENDIF;
+
+          ENDIF; /* IF [4] */
+        ENDIF; /* IF [3] */
+      ENDIF;  /* IF [1] */
+   ENDIF; /* old_pricing_group = 0 */
+
+            }; /* End Loop 2 */
+
+      /**************************
+      ** Check For INGRES Error
+      ***************************/
+      INQUIRE_INGRES (IIerrorno = ERRORNO,
+      IIerrtext = ERRORTEXT,
+      IIrowcount = ROWCOUNT);
+
+      IF IIerrorno != 0 THEN
+        ROLLBACK;
+        MESSAGE '-02- INGRES error in temp_table and template select '
+           + :IIerrtext WITH STYLE = POPUP;
+        log_string = '-02- INGRES error in temp_table and template select ';
+        CALLPROC errorlog(:log_string,'ASEN');
+        RETURN 1;
+      ENDIF;
+      COMMIT;
+
+     IF lv_debug = 1 THEN
+       drop table agency_sessiontable; commit;
+       create table agency_sessiontable as select * from :sess_name; commit;
+       IF mess_flag = 1 THEN
+         MESSAGE '-ISS- out of loop 2 Drop and create agency_sessiontable' 
+         WITH STYLE=POPUP;
+       ENDIF;
+     ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Send Email                                              */
+/*----------------------------------------------------------*/
+   /* For amended accounts send email as follows:
+      1. Account is changed to DFD - (CLOSED ACCOUNT)
+      2. Account is changed to trading from non trading. (NEW ACCOUNT)
+      3. Account is re-instated. (NEW ACCOUNT) */
+
+   IF p_send_mail = 1
+   THEN
+     IF mess_flag = 1 THEN
+      MESSAGE '-ISS- About to send email for'
+          + ' agency_supplier: ' + varchar(:agency_supplier)
+          + ' request: ' + varchar(:request)
+          + ' p_table_name:' + varchar(:table_name) 
+          + ' p_column_name:' + varchar(:column_name) 
+          + ' p_closed: ' + varchar(:p_closed)
+          + ' p_new: ' + varchar(:p_new)
+          + ' supplier_name: ' + varchar(:supplier_name)
+          + ' email_to: ' + varchar(:email_to) with style=popup;
+     ENDIF;
+
+      /* AZ Lynx (PSN) - do not perform email notify if account is G99 */
+      g99_account = 'N';
+
+      SELECT 'Y' AS g99_account
+      FROM sales_accts sac,
+           agency_supplier_mapping asm
+      WHERE sac.account_no = :account_no
+      AND sac.branch = :account_branch
+      AND asm.aah_code = char(sac.custype_no)
+      AND sac.branch != '606R'
+      AND sac.branch != '608V'
+      AND sac.branch != '904Q'
+      AND asm.agency_supplier_code = 'G99'
+      AND asm.agency_supplier = 1
+      AND asm.mapping_type = 'CUST';
+ 
+      INQUIRE_INGRES (IIerrorno  = ERRORNO, IIerrtext = ERRORTEXT, IIrowcount = ROWCOUNT);
+
+      IF IIerrorno != 0
+      THEN
+          ROLLBACK;
+          MESSAGE '-41B- INGRES error in SELECT ' + :IIerrtext
+          WITH STYLE = POPUP;
+          log_string = '-41B- INGRES error in SELECT ';
+          CALLPROC errorlog(:log_string,'ASEN');
+          RETURN 1;
+      ENDIF;
+
+      IF (g99_account != 'Y')
+      THEN
+          CALLPROC lp_send_email();
+  
+          IIint = CALLPROC insert_email_audit ();
+          IF IIint != gc_success
+          THEN
+              RETURN 1;
+          ENDIF;
+      ENDIF;
+   ENDIF;
+
+          }; /* End Loop 1 */
+
+      /************************
+       Check For INGRES Error 
+      *************************/
+      INQUIRE_INGRES (IIerrorno  = ERRORNO,
+      IIerrtext = ERRORTEXT,
+      IIrowcount = ROWCOUNT);
+  
+      IF IIerrorno != 0 THEN
+      ROLLBACK;
+        MESSAGE '-03- INGRES error selecting from agency_interface_email' 
+           + :IIerrtext WITH STYLE = POPUP;
+        log_string = '-03- INGRES error selecting from agency_interface_email';
+        CALLPROC errorlog(:log_string,'ASEN');
+          RETURN 1;
+      ENDIF;
+      COMMIT;
+
+        }; /* End of unload for each agency email */
+
+    ENDIF; /* Request Type */
+
+  ENDIF; /* Exc Branches */
+
+/*----------------------------------------------------------*/
+/*  Write to error log                                      */
+/*----------------------------------------------------------*/
+    CALLPROC lp_write_errlog();
+        
+    DROP TABLE :sess_name;
+    COMMIT;
+        
+    RETURN 0;
+}    
+
+
+PROCEDURE create_session_table ()=
+{
+    now_string = VARCHAR(date('now'));
+    now_digits = '';
+    sess_name = '';
+    loop = 1;
+    WHILE (loop <= LENGTH(now_string)) DO
+       thischar = CHAREXTRACT(now_string,loop);
+       IF thischar LIKE '\[0-9\]' ESCAPE '\'
+       THEN
+         now_digits = now_digits + thischar;
+       ENDIF;
+       loop = loop + 1;
+    ENDWHILE;
+
+    sess_name = 'SESSION.agency_supplier_' + TRIM(now_digits);
+
+    DECLARE GLOBAL TEMPORARY TABLE :sess_name
+       (
+       request             varchar(6) not null not default,
+       agency_supplier     integer4 not null not default,
+       account_branch      char(4) not null not default,
+       account_no          char(9) not null not default,
+       table_name          varchar(32) not null not default,
+       column_name         varchar(32) not null with default,
+       old_value           varchar(100) not null with default,
+       new_value           varchar(100) not null with default,
+       description         varchar(100) not null with default,
+       man_ind             integer1 not null with default,
+       subject             varchar(100) not null not default,
+       due_for_del         char(1) not null with default,
+       del_date            date not null with default,
+       form_completed      date not null with default,
+       addr_line1          varchar(32) not null with default,
+       addr_line2          varchar(32) not null with default,
+       addr_line3          varchar(32) not null with default,
+       addr_line4          varchar(32) not null with default,
+       post_code           varchar(8) not null with default,
+       tel_no              varchar(12) not null with default,
+       fax_no              char(20) not null with default,
+       email               char(50) not null with default,
+       status              char(1) not null with default,
+       status_text         varchar(20) not null with default,
+       payer_id            char(13) not null with default,
+       az_channel          char(3) not null with default,
+       az_channel_desc     char(35) not null with default,
+       custype_no          char(3) not null with default,
+       custype_text        varchar(32) not null with default,
+       custgroup_no        char(3) not null with default,
+       custgroup_text      varchar(32) not null with default,
+       credit_risk         integer1 not null with default,
+       credit_text         varchar(32) not null with default,
+       credit_desc         varchar(32) not null with default,
+       credit_terms        integer4 not null with default,
+       credit_limit        integer4 not null with default,
+       vat_rate            float8 not null with default,
+       vat_status          varchar(12) not null with default,
+       vat_no              char(20) not null with default,
+       gmc_seq_no          integer not null with default,
+       gmc_supp_ref        char(20) not null with default,
+       gmc_account_no      char(20) not null with default,
+       rps_seq_no          integer not null with default,
+       rps_supp_ref        char(20) not null with default,
+       rps_account_no      char(20) not null with default,
+       email_from          varchar(100) not null with default,
+       email_to            varchar(500) not null with default,
+       sort_order          integer4 not null with default
+       )
+    ON COMMIT PRESERVE ROWS WITH NORECOVERY;    
+
+    /**************************
+    ** Check For INGRES Error 
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+       IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-07- INGRES error creating session table ' 
+         + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-07- INGRES error creating session table ';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+    COMMIT;
+}
+
+
+PROCEDURE get_sales_accts ()=
+{
+    SELECT addr_line1    = sa.addr_line1,
+           addr_line2    = sa.addr_line2,
+           addr_line3    = sa.addr_line3,
+           addr_line4    = sa.addr_line4,
+           vat_status    = sa.vat_mkr,
+           custype_no    = sa.custype_no,
+           custgroup_no  = sa.custgroup_no,
+           second_cust_type = sa.second_cust_type
+      FROM sales_accts sa
+     WHERE sa.branch     = :account_branch
+       AND sa.account_no = :account_no;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                     IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-08- INGRES error selecting sales_accts'
+         + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-08- INGRES error selecting sales_accts';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+    COMMIT;
+}
+
+
+PROCEDURE check_temp_table ()=
+{
+    SELECT :table_name  = SQUEEZE (TRIM (tmp.table_name)),
+           :column_name = SQUEEZE (TRIM (tmp.column_name)),
+           :old_value   = SQUEEZE (TRIM (tmp.old_value)),
+           :new_value   = SQUEEZE (TRIM (tmp.new_value))
+    FROM   :in_table_name tmp
+
+    BEGIN
+       p_changes = p_changes + 1;
+
+       IF table_name    = 'sales_accts'   AND
+          column_name   = 'pricing_group' AND
+          new_value     = '0'             AND
+          p_changes     = 1    
+       THEN
+          p_group_check = 1;
+          p_new = 1;
+          p_send_mail = 1;
+         IF mess_flag = 1 THEN
+           MESSAGE '-ISS- in check_temp_table loop pass 1 ' +
+                   ' column_name: ' + varchar(:column_name) +
+                   ' old_value: ' + varchar(:old_value) +
+                   ' new_value: ' + varchar(:new_value) +
+                   ' p_changes: ' + varchar(:p_changes) +
+                   ' p_group_check: ' + varchar(:p_group_check) +
+                   ' p_closed: ' + varchar(:p_closed) +
+                   ' p_new: ' + varchar(:p_new) +
+                   ' p_send_mail: ' + varchar(:p_send_mail) with style=popup;
+         ENDIF;
+       ENDIF;
+
+       IF table_name    = 'sales_accts'   AND
+          column_name   = 'pricing_group' AND
+          old_value     = '9999'          AND
+          new_value     = '0'             AND
+          p_changes     > 0
+       THEN
+          p_send_mail = 1;
+          p_new = 1;
+         IF mess_flag = 1 THEN
+           MESSAGE '-ISS- in check_temp_table loop pass 2 ' +
+                   ' column_name: ' + varchar(:column_name) +
+                   ' old_value: ' + varchar(:old_value) +
+                   ' new_value: ' + varchar(:new_value) +
+                   ' p_changes: ' + varchar(:p_changes) +
+                   ' p_group_check: ' + varchar(:p_group_check) +
+                   ' p_closed: ' + varchar(:p_closed) +
+                   ' p_new: ' + varchar(:p_new) +
+                   ' p_send_mail: ' + varchar(:p_send_mail) with style=popup;
+         ENDIF;
+       ENDIF;
+
+       IF table_name    = 'sales_accts'   AND
+          column_name   = 'del_date'      AND
+          p_changes     > 0
+       THEN
+          p_send_mail = 1;
+          p_closed = 1;
+         IF mess_flag = 1 THEN
+           MESSAGE '-ISS- in check_temp_table loop pass 3 ' +
+                   ' column_name: ' + varchar(:column_name) +
+                   ' old_value: ' + varchar(:old_value) +
+                   ' new_value: ' + varchar(:new_value) +
+                   ' p_changes: ' + varchar(:p_changes) +
+                   ' p_group_check: ' + varchar(:p_group_check) +
+                   ' p_closed: ' + varchar(:p_closed) +
+                   ' p_new: ' + varchar(:p_new) +
+                   ' p_send_mail: ' + varchar(:p_send_mail) with style=popup;
+         ENDIF;
+       ENDIF;
+
+       IF table_name    = 'sales_accts'   AND (
+          column_name   = 'del_date'      OR
+          column_name   = 'pricing_group' ) AND
+          p_changes     > 0
+       THEN
+          p_insert = 0;
+         IF mess_flag = 1 THEN
+           MESSAGE '-ISS- in check_temp_table loop pass 4 ' +
+                   ' column_name: ' + varchar(:column_name) +
+                   ' old_value: ' + varchar(:old_value) +
+                   ' new_value: ' + varchar(:new_value) +
+                   ' p_changes: ' + varchar(:p_changes) +
+                   ' p_group_check: ' + varchar(:p_group_check) +
+                   ' p_closed: ' + varchar(:p_closed) +
+                   ' p_new: ' + varchar(:p_new) +
+                   ' p_send_mail: ' + varchar(:p_send_mail) with style=popup;
+         ENDIF;
+
+       ENDIF;
+
+      IF p_changes > 1 AND 
+         p_group_check = 1 
+      THEN
+        p_group_check = 0;
+      ENDIF;
+
+    END;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                     IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-09- INGRES error selecting ' + LOWER(VARCHAR(in_table_name))
+         + ' ' + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-09- INGRES error selecting ' + LOWER(VARCHAR(in_table_name));
+       CALLPROC errorlog (log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    COMMIT;
+}
+
+
+PROCEDURE get_agency_supplier ()=
+{
+     /*
+     ** MBT - AZ changes WR 2101867
+     **
+     ** AZ only require updates to accounts they trade with.
+     ** AZ accounts also to exclude delivery/HO accounts.
+     */
+
+    IIint = CALLPROC ARRAYCLEAR(agency_array);
+
+      IF request != 'N' THEN
+        IF p_new = 1 OR p_closed = 1 THEN
+
+         IF mess_flag = 1 THEN
+           MESSAGE '-ISS- in get_agency_supplier 1 ' +
+                   ' p_changes: ' + varchar(:p_changes) +
+                   ' p_group_check: ' + varchar(:p_group_check) +
+                   ' p_closed: ' + varchar(:p_closed) +
+                   ' p_new: ' + varchar(:p_new) +
+                   ' p_send_mail: ' + varchar(:p_send_mail) with style=popup;
+         ENDIF;
+
+
+         agency_array:= SELECT agency_supplier = a.agency_supplier
+                          FROM agency_interface_email a,
+                               agency_supplier_mapping b,
+                               agency_supplier c,
+                               sales_accts d
+                         WHERE d.branch = :account_branch
+                           AND d.account_no = :account_no
+                           AND interface_name = 'CUS03'
+                           AND aah_code = CHAR(:custype_no)
+                           AND mapping_type = 'CUST'
+                           AND a.agency_supplier = b.agency_supplier
+                           AND a.agency_supplier = c.agency_supplier
+                           AND b.aah_code = d.custype_no
+                           AND NOT EXISTS (
+                        SELECT * FROM acctlinks f
+                         WHERE f.branch     = :account_branch
+                           AND f.account_no = :account_no
+                           AND purchase_code != '0000'
+                           AND delivery_code != '00'
+                           AND d.branch = f.branch
+                           AND d.account_no = f.account_no);
+
+        ELSE
+
+         IF mess_flag = 1 THEN
+           MESSAGE '-ISS- in get_agency_supplier 2 ' +
+                   ' p_changes: ' + varchar(:p_changes) +
+                   ' p_group_check: ' + varchar(:p_group_check) +
+                   ' p_closed: ' + varchar(:p_closed) +
+                   ' p_new: ' + varchar(:p_new) +
+                   ' p_send_mail: ' + varchar(:p_send_mail) with style=popup;
+         ENDIF;
+
+         agency_array:= SELECT agency_supplier = a.agency_supplier
+                          FROM agency_interface_email a,
+                               agency_supplier_mapping b,
+                               agency_supplier c,
+                               sales_accts d,
+                               saccts_mkrs e
+                         WHERE d.branch = :account_branch
+                           AND d.account_no = :account_no
+                           AND interface_name = 'CUS03'
+                           AND aah_code = CHAR(:custype_no)
+                           AND mkr_status = 1
+                           AND mapping_type = 'CUST'
+                           AND a.agency_supplier = b.agency_supplier
+                           AND a.agency_supplier = c.agency_supplier
+                           AND b.aah_code = d.custype_no
+                           AND c.mkr_code = e.mkr_code
+                           AND d.branch = e.branch
+                           AND d.account_no = e.account_no
+                           AND NOT EXISTS (
+                        SELECT * FROM acctlinks f
+                         WHERE f.branch     = :account_branch
+                           AND f.account_no = :account_no
+                           AND purchase_code != '0000'
+                           AND delivery_code != '00'
+                           AND d.branch = f.branch
+                           AND e.branch = f.branch
+                           AND d.account_no = f.account_no
+                           AND e.account_no = f.account_no);
+
+        ENDIF; /* IF p_new = 1 OR p_closed = 1 */
+
+      ELSE
+
+         IF mess_flag = 1 THEN
+           MESSAGE '-ISS- in get_agency_supplier 3 ' +
+                   ' p_changes: ' + varchar(:p_changes) +
+                   ' p_group_check: ' + varchar(:p_group_check) +
+                   ' p_closed: ' + varchar(:p_closed) +
+                   ' p_new: ' + varchar(:p_new) +
+                   ' p_send_mail: ' + varchar(:p_send_mail) with style=popup;
+         ENDIF;
+
+
+         agency_array:= SELECT agency_supplier = a.agency_supplier
+                          FROM agency_interface_email a,
+                               agency_supplier_mapping b,
+                               agency_supplier c,
+                               sales_accts d
+                         WHERE d.branch = :account_branch
+                           AND d.account_no = :account_no
+                           AND interface_name = 'CUS03'
+                           AND aah_code = CHAR(:custype_no)
+                           AND mapping_type = 'CUST'
+                           AND a.agency_supplier = b.agency_supplier
+                           AND a.agency_supplier = c.agency_supplier
+                           AND b.aah_code = d.custype_no;
+      ENDIF;
+
+      /**************************
+      ** Check For INGRES Error
+      ***************************/
+      INQUIRE_INGRES (IIerrorno  = ERRORNO,
+      IIerrtext = ERRORTEXT,
+      IIrowcount = ROWCOUNT);
+      
+      IF IIerrorno != 0 THEN
+         ROLLBACK;
+         MESSAGE '-10- INGRES error in agency_interface_email select '
+           + :IIerrtext WITH STYLE = POPUP;
+         log_string = '-10- INGRES error in agency_interface_email select '
+           + :IIerrtext;
+         CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+      ENDIF;
+      COMMIT;
+           
+      IF mess_flag = 1 THEN
+        MESSAGE '-ISS- in proc get_agency_supplier '
+             +  ' rowcount: ' + varchar(:IIrowcount) with style = popup;
+      ENDIF;
+ 
+      IF IIrowcount = 0 THEN
+        log_string = 'No agency supplier found. . .';
+         CALLPROC errorlog(:log_string,'ASEN');
+        RETURN gc_success;
+      ENDIF;
+}
+
+
+PROCEDURE lp_send_email ()=
+{
+    IF mess_flag = 1 THEN
+       MESSAGE '-ISS- gv_boxid = ' + VARCHAR(:gv_boxid) + X'0A' 
+         + 'email_to = ' + VARCHAR(:email_to) WITH STYLE = POPUP;
+    ENDIF;
+    
+    agency_file = :gc_temp + TRIM(:agency_file_name) + TRIM(:now_digits) + '.html';
+    param_name = 'agency_supplier_' + TRIM(now_digits); 
+    param_list = 'sess_name = "' + TRIM(VARCHAR(:param_name)) + '"';
+ 
+    CALL REPORT (report = 'agency_supplier_email_notify',
+                 param  = :param_list,
+                 file   = :agency_file,
+                 silent = 'Y',
+                 forcerep = 'Y'
+                );
+ 
+    system_cmd = 'cat ' + TRIM (agency_file) + ' ' + '| mailx -t -r ' 
+       + TRIM(VARCHAR(email_from));
+ 
+    IF mail_flag = 1 THEN
+      CALL SYSTEM :system_cmd;
+    ENDIF;
+  
+    system_cmd = 'mv ' + TRIM(:agency_file) + ' ' + :gc_arc_mth_curr;
+    CALL SYSTEM :system_cmd;
+ 
+    user_text = '';
+    email_text = '';
+    table_text = '';
+  
+    IF request = 'N'
+    THEN
+      user_text = user_text + 'NEW ACCOUNT : ' + TRIM(:account_branch) 
+        + TRIM(:account_no) + ' ' + TRIM(:addr_line1) + ' '
+        + TRIM(:addr_line2) + ' ' + TRIM(:addr_line3);
+ 
+      email_text = email_text + 'request=' + TRIM(:request) + ', '
+        + 'account_branch=' + TRIM(:account_branch) + ', '
+        + 'account_no=' + TRIM(:account_no) + ', ';
+ 
+        IF mess_flag = 1 THEN
+          MESSAGE '-ISS- NEW user_text ' + varchar(:user_text) with style=popup;
+          MESSAGE '-ISS- NEW email_text ' + varchar(:email_text) with style=popup;
+        ENDIF;
+    ELSE
+ 
+      email_text = email_text + 'request=' + TRIM(:request) + ', '
+        + 'account_branch=' + TRIM(:account_branch) + ', '
+        + 'account_no=' + TRIM(:account_no) + ', '
+        + 'in_table_name=' + LOWER(TRIM(:in_table_name)) + ', ';
+   
+      table_text = table_text + 'table=' + TRIM(:table_name) + ', '
+        + 'column=' + TRIM(:column_name) + ', ';
+ 
+      IF p_new = 1 THEN
+        request = 'N';
+        user_text = user_text + 'NEW ACCOUNT : ' + TRIM(:account_branch) 
+          + TRIM(:account_no) + ' ' + TRIM(:addr_line1) + ' '
+          + TRIM(:addr_line2) + ' ' + TRIM(:addr_line3);
+        IF mess_flag = 1 THEN
+          MESSAGE '-ISS- NEW user_text ' + varchar(:user_text) with style=popup;
+          MESSAGE '-ISS- NEW email_text ' + varchar(:email_text) with style=popup;
+          MESSAGE '-ISS- NEW table_text ' + varchar(:table_text) with style=popup;
+        ENDIF;
+      ELSEIF request = 'U' THEN
+        user_text = user_text + 'UPD ACCOUNT : ' + TRIM(:account_branch) 
+          + TRIM(:account_no) + ' ' + TRIM(:addr_line1) + ' '
+          + TRIM(:addr_line2) + ' ' + TRIM(:addr_line3);
+        IF mess_flag = 1 THEN
+          MESSAGE '-ISS- UPD user_text ' + varchar(:user_text) with style=popup;
+          MESSAGE '-ISS- UPD email_text ' + varchar(:email_text) with style=popup;
+          MESSAGE '-ISS- UPD table_text ' + varchar(:table_text) with style=popup;
+        ENDIF;
+      ELSEIF p_closed = 1 THEN
+        request = 'C';
+        user_text = user_text + 'CLS ACCOUNT : ' + TRIM(:account_branch) 
+          + TRIM(:account_no) + ' ' + TRIM(:addr_line1) + ' '
+          + TRIM(:addr_line2) + ' ' + TRIM(:addr_line3);
+        IF mess_flag = 1 THEN
+          MESSAGE '-ISS- CLS user_text ' + varchar(:user_text) with style=popup;
+          MESSAGE '-ISS- CLS email_text ' + varchar(:email_text) with style=popup;
+          MESSAGE '-ISS- CLS table_text ' + varchar(:table_text) with style=popup;
+        ENDIF;
+      ENDIF;
+
+    ENDIF;
+}
+
+
+PROCEDURE lp_write_errlog ()=
+{
+   log_string = 'Send ' + TRIM(VARCHAR(:supplier_name)) + ' Agency Supplier ' 
+      + TRIM(VARCHAR(:agency_supplier)) + ' Request ' + TRIM(:request);
+   CALLPROC errorlog(:log_string,'ASEN');
+
+   log_string = 'To ' + TRIM(VARCHAR(:email_to));
+   CALLPROC errorlog(:log_string,'ASEN');
+ 
+   log_string = 'From ' + TRIM(VARCHAR(:gv_user_id)) + ' ' 
+      + TRIM(VARCHAR(:gv_branch_id)) + ' ' + TRIM(VARCHAR(:email_from));
+   CALLPROC errorlog(:log_string,'ASEN');
+}
+
+
+PROCEDURE insert_session_table ()=
+{
+    IF mess_flag = 1 THEN
+      MESSAGE '-ISS- in proc insert_session_table' with style = popup;
+    ENDIF;
+
+    INSERT INTO :sess_name
+       (
+       request,
+       agency_supplier,
+       account_branch,
+       account_no,
+       table_name,
+       subject,
+       form_completed,
+       status_text,
+       vat_status,
+       payer_id,
+       credit_text,
+       credit_terms,
+       email_from,
+       email_to
+       )
+    VALUES
+       (
+       :request,
+       :agency_array[:row_no].agency_supplier,
+       :account_branch,
+       :account_no,
+       :table_name,
+       'New Account Creation - ' + TRIM(:supplier_name),
+       date('today'),
+       'Suspended',
+       'Standard',
+       TRIM(VARCHAR(:account_branch)) + TRIM(VARCHAR(:account_no)),
+       'No',
+       30,
+       TRIM(:email_from),
+       TRIM(:email_to)
+       );
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+       IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+    IF mess_flag = 1 THEN
+      MESSAGE '-ISS- in proc insert_session_table' +
+        ' rowcount: ' + varchar(:IIrowcount) with style = popup;
+    ENDIF;
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-11- INGRES error inserting into session table'
+         + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-11- INGRES error inserting into session table';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+    COMMIT;
+}
+
+
+PROCEDURE update_session_table ()=
+{
+   rps_cnt = 0;
+   gmc_cnt = 0;
+
+    UPDATE :sess_name sess
+      FROM sales_accts sa
+       SET due_for_del     = sa.due_for_del,
+           del_date        = sa.del_date,
+           addr_line1      = sa.addr_line1,
+           addr_line2      = sa.addr_line2,
+           addr_line3      = sa.addr_line3,
+           addr_line4      = sa.addr_line4,
+           post_code       = sa.post_code,
+           tel_no          = sa.tel_no,
+           status          = sa.stop_warn,
+           custype_no      = sa.custype_no,
+           custgroup_no    = sa.custgroup_no,
+           credit_risk     = sa.credit_risk,
+           credit_limit    = sa.credit_limit,
+           vat_status      = sa.vat_mkr
+     WHERE sa.branch       = :account_branch
+       AND sa.account_no   = :account_no;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+       IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-12- INGRES error updating session table from sales_accts'
+         + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-13- INGRES error updating session table from sales_accts';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    /* Set the Credit Description */  
+    UPDATE :sess_name sess
+    SET credit_text = 'No'
+    WHERE credit_risk = 0;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+       IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-48- INGRES error updating session table' + :IIerrtext 
+       WITH STYLE = POPUP;
+       log_string = '-48- INGRES error updating session table';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    /* Set the Credit Description */  
+    UPDATE :sess_name sess
+    SET credit_text = 'Yes'
+    WHERE credit_risk > 0;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+       IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-14- INGRES error updating session table' + :IIerrtext 
+       WITH STYLE = POPUP;
+       log_string = '-14- INGRES error updating session table';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    /* Set the Credit Description */  
+    UPDATE :sess_name sess
+    FROM credit_risks cr
+    SET credit_desc = cr.description
+    WHERE sess.credit_risk = cr.code;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                     IIerrtext = ERRORTEXT,
+                    IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-15- INGRES error updating session table from credit_risks'
+         + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-15- INGRES error updating session table from credit_risks';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    /* Get Sales Accounts Extra */
+    UPDATE :sess_name sess
+      FROM sales_accts_extra sae
+       SET fax_no         = sae.fax_no,
+           email          = sae.email,
+           vat_no         = sae.vat_no
+     WHERE sae.branch     = sess.account_branch
+       AND sae.account_no = sess.account_no;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                     IIerrtext = ERRORTEXT,
+                    IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-16- INGRES error updating session table from sales_accts_extra'
+         + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-16- INGRES error updating session table from '
+         + 'sales_accts_extra' + :IIerrtext;
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    /* Update Customer Order Status Text FREE */
+    UPDATE :sess_name sess
+    SET status_text = 'FREE'
+    WHERE status NOT IN ('S','W');
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-17- INGRES error updating session table with customer '
+         + 'order status' + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-17- INGRES error updating session table with customer '
+         + 'order status' + :IIerrtext;
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    /* Update Customer Order Status Text STOP */
+    UPDATE :sess_name sess
+    SET status_text = 'STOP'
+    WHERE status = 'S';
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-38- INGRES error updating session table with customer '
+         + 'order status' + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-38- INGRES error updating session table with customer '
+         + 'order status' + :IIerrtext;
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    /* Update Customer Order Status Text WARN */
+    UPDATE :sess_name sess
+    SET status_text = 'WARN'
+    WHERE status = 'W';
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-39- INGRES error updating session table with customer '
+         + 'order status' + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-39- INGRES error updating session table with customer '
+         + 'order status' + :IIerrtext;
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+     /* Get Account Links */
+     UPDATE :sess_name sess
+       FROM acctlinks acc
+        SET payer_id = concat(acc.branch, acc.account_no)
+      WHERE acc.branch = sess.account_branch
+        AND acc.account_no = sess.account_no
+        AND acc.purchase_code = '0000';
+
+     /**************************
+     ** Check For INGRES Error
+     ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+     IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-18- INGRES error updating session table from acctlinks'
+          + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-18- INGRES error updating session table from acctlinks '
+          + :IIerrtext;
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+     ENDIF;
+
+     /* Get AZ Customer Type */
+     UPDATE :sess_name sess
+       FROM cust_types ct
+        SET custype_text = ct.custype
+      WHERE ct.custype_no = :custype_no;
+     
+     /**************************
+     ** Check For INGRES Error
+     ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+     IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-19- INGRES error updating session table from '
+         + 'cust_types' + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-19- INGRES error updating session table from '
+         + 'cust_types ' + :IIerrtext;
+       CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+     ENDIF;
+
+     /* Get AAH Customer Group */ 
+     UPDATE :sess_name sess
+       FROM cust_groups cg
+        SET custgroup_text = cg.custgroup_name
+      WHERE cg.custgroup_no = :custgroup_no;
+
+     /**************************
+     ** Check For INGRES Error
+     ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+     IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-39- INGRES error updating session table from '
+         + 'cust_groups ' + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-39- INGRES error updating session table from '
+         + 'cust_groups ' + :IIerrtext;
+       CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+     ENDIF;
+
+     /* Get AZ Customer Group */
+     SELECT az_channel = azc.az_channel
+       FROM az_channel azc
+      WHERE azc.cust_type = :custype_no
+        AND azc.cust_group = :custgroup_no
+        AND ((azc.second_cust_type = :second_cust_type
+              AND :second_cust_type IN (SELECT distinct second_cust_type
+                                          FROM az_channel azx
+                                         WHERE azx.cust_type = azc.cust_type
+                                           AND azx.cust_group = azc.cust_group))
+             OR (azc.second_cust_type != :second_cust_type
+                 AND azc.second_cust_type = 0
+                 AND :second_cust_type NOT IN (SELECT distinct second_cust_type
+                                                 FROM az_channel azy
+                                                WHERE azy.cust_type = azc.cust_type
+                                                  AND azy.cust_group = azc.cust_group)));
+
+     /**************************
+     ** Check For INGRES Error
+     ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+     IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-20- INGRES error retreiving az_channel '
+          + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-20- INGRES error retreiving az_channel ';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+     ENDIF;
+
+     IF IIrowcount != 0 THEN
+
+     UPDATE :sess_name sess
+      FROM  az_channel azc
+       SET  az_channel = azc.az_channel,
+            az_channel_desc = azc.channel_desc
+      WHERE azc.cust_type = :custype_no
+        AND azc.cust_group = :custgroup_no
+        AND ((azc.second_cust_type = :second_cust_type
+              AND :second_cust_type IN (SELECT distinct second_cust_type
+                                          FROM az_channel azx
+                                         WHERE azx.cust_type = azc.cust_type
+                                           AND azx.cust_group = azc.cust_group))
+             OR (azc.second_cust_type != :second_cust_type
+                 AND azc.second_cust_type = 0
+                 AND :second_cust_type NOT IN (SELECT distinct second_cust_type
+                                                 FROM az_channel azy
+                                                WHERE azy.cust_type = azc.cust_type
+                                                  AND azy.cust_group = azc.cust_group)));
+ 
+     ELSE
+
+     UPDATE :sess_name sess
+      FROM  az_channel azc
+       SET  az_channel = azc.az_channel,
+            az_channel_desc = azc.channel_desc
+      WHERE azc.cust_type = :custype_no
+        AND azc.cust_group = 0
+        AND ((azc.second_cust_type = :second_cust_type
+              AND :second_cust_type IN (SELECT distinct second_cust_type
+                                          FROM az_channel azx
+                                         WHERE azx.cust_type = azc.cust_type
+                                           AND azx.cust_group = azc.cust_group))
+             OR (azc.second_cust_type != :second_cust_type
+                 AND azc.second_cust_type = 0
+                 AND :second_cust_type NOT IN (SELECT distinct second_cust_type
+                                                 FROM az_channel azy
+                                                WHERE azy.cust_type = azc.cust_type
+                                                  AND azy.cust_group = azc.cust_group)));
+
+     ENDIF;
+ 
+     /**************************
+     ** Check For INGRES Error
+     ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+     IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-43- INGRES error updating session table from '
+         + 'az_channel ' + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-43- INGRES error updating session table from '
+         + 'az_channel ' + :IIerrtext;
+       CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+     ENDIF;
+
+     /* Update VAT Status */
+     SELECT vat_mkr = acc.vat_mkr
+       FROM sales_accts acc, :sess_name sess
+      WHERE acc.branch = sess.account_branch
+        AND acc.account_no = sess.account_no;
+
+     /**************************
+     ** Check For INGRES Error
+     ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+     IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-20- INGRES error retreiving VAT marker '
+          + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-20- INGRES error retreiving VAT marker ';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+     ENDIF;
+
+     IF vat_mkr = 'EX'
+     THEN
+       UPDATE :sess_name sess
+       SET vat_status = 'Exempt' ;
+     ELSEIF vat_mkr = 'CH'
+     THEN
+       UPDATE :sess_name sess
+       SET vat_status = 'Charity';
+     ELSE
+       UPDATE :sess_name sess
+       SET vat_status = 'Standard';
+     ENDIF;
+
+     /**************************
+     ** Check For INGRES Error
+     ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+     IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-21- INGRES error updating session table with VAT Status'
+          + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-21- INGRES error updating session table with VAT Status';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+     ENDIF;
+
+    /* General Pharmaceutical Council */
+    /* (was Royal Pharmaceutical Society) variables still use RPS_ prefix. */
+    UPDATE :sess_name sess
+      FROM saccts_supplier_acctno ssa
+       SET rps_seq_no      = ssa.sequence_no,
+           rps_supp_ref    = ssa.supplier_reference,
+           rps_account_no  = ssa.supplier_account_no
+     WHERE ssa.sequence_no = 12		/* GPhC (was RPS) changed to 12 : TE0363 : 20160304	*/
+       AND ssa.branch      = sess.account_branch
+       AND ssa.account_no  = sess.account_no;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                     IIerrtext = ERRORTEXT,
+                    IIrowcount = ROWCOUNT);
+    
+    rps_cnt = :IIrowcount;
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-44- INGRES error updating session table from '
+          + 'saccts_supplier_acctno ' + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-44- INGRES error updating session table from '
+          + 'saccts_supplier_acctno ' + :IIerrtext;
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    /* General Medical Council */
+    UPDATE :sess_name sess
+      FROM saccts_supplier_acctno ssa
+       SET gmc_seq_no      = ssa.sequence_no,
+           gmc_supp_ref    = ssa.supplier_reference,
+           gmc_account_no  = ssa.supplier_account_no
+     WHERE ssa.sequence_no = 13		/* GMC Nos are 13. TE363 20160304	*/
+       AND ssa.branch      = sess.account_branch
+       AND ssa.account_no  = sess.account_no;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                     IIerrtext = ERRORTEXT,
+                    IIrowcount = ROWCOUNT);
+
+    gmc_cnt = :IIrowcount;
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-45- INGRES error updating session table from ' 
+         + 'saccts_supplier_acctno' + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-45- INGRES error updating session table from '
+         + 'saccts_supplier_acctno' + :IIerrtext;
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    /* Set request to C if p_closed is set */  
+    IF p_closed = 1 THEN
+      request = 'C';
+      UPDATE :sess_name
+      SET request = 'C',
+          subject = 'Closed Account - ' + TRIM(:supplier_name);
+    ENDIF;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+       IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-46- INGRES error updating session table' + :IIerrtext 
+       WITH STYLE = POPUP;
+       log_string = '-46- INGRES error updating session table';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    /* Set request to N if p_new is set */  
+    IF p_new = 1 THEN
+      request = 'N';
+      UPDATE :sess_name
+      SET request = 'N';
+    ENDIF;
+
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+       IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-47- INGRES error updating session table' + :IIerrtext 
+       WITH STYLE = POPUP;
+       log_string = '-47- INGRES error updating session table';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+
+    COMMIT;
+
+    IF mess_flag = 1 THEN
+      MESSAGE '-ISS- in update_session_table ' +
+              ' Number of seq 12 GPhC rows: ' + varchar(:rps_cnt) +
+              ' Number of seq 13 GMC rows: ' + varchar(:gmc_cnt) +
+              ' column_name: ' + varchar(:column_name) +
+              ' old_value: ' + varchar(:old_value) +
+              ' new_value: ' + varchar(:new_value) with style=popup;
+    ENDIF;
+}
+
+
+PROCEDURE insert_email_audit ()=
+{
+    IF mess_flag = 1 THEN
+      MESSAGE '-ISS- in proc insert_email_audit' with style = popup;
+    ENDIF;
+
+    INSERT INTO agency_supplier_email_audit
+       (
+       agency_supplier,
+       user_details,
+       email_details,
+       table_details,
+       audit_date
+       )
+    VALUES
+       (
+       :agency_supplier,
+       :user_text,
+       :email_text,
+       :table_text,
+       date('now')
+       );
+  
+    /**************************
+    ** Check For INGRES Error
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                     IIerrtext = ERRORTEXT,
+                    IIrowcount = ROWCOUNT);
+  
+    IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-22- INGRES error inserting into agency_supplier_email_audit'
+         + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-22- INGRES error inserting into agency_supplier_email_audit';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+    ENDIF;
+    COMMIT;
+}
+
+
+PROCEDURE insert_notification ()=
+{
+    IF mess_flag = 1 THEN
+      MESSAGE '-ISS- in proc insert_notification' with style = popup;
+    ENDIF;
+
+    SELECT :agency_supplier = a.agency_supplier
+      FROM agency_supplier_template a,
+           agency_interface_email b
+     WHERE table_name like 'sales_accts%'
+       AND a.agency_supplier = b.agency_supplier
+  GROUP BY a.agency_supplier
+
+     {
+       SELECT :lv_row_id = row_id 
+       FROM agency_sequence;
+
+       /**************************
+       ** Check For INGRES Error 
+       ***************************/
+       INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                        IIerrtext = ERRORTEXT,
+                       IIrowcount = ROWCOUNT);
+
+       IF IIerrorno != 0 THEN
+         ROLLBACK;
+         MESSAGE '-23- INGRES error selecting from agency_sequence'
+            + :IIerrtext WITH STYLE = POPUP;
+         log_string = '-23- INGRES error selecting from agency_sequence';
+         CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+       ENDIF;
+
+       lv_row_id = :lv_row_id + 1;
+
+       UPDATE agency_sequence
+       SET row_id = :lv_row_id;
+
+       /**************************
+       ** Check For INGRES Error 
+       ***************************/
+       INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                        IIerrtext = ERRORTEXT,
+                       IIrowcount = ROWCOUNT);
+
+       IF IIerrorno != 0 THEN
+         ROLLBACK;
+         MESSAGE '-24- INGRES error updating agency_sequence'
+            + :IIerrtext WITH STYLE = POPUP;
+         log_string = '-24- INGRES error updating agency_sequence';
+         CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+       ENDIF;
+       COMMIT; 
+
+       /********************************/
+       /* Write to Agency Notification */
+       /********************************/
+
+       INSERT INTO agency_notification
+       (
+       row_id,
+       agency_supplier,
+       table_name,
+       column_name,
+       pk_value_1, 
+       pk_value_2, 
+       pk_value_number, 
+       action,
+       updated_on,
+       updated_by,
+       old_value,
+       new_value
+       )
+       VALUES
+       (
+       :lv_row_id,
+       :agency_supplier,
+       'sales_accts',
+       :column_name,
+       :account_branch,
+       :account_no,
+       0, 
+       'I',
+       date('now'),
+       :gv_user_id,
+       '',
+       :new_value
+       );
+
+       /**************************
+       ** Check For INGRES Error 
+       ***************************/
+       INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                        IIerrtext = ERRORTEXT,
+                       IIrowcount = ROWCOUNT);
+
+     IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-25- INGRES error inserting into agency_notification'
+          + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-25- INGRES error inserting into agency_notification';
+       CALLPROC errorlog(:log_string,'ASEN');
+       RETURN 1;
+     ENDIF;
+     COMMIT;
+     };
+
+     /**************************
+     ** Check For INGRES Error 
+     ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+  
+     IF IIerrorno != 0 THEN
+        ROLLBACK;
+        MESSAGE '-26- INGRES error selecting agency_supplier'
+          + :IIerrtext WITH STYLE = POPUP;
+        log_string = '-26- INGRES error selecting agency_supplier';
+        CALLPROC errorlog(:log_string,'ASEN');
+        RETURN 1;
+     ENDIF;
+}
+
+
+PROCEDURE lp_customer_type ()=
+{
+    IF :table_name = 'sales_accts'
+    AND :column_name = 'custype_no'
+    THEN
+      SELECT :custype_text = custype
+        FROM cust_types
+       WHERE custype_no = :custype_no;
+
+      /**************************
+      ** Check For INGRES Error
+      ***************************/
+      INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                       IIerrtext = ERRORTEXT,
+                      IIrowcount = ROWCOUNT);
+
+      IF IIerrorno != 0 THEN
+        ROLLBACK;
+        MESSAGE '-27- INGRES error reading from cust_types'
+          + :IIerrtext WITH STYLE = POPUP;
+        log_string = '-27- INGRES error reading from cust_types';
+        CALLPROC errorlog(:log_string,'ASEN');
+        RETURN 1;
+      ENDIF;
+
+      new_value = '';
+
+      IF IIrowcount > 0
+      THEN
+        new_value = varchar(:custype_no);
+        new_value = :new_value + ' - ';
+        new_value = :new_value + custype_text;
+
+         IF mess_flag = 1 THEN
+           MESSAGE '-ISS- in lp_customer_type 1 ' +
+                   ' new_value: ' + varchar(:new_value) with style=popup;
+         ENDIF;
+
+        SELECT :custype_text_old = custype
+          FROM cust_types
+         WHERE custype_no = INT4(SHIFT(:old_value,-1 * LOCATE(:old_value,'#')));
+  
+        /**************************
+        ** Check For INGRES Error
+        ***************************/
+        INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                         IIerrtext = ERRORTEXT,
+                        IIrowcount = ROWCOUNT);
+  
+        IF IIerrorno != 0 THEN
+          ROLLBACK;
+          MESSAGE '-40- INGRES error reading from cust_types'
+            + :IIerrtext WITH STYLE = POPUP;
+          log_string = '-40- INGRES error reading from cust_types';
+          CALLPROC errorlog(:log_string,'ASEN');
+          RETURN 1;
+        ENDIF;
+
+        old_value = VARCHAR(INT4(SHIFT(:old_value,-1 * LOCATE(:old_value,'#'))));
+        old_value = :old_value + ' - ';
+        old_value = :old_value + custype_text_old;
+
+      ENDIF;
+
+    ENDIF;
+
+         IF mess_flag = 1 THEN
+           MESSAGE '-ISS- in lp_customer_type 2 ' +
+                   ' old_value: ' + varchar(:old_value) +
+                   ' new_value: ' + varchar(:new_value) with style=popup;
+         ENDIF;
+}
+
+
+PROCEDURE lp_customer_group ()=
+{
+    IF :table_name = 'sales_accts'
+    AND :column_name = 'custgroup_no'
+    THEN
+      SELECT custgroup_text = custgroup_name 
+        FROM cust_groups 
+       WHERE custgroup_no = :custgroup_no;
+
+      /**************************
+      ** Check For INGRES Error
+      ***************************/
+      INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                       IIerrtext = ERRORTEXT,
+                      IIrowcount = ROWCOUNT);
+
+      IF IIerrorno != 0 THEN
+        ROLLBACK;
+        MESSAGE '-37- INGRES error reading from cust_groups'
+          + :IIerrtext WITH STYLE = POPUP;
+        log_string = '-37- INGRES error reading from cust_groups';
+        CALLPROC errorlog(:log_string,'ASEN');
+        RETURN 1;
+      ENDIF;
+
+      new_value = '';
+
+      IF IIrowcount > 0
+      THEN
+        new_value = varchar(:custgroup_no);
+        new_value = :new_value + ' - ';
+        new_value = :new_value + custgroup_text;
+
+         IF mess_flag = 1 THEN
+           MESSAGE '-ISS- in lp_customer_group 1 ' +
+                   ' old_value: ' + varchar(:old_value) +
+                   ' new_value: ' + varchar(:new_value) with style=popup;
+         ENDIF;
+
+        SELECT :custgroup_text_old = custgroup_name
+          FROM cust_groups
+         WHERE custgroup_no = :old_value;
+  
+        /**************************
+        ** Check For INGRES Error
+        ***************************/
+        INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                         IIerrtext = ERRORTEXT,
+                        IIrowcount = ROWCOUNT);
+  
+        IF IIerrorno != 0 THEN
+          ROLLBACK;
+          MESSAGE '-41- INGRES error reading from cust_groups'
+            + :IIerrtext WITH STYLE = POPUP;
+          log_string = '-41- INGRES error reading from cust_groups';
+          CALLPROC errorlog(:log_string,'ASEN');
+          RETURN 1;
+        ENDIF;
+
+        old_value = varchar(old_value);
+        old_value = :old_value + ' - ';
+        old_value = :old_value + custgroup_text_old;
+
+      ENDIF;
+
+    ENDIF;
+}
+
+
+PROCEDURE lp_credit_risk ()=
+{
+   IF :table_name = 'sales_accts'
+   AND :column_name = 'credit_risk'
+   THEN
+
+     /* Get Credit Description */
+     SELECT credit_desc = description
+       FROM credit_risks
+      WHERE code = TRIM(:new_value);
+
+     /**************************
+     ** Check For INGRES Error 
+     ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+     IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-28- INGRES error selecting from credit_risks' 
+         + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-28- INGRES error selecting from credit_risks';
+       CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+     ENDIF;
+     COMMIT; 
+
+       IF TRIM(:new_value) = '0'
+       THEN 
+         credit_text = 'No';
+         new_value = TRIM(:new_value) + ' - ' +  TRIM(credit_desc);
+       ELSE
+         credit_text = 'Yes';
+         new_value = TRIM(:new_value) + ' - '  + TRIM(credit_desc);
+       ENDIF;
+
+
+     /* Get Original Credit Description */
+     SELECT credit_desc_old = description
+       FROM credit_risks
+      WHERE code = TRIM(:old_value);
+
+     /**************************
+     ** Check For INGRES Error 
+     ***************************/
+     INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                      IIerrtext = ERRORTEXT,
+                     IIrowcount = ROWCOUNT);
+
+     IF IIerrorno != 0 THEN
+       ROLLBACK;
+       MESSAGE '-99- INGRES error selecting from credit_risks' 
+         + :IIerrtext WITH STYLE = POPUP;
+       log_string = '-99- INGRES error selecting from credit_risks';
+       CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+     ENDIF;
+     COMMIT; 
+
+     old_value = TRIM(:old_value) + ' - ' +  TRIM(credit_desc_old);
+
+       /* insert 2 new rows */
+
+       INSERT INTO :sess_name
+       ( 
+        request,
+        agency_supplier,
+        account_branch,
+        account_no,
+        table_name,
+        column_name,
+        new_value,
+        description,
+        man_ind,
+        subject,
+        form_completed,
+        addr_line1,
+        addr_line2,
+        addr_line3,
+        addr_line4,
+        payer_id,
+        custype_no,
+        custype_text,
+        vat_status,
+        email_from,
+        email_to,
+        sort_order
+       )
+       VALUES
+       (
+        :request,
+        :agency_supplier,
+        :account_branch,
+        :account_no,
+        :table_name,
+        :column_name,
+        TRIM(:credit_text),
+        'RPS or GMC check completed',
+        :man_ind,
+        'New Account Creation - ' + TRIM(:supplier_name),
+        date('today'),
+        :addr_line1,
+        :addr_line2,
+        :addr_line3,
+        :addr_line4,
+        TRIM(VARCHAR(:account_branch)) + TRIM(VARCHAR(:account_no)),
+        :custype_no,
+        :custype_text,
+        'Standard',
+        TRIM(:email_from),
+        TRIM(:email_to),
+        :sort_order - 2  
+       );
+
+       /**************************
+       ** Check For INGRES Error 
+       ***************************/
+       INQUIRE_INGRES (IIerrorno  = ERRORNO,
+       IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+       IF IIerrorno != 0 THEN
+         ROLLBACK;
+         MESSAGE '-29- INGRES error inserting into session table' 
+           + :IIerrtext WITH STYLE = POPUP;
+         log_string = '-29- INGRES error inserting into session table';
+         CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+       ENDIF;
+       COMMIT;
+
+       INSERT INTO :sess_name
+       ( 
+         request,
+         agency_supplier,
+         account_branch,
+         account_no,
+         table_name,
+         column_name,
+         new_value,
+         description,
+         man_ind,
+         subject,
+         form_completed,
+         addr_line1,
+         addr_line2,
+         addr_line3,
+         addr_line4,
+         payer_id,
+         custype_no,
+         custype_text,
+         vat_status,
+         email_from,
+         email_to,
+         sort_order
+       )
+       VALUES
+       (
+         :request,
+         :agency_supplier,
+         :account_branch,
+         :account_no,
+         :table_name,
+         :column_name,
+         TRIM(:credit_text),
+         'Credit agency check completed',
+         :man_ind,
+         'New Account Creation - ' + TRIM(:supplier_name),
+         date('today'),
+         :addr_line1,
+         :addr_line2,
+         :addr_line3,
+         :addr_line4,
+         TRIM(VARCHAR(:account_branch)) + TRIM(VARCHAR(:account_no)),
+         :custype_no,
+         :custype_text,
+         'Standard',
+         TRIM(:email_from),
+         TRIM(:email_to),
+         :sort_order - 1 
+       );
+
+       /**************************
+       ** Check For INGRES Error 
+       ***************************/
+       INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                        IIerrtext = ERRORTEXT,
+                       IIrowcount = ROWCOUNT);
+       
+       IF IIerrorno != 0 THEN
+         ROLLBACK;
+         MESSAGE '-30- INGRES error inserting into session table' 
+           + :IIerrtext WITH STYLE = POPUP;
+         log_string = '-30- INGRES error inserting into session table';
+         CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+       ENDIF;
+       COMMIT;
+
+   ENDIF; /* Credit risk */
+}
+
+
+PROCEDURE lp_stop_warn ()=
+{
+   IF :table_name = 'sales_accts'
+   AND :column_name = 'stop_warn'
+   THEN
+     IF TRIM(:new_value) = 'S'
+     THEN
+       status_text = 'STOP';
+     ELSEIF TRIM(:new_value) = 'W'
+     THEN
+       status_text = 'WARN';
+     ELSE
+       status_text = 'FREE';
+     ENDIF;
+
+     new_value = status_text;
+
+     IF TRIM(:old_value) = 'S'
+     THEN
+       old_value = 'STOP';
+     ELSEIF TRIM(:old_value) = 'W'
+     THEN
+       old_value = 'WARN';
+     ELSE
+       old_value = 'FREE';
+     ENDIF;
+
+   ENDIF; /* Stop / Warn */
+}
+
+
+PROCEDURE lp_vat_mkr ()=
+{
+   IF :table_name = 'sales_accts'
+   AND :column_name = 'vat_mkr'
+   THEN
+     IF TRIM(:new_value) = 'EX'
+     THEN
+       vat_status = 'Exempt';
+     ELSEIF TRIM(:new_value) = 'CH'
+     THEN
+       vat_status = 'Charity';
+     ELSE
+       vat_status = 'Standard';
+     ENDIF;
+     new_value = vat_status;
+
+		 /* Now set the old value according to above...*/
+     IF TRIM(:old_value) = ' '
+     THEN
+         old_value = 'Standard';
+     ENDIF;
+   ENDIF; /* VAT Status */
+}
+
+
+PROCEDURE lp_acctlinks ()=
+{
+   IF :table_name = 'acctlinks'
+   AND :column_name = 'account_no'
+   THEN
+     IF :new_value != ''
+     THEN
+       SELECT CONCAT(t2.branch, t2.account_no) as new_value
+         FROM acctlinks t1, acctlinks t2
+        WHERE t1.branch        = :account_branch
+          AND t1.account_no    = :account_no 
+          AND t2.pay_code      = t1.pay_code
+          AND t2.purchase_code = '0000';
+
+       /**************************
+       ** Check For INGRES Error
+       ***************************/
+       INQUIRE_INGRES (
+       IIerrorno  = ERRORNO,
+        IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+       IF IIerrorno != 0 THEN
+         ROLLBACK;
+         MESSAGE '-31- INGRES error selecting from table acctlinks'
+           + :IIerrtext WITH STYLE = POPUP;
+         log_string = '-31- INGRES error selecting from table acctlinks';
+         CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+       ENDIF;
+       COMMIT;
+     ENDIF;
+   ENDIF; /* Account Links */
+}
+
+
+PROCEDURE lp_rebate_code ()=
+{
+   IF :table_name = 'sales_accts'
+   AND :column_name = 'rebate_code'
+   THEN
+     IF :new_value != ''
+     THEN
+       SELECT rebate_terms as new_value
+         FROM rebate_types 
+        WHERE rebate_code = :new_value;
+
+       /**************************
+       ** Check For INGRES Error
+       ***************************/
+       INQUIRE_INGRES (
+       IIerrorno  = ERRORNO,
+        IIerrtext = ERRORTEXT,
+       IIrowcount = ROWCOUNT);
+
+       IF IIerrorno != 0 THEN
+         ROLLBACK;
+         MESSAGE '-32- INGRES error selecting from table rebate_types'
+           + :IIerrtext WITH STYLE = POPUP;
+         log_string = '-32- INGRES error selecting from table rebate_types';
+         CALLPROC errorlog(:log_string,'ASEN');
+         RETURN 1;
+       ENDIF;
+       COMMIT;
+     ENDIF;
+   ENDIF; /* Credit Terms */
+}
+
+
+PROCEDURE insert_session_table2 ()=
+{
+   INSERT INTO :sess_name
+   ( 
+     request,
+     agency_supplier,
+     account_branch,
+     account_no,
+     table_name,
+     column_name,
+     old_value,
+     new_value,
+     description,
+     man_ind,
+     subject,
+     form_completed,
+     addr_line1,
+     addr_line2,
+     addr_line3,
+     addr_line4,
+     payer_id,
+     custype_no,
+     custype_text,
+     vat_status,
+     email_from,
+     email_to,
+     sort_order
+   )
+   VALUES
+   (
+     :request,
+     :agency_supplier,
+     :account_branch,
+     :account_no,
+     :table_name,
+     :column_name,
+     :old_value,
+     :new_value,
+     :description,
+     :man_ind,
+     'New Account Creation - ' + TRIM(:supplier_name),
+     date('today'),
+     :addr_line1,
+     :addr_line2,
+     :addr_line3,
+     :addr_line4,
+     TRIM(VARCHAR(:account_branch)) + TRIM(VARCHAR(:account_no)),
+     :custype_no,
+     :custype_text,
+     :vat_status,
+     TRIM(:email_from),
+     TRIM(:email_to),
+     :sort_order  
+   );
+
+   /**************************
+   ** Check For INGRES Error 
+   ***************************/
+   INQUIRE_INGRES (IIerrorno  = ERRORNO,
+   IIerrtext = ERRORTEXT,
+   IIrowcount = ROWCOUNT);
+
+   IF IIerrorno != 0 THEN
+     ROLLBACK;
+     MESSAGE '-33- INGRES error inserting into session table' 
+       + :IIerrtext WITH STYLE = POPUP;
+     log_string = '-33- INGRES error inserting into session table';
+     CALLPROC errorlog(:log_string,'ASEN');
+     RETURN 1;
+   ENDIF;
+   COMMIT;
+}
+
+
+PROCEDURE insert_notification2 ()=
+{
+   SELECT :lv_row_id = row_id 
+   FROM agency_sequence;
+
+   /**************************
+   ** Check For INGRES Error 
+   ***************************/
+   INQUIRE_INGRES (IIerrorno  = ERRORNO,
+   IIerrtext = ERRORTEXT,
+   IIrowcount = ROWCOUNT);
+
+   IF IIerrorno != 0 THEN
+     ROLLBACK;
+     MESSAGE '-34- INGRES error selecting from agency_sequence'
+       + :IIerrtext WITH STYLE = POPUP;
+     log_string = '-34- INGRES error selecting from agency_sequence';
+     CALLPROC errorlog(:log_string,'ASEN');
+     RETURN 1;
+   ENDIF;
+
+   lv_row_id = :lv_row_id + 1;
+
+   UPDATE agency_sequence
+   SET row_id = :lv_row_id;
+
+   /**************************
+   ** Check For INGRES Error 
+   ***************************/
+   INQUIRE_INGRES (IIerrorno  = ERRORNO,
+   IIerrtext = ERRORTEXT,
+   IIrowcount = ROWCOUNT);
+
+   IF IIerrorno != 0 THEN
+     ROLLBACK;
+     MESSAGE '-35- INGRES error updating agency_sequence'
+       + :IIerrtext WITH STYLE = POPUP;
+     log_string = '-35- INGRES error updating agency_sequence';
+     CALLPROC errorlog(:log_string,'ASEN');
+     RETURN 1;
+   ENDIF;
+   COMMIT;
+
+   IF :table_name = 'sales_accts' AND 
+      :column_name = 'pricing_group' AND 
+      :new_value = VARCHAR(DATE('TODAY'))
+   THEN
+     new_value = '9999';
+   ENDIF;
+
+   INSERT INTO agency_notification
+   (
+     row_id,
+     agency_supplier,
+     table_name,
+     column_name,
+     pk_value_1, 
+     pk_value_2, 
+     pk_value_number, 
+     action,
+     updated_on,
+     updated_by,
+     old_value,
+     new_value
+   )
+   VALUES
+   (
+     :lv_row_id,
+     :agency_supplier,
+     :table_name,
+     :column_name,
+     :account_branch,
+     :account_no,
+     0,
+     'U',
+     date('now'),
+     :gv_user_id,
+     :old_value,
+     :new_value
+   );
+
+   /**************************
+   ** Check For INGRES Error 
+   ***************************/
+   INQUIRE_INGRES (IIerrorno  = ERRORNO,
+   IIerrtext = ERRORTEXT,
+   IIrowcount = ROWCOUNT);
+
+   IF IIerrorno != 0 THEN
+     ROLLBACK;
+     MESSAGE '-36- INGRES error inserting into agency_notification'
+       + :IIerrtext WITH STYLE = POPUP;
+     log_string = '-36- INGRES error inserting into agency_notification';
+     CALLPROC errorlog(:log_string,'ASEN');
+     RETURN 1;
+   ENDIF;
+   COMMIT;
+}
+
+
+PROCEDURE insert_agency_changes (
+   p_table_name    = varchar(32) not null with default;
+   p_column_name   = varchar(32) not null with default;
+   p_sort_order    = smallint not null with default;
+)=
+{
+   INSERT into agency_supplier_changes (
+     request,
+     agency_supplier,
+     account_branch,
+     account_no,
+     table_name,
+     column_name,
+     old_value,
+     new_value,
+     description,
+     man_ind,
+     subject,
+     due_for_del,
+     del_date,
+     form_completed,
+     addr_line1,
+     addr_line2,
+     addr_line3,
+     addr_line4,
+     post_code,
+     tel_no,
+     fax_no,
+     email,
+     status,
+     status_text,
+     payer_id,
+     custype_no,
+     custype_text,
+     custgroup_no,
+     credit_risk,
+     credit_text,
+     credit_desc,
+     credit_terms,
+     credit_limit,
+     vat_rate,
+     vat_status,
+     vat_no,
+     email_from,
+     email_to,
+     sort_order
+   )
+   VALUES (
+     'U',
+     agency_supplier,
+     account_branch,
+     account_no,
+     p_table_name,
+     p_column_name,
+     :old_value,
+     :new_value,
+     '',
+     0,
+     'Account before Amendment',
+     sales_accts_rec.due_for_del,
+     sales_accts_rec.del_date,
+     date('today'),
+     sales_accts_rec.addr_line1,
+     sales_accts_rec.addr_line2,
+     sales_accts_rec.addr_line3,
+     sales_accts_rec.addr_line4,
+     sales_accts_rec.post_code,
+     sales_accts_rec.tel_no,
+     0,
+     '',
+     sales_accts_rec.stop_warn,
+     'Suspended',
+     TRIM(VARCHAR(:account_branch)) + TRIM(VARCHAR(:account_no)),
+     sales_accts_rec.custype_no,
+     :custype_text,
+     sales_accts_rec.custgroup_no,
+     sales_accts_rec.credit_risk,
+     '',
+     '',
+     '',
+     0,
+     '',
+     '',
+     0,
+     '',
+     :email_to,
+     p_sort_order
+   );
+}
+
+
+PROCEDURE update_agency_changes(
+   p_table_name    = varchar(32) not null with default;
+   p_column_name   = varchar(32) not null with default;
+   p_sort_order    = smallint not null with default;
+)=
+{
+   UPDATE agency_supplier_changes
+      SET new_value      = :new_value
+    WHERE request        = 'U'
+      AND account_branch = :account_branch
+      AND account_no     = :account_no
+      AND table_name     = :table_name
+      AND column_name    = :column_name;
+
+   /**************************
+   ** Check For INGRES Error
+   ***************************/
+   INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                    IIerrtext = ERRORTEXT,
+                   IIrowcount = ROWCOUNT);
+
+   IF IIerrorno != 0 THEN
+     ROLLBACK;
+     MESSAGE '-39- INGRES error updating agency_supplier_changes '
+       + :IIerrtext WITH STYLE = POPUP;
+     log_string = '-39- INGRES error updating agency_supplier_changes ';
+     CALLPROC errorlog(:log_string,'ASEN');
+     RETURN gc_fail;
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+PROCEDURE non_agency_notification()=
+{
+   /* Non Agent Notification */
+   SELECT :table_name  = SQUEEZE(TRIM(tmp.table_name)), 
+          :column_name = SQUEEZE(TRIM(tmp.column_name)),
+          :old_value   = SQUEEZE(TRIM(tmp.old_value)),
+          :new_value   = SQUEEZE(TRIM(tmp.new_value)),
+          :description = et.description,
+          :man_ind     = et.man_ind,
+          :sort_order  = et.sort_order, 
+	  :agency_supplier = et.agency_supplier
+   FROM :in_table_name tmp,
+        agency_supplier_template et
+   WHERE SQUEEZE(TRIM(tmp.table_name)) = SQUEEZE(TRIM(et.table_name))
+   AND  SQUEEZE(TRIM(tmp.column_name)) = SQUEEZE(TRIM(et.column_name))
+   {
+      IIint = CALLPROC insert_notification2 ();
+      IF IIint != gc_success
+      THEN
+         RETURN 1;
+      ENDIF;
+
+   };
+
+   /**************************
+   ** Check For INGRES Error
+   ***************************/
+   INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                    IIerrtext = ERRORTEXT,
+                   IIrowcount = ROWCOUNT);
+
+   IF IIerrorno != 0 THEN
+     ROLLBACK;
+     MESSAGE '-49- INGRES error selecting agency_supplier_template '
+       + :IIerrtext WITH STYLE = POPUP;
+     log_string = '-49- INGRES error selecting agency_supplier_template ';
+     CALLPROC errorlog(:log_string,'ASEN');
+     RETURN gc_fail;
+   ENDIF;
+
+   RETURN gc_success;
+}
+
+
+PROCEDURE lp_get_dev_email()=
+{
+   SELECT email as email_to
+     FROM users_email
+    WHERE branch_id = :gv_branch_id
+      AND user_id   = :gv_user_id;
+
+   /**************************
+   ** Check For INGRES Error
+   ***************************/
+   INQUIRE_INGRES (IIerrorno  = ERRORNO,
+                    IIerrtext = ERRORTEXT,
+                   IIrowcount = ROWCOUNT);
+
+   IF IIerrorno != 0 THEN
+     ROLLBACK;
+     MESSAGE '-50- INGRES error selecting email address for Dev User '
+       + :IIerrtext WITH STYLE = POPUP;
+     log_string = '-50- INGRES error selecting email address ';
+     CALLPROC errorlog(:log_string,'ASEN');
+     RETURN gc_fail;
+   ENDIF;
+
+   IF IIrowcount != 1
+   THEN
+      MESSAGE 'You do not have an associated email address in users_email table.'
+        +     'Please add your details before continuing.' WITH STYLE = POPUP;
+      RETURN gc_fail;
+   ENDIF;
+
+   RETURN gc_success;
+}

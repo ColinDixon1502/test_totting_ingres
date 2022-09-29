@@ -1,0 +1,722 @@
+/****************************************************************************/
+/* Source:      agency_supplier_az_daily.osq                                */
+/*                                                                          */
+/* Proc Name:   agency_supplier_az_daily                                    */
+/*                                                                          */
+/* Purpose:     AstraZeneca Daily Email. Send details of amended accounts   */
+/*              to AstraZeneca's email group at the end of each day.        */
+/*              Details will be sent in a csv format. File is archived.     */
+/*                                                                          */
+/* Author:      Irfan Salim                                                 */
+/*                                                                          */
+/* Date:        09/11/2009                                                  */
+/*                                                                          */
+/* Return Val:  0 - OK                                                      */
+/*              1 - Error                                                   */
+/****************************************************************************/
+/*  Version | Date     | Coded | Description of changes made                */
+/***********|**********|*******|*********************************************/
+/*  1.0     | 04.11.09 | ISS   | Original Code for AZ 2009 - Lynx2 Project  */
+/***********|**********|*******|*********************************************/
+/*  1.1     | 07.12.09 | ISS   | 2 x reports now produced.                  */
+/*          |          |       | Report 1 - Changes excluding stop_warn     */
+/*          |          |       | Report 2 - Changes for stop_warn only      */
+/***********|**********|*******|*********************************************/
+/*  1.2     | 21.12.09 | ISS   | When producing csv files use '|' as the    */
+/*          |          |       | delimiter instead of commas as otherwise   */
+/*          |          |       | the resulting csv file generated is corrupt*/
+/***********|**********|*******|*********************************************/
+/*  1.3     | 01.02.10 | MBT   | AZ 2009 - Lynx2 Project                    */
+/*          l          |       | Fix problem to send email when no changes. */
+/***********|**********|*******|*********************************************/
+/*  1.4     | 26.02.13 | ISS   | HPSM 126855                                */
+/*          l          |       | When running on Dev email to Dev Support.  */
+/***********|**********|*******|*********************************************/
+PROCEDURE agency_supplier_az_daily ()=
+DECLARE
+
+   /*******************************************************
+   ** INGRES ERROR HANDLING VARIABLES
+   *******************************************************/
+   IIint       	  = INTEGER(4) NOT NULL,
+   IIrowcount  	  = INTEGER(4) NOT NULL,
+   IIerrorno   	  = INTEGER(4) NOT NULL,
+   IIerrtext  	  = CHAR(256)  NOT NULL,
+   
+   report_name    = VARCHAR(76)  NOT NULL,
+   param_list     = VARCHAR(500) NOT NULL,
+   filename       = VARCHAR(100) NOT NULL WITH DEFAULT,
+   out_file       = VARCHAR(100) NOT NULL WITH DEFAULT,
+   email_body     = VARCHAR(250) NOT NULL WITH DEFAULT,
+   attach_file    = VARCHAR(100) NOT NULL WITH DEFAULT,
+   email_to       = VARCHAR(500) NOT NULL WITH DEFAULT;
+   email_to_unix  = VARCHAR(500) NOT NULL WITH DEFAULT;
+   system_cmd     = VARCHAR(1000) NOT NULL WITH DEFAULT,
+   copy_string    = VARCHAR(500) NOT NULL,
+   
+   thischar       = CHAR(1) NOT NULL WITH DEFAULT;
+   now_string     = VARCHAR(25) NOT NULL WITH DEFAULT;
+   now_digits     = VARCHAR(25) NOT NULL WITH DEFAULT;
+   sess_name      = VARCHAR(50) NOT NULL WITH DEFAULT;
+   loop           = INTEGER(4) NOT NULL;
+   row_no     	  = INTEGER(4) NOT NULL,
+   
+   account_branch = CHAR(4) NOT NULL WITH DEFAULT;
+   account_no     = CHAR(9) NOT NULL WITH DEFAULT;
+   form_completed = DATE NOT NULL WITH DEFAULT;
+
+   file_ext       = CHAR(8) NOT NULL,
+   tempint        = INTEGER(4) NOT NULL,
+   dt             = CHAR(2) NOT NULL,
+   mt             = CHAR(2) NOT NULL,
+   yr             = CHAR(4) NOT NULL,
+
+   mess_flag      = INTEGER4 NOT NULL WITH DEFAULT;
+   mail_flag      = INTEGER4 NOT NULL WITH DEFAULT;
+   lv_debug       = INTEGER4 NOT NULL WITH DEFAULT;
+   sw_flag        = INTEGER4 NOT NULL WITH DEFAULT;
+   non_sw_flag    = INTEGER4 NOT NULL WITH DEFAULT;
+   stop_warn      = CHAR(1) NOT NULL WITH DEFAULT;
+   non_stop_warn  = CHAR(1) NOT NULL WITH DEFAULT;
+   temp_tabowner  = VARCHAR(32)  NOT NULL,
+   temp_tabname   = VARCHAR(24) NOT NULL,
+
+   email_array    = ARRAY OF TYPE OF TABLE agency_interface_email;
+
+  /*******************************************************
+  ** LOCAL PROCEDURES
+  *******************************************************/
+  file_extention  = PROCEDURE returning none;          
+
+   { /* BEGIN */
+
+   mess_flag = 0; /* 1: Show debugging popups */
+                  /* 0: Don't show debugging popups */
+ 
+   lv_debug = 1; /* 1: Create debug table az_sessiontable */
+                 /* 0: Don't create debug table az_sessiontable */
+ 
+   mail_flag = 1; /* 1: Switch email on  */
+                  /* 0: Switch email off */ 
+
+   SELECT temp_tabowner = dbmsinfo('username');
+ 
+   /****************************/
+   /* Get DATE and TIME string */
+   /****************************/
+   now_string = VARCHAR(date('now'));
+   now_digits = '';
+   sess_name= '';
+   loop = 1;
+   WHILE (loop <= LENGTH(now_string)) DO
+      thischar = CHAREXTRACT(now_string,loop);
+      IF thischar LIKE '\[0-9\]' ESCAPE '\'
+      THEN
+         now_digits = now_digits + thischar;
+      ENDIF;
+      loop = loop + 1;
+   ENDWHILE;
+
+   IIint = CALLPROC ARRAYCLEAR(email_array);
+   /************************/
+   /* Fetch Email Contacts */
+   /************************/
+   gv_boxid  = get_nodename();
+
+   email_array := SELECT 
+      email = TRIM(email)
+   FROM 
+      agency_interface_email
+   WHERE 
+      agency_supplier = 1 /*AZ*/
+   AND   
+      interface_name  = 'CUS03'
+   ORDER BY
+      email ASC;
+  
+   /**************************
+   ** Check For INGRES Error
+   ***************************/
+   INQUIRE_INGRES (
+      IIerrorno  = ERRORNO,
+      IIerrtext = ERRORTEXT,
+      IIrowcount = ROWCOUNT);
+
+   IF IIerrorno != 0
+   THEN
+      MESSAGE 'Error -900- getting email_to address. ' + IIerrtext 
+      WITH STYLE=POPUP;
+      RETURN -1;
+   ENDIF;
+
+   row_no = 1;
+   email_to = '';
+   UNLOADTABLE email_array
+   {
+      IF row_no > 1
+      THEN
+         email_to = email_to + '; ';
+      ENDIF;
+      IF (gv_boxid = 'zeus')  
+      THEN
+         email_to = email_to + email_array[:row_no].email;
+         row_no = row_no + 1;
+      else
+         email_to = 'gb-aah-supply-central-systems@aah.co.uk';
+      ENDIF;
+   };
+
+   row_no = 1;
+   email_to_unix = '';
+   UNLOADTABLE email_array
+   {
+      IF row_no > 1
+      THEN
+         email_to_unix = email_to_unix + ' ';
+      ENDIF;
+
+      IF (gv_boxid = 'zeus')  
+      THEN
+         email_to_unix = email_to_unix + email_array[:row_no].email;
+         row_no = row_no + 1;
+      else
+         email_to_unix = 'gb-aah-supply-central-systems@aah.co.uk';
+      ENDIF;
+   };
+
+   sess_name = 'session.agency_supplier_' + TRIM(now_digits);
+   
+   DECLARE GLOBAL TEMPORARY TABLE :sess_name
+      (
+      branchacc       varchar(15) not null not default,
+      request         varchar(6) not null not default,
+      agency_supplier integer4 not null not default,
+      account_branch  char(4) not null not default,
+      account_no      char(9) not null not default,
+      table_name      varchar(32) not null not default,
+      column_name     varchar(32) not null with default,
+      old_value       varchar(100) not null with default,
+      new_value       varchar(100) not null with default,
+      description     varchar(100) not null with default,
+      man_ind         integer1 not null with default,
+      subject         varchar(100) not null not default,
+      due_for_del     char(1) not null with default,
+      del_date        date not null with default,
+      form_completed  date not null with default,
+      addr_line1      varchar(32) not null with default,
+      addr_line2      varchar(32) not null with default,
+      addr_line3      varchar(32) not null with default,
+      addr_line4      varchar(32) not null with default,
+      post_code       varchar(8) not null with default,
+      tel_no          varchar(12) not null with default,
+      fax_no          char(20) not null with default,
+      email           char(50) not null with default,
+      status          char(1) not null with default,
+      status_text     varchar(20) not null with default,
+      payer_id        char(13) not null with default,
+      custype_no      integer1 not null with default,
+      custype_text    varchar(32) not null with default,
+      custgroup_no    integer4 not null with default,
+      credit_risk     integer1 not null with default,
+      credit_text     varchar(32) not null with default,
+      credit_desc     varchar(32) not null with default,
+      credit_terms    integer4 not null with default,
+      credit_limit    integer4 not null with default,
+      vat_rate        float8 not null with default,
+      vat_status      varchar(12) not null with default,
+      vat_no          char(20) not null with default,
+      email_from      varchar(100) not null with default,
+      email_to        varchar(500) not null with default,
+      sort_order      integer4 not null with default
+      )
+   ON COMMIT PRESERVE ROWS WITH NORECOVERY;    
+
+   /**************************
+   ** Check For INGRES Error
+   ***************************/
+   INQUIRE_INGRES (IIerrorno  = ERRORNO,
+         IIerrtext = ERRORTEXT,
+         IIrowcount = ROWCOUNT);
+
+   IF IIerrorno != 0
+   THEN
+      MESSAGE 'Error -100- agency_supplier_az_daily procedure. ' + IIerrtext
+      WITH STYLE=POPUP;
+      RETURN -1;
+   ENDIF;
+   
+   INSERT INTO :sess_name
+   (
+      branchacc,
+      request,
+      agency_supplier,
+      account_branch,
+      account_no,
+      table_name,
+      column_name,
+      new_value,
+      old_value,
+      description,
+      man_ind,
+      subject,
+      due_for_del,
+      del_date,
+      form_completed,
+      addr_line1,
+      addr_line2,
+      addr_line3,
+      addr_line4,
+      post_code,
+      tel_no,
+      fax_no,
+      email,
+      status,
+      status_text,
+      payer_id,
+      custype_no,
+      custype_text,
+      custgroup_no,
+      credit_risk,
+      credit_text,
+      credit_desc,
+      credit_terms,
+      credit_limit,
+      vat_rate,
+      vat_status,
+      vat_no,
+      email_from,
+      email_to,
+      sort_order
+   )
+   SELECT 
+      TRIM(account_branch) + (account_no),
+      request,
+      agency_supplier,
+      account_branch,
+      account_no,
+      table_name,
+      column_name,
+      new_value,
+      old_value,
+      description,
+      man_ind,
+      subject,
+      due_for_del,
+      del_date,
+      form_completed,
+      addr_line1,
+      addr_line2,
+      addr_line3,
+      addr_line4,
+      post_code,
+      tel_no,
+      fax_no,
+      email,
+      status,
+      status_text,
+      payer_id,
+      custype_no,
+      custype_text,
+      custgroup_no,
+      credit_risk,
+      credit_text,
+      credit_desc,
+      credit_terms,
+      credit_limit,
+      vat_rate,
+      vat_status,
+      vat_no,
+      email_from,
+      email_to,
+      sort_order
+   FROM 
+      agency_supplier_changes
+  WHERE 
+      form_completed = date('today')
+    AND   
+      agency_supplier = 1 /* AZ */
+    AND   
+      SQUEEZE(TRIM(column_name)) != 'credit_risk';
+
+   /**************************
+   ** Check For INGRES Error
+   ***************************/
+   INQUIRE_INGRES (IIerrorno  = ERRORNO,
+         IIerrtext = ERRORTEXT,
+         IIrowcount = ROWCOUNT);
+
+   IF IIerrorno != 0
+   THEN
+      MESSAGE 'Error -200- agency_supplier_az_daily procedure. ' + IIerrtext
+      WITH STYLE=POPUP;
+      RETURN -1;
+   ENDIF;
+   form_completed = date('today');
+   sw_flag = 0;
+   non_sw_flag = 0;
+
+   IF IIrowcount > 0 /* Changes exist for today */
+   THEN
+     IF mess_flag = 1 THEN
+       MESSAGE 'Changes exist for today ' WITH STYLE=POPUP;
+     ENDIF;
+
+     /* Are there any stop_warn changes ? */
+     SELECT column_name AS stop_warn
+       FROM :sess_name
+      WHERE column_name = 'stop_warn';
+
+      /**************************
+      ** Check For INGRES Error
+      ***************************/
+      INQUIRE_INGRES (IIerrorno = ERRORNO,
+      IIerrtext = ERRORTEXT,
+      IIrowcount = ROWCOUNT);
+
+      IF IIerrorno != 0 THEN
+        MESSAGE 'Error -300- selecting from sessiontable. ' + IIerrtext
+        WITH STYLE = POPUP;
+        RETURN -1;
+      ENDIF;
+
+      IF IIrowcount > 0 THEN
+        sw_flag = 1;
+      ENDIF;
+
+     /* Are there any changes other than stop_warn ? */
+     SELECT column_name AS non_stop_warn
+       FROM :sess_name
+      WHERE column_name != 'stop_warn';
+
+      /**************************
+      ** Check For INGRES Error
+      ***************************/
+      INQUIRE_INGRES (IIerrorno = ERRORNO,
+      IIerrtext = ERRORTEXT,
+      IIrowcount = ROWCOUNT);
+
+      IF IIerrorno != 0 THEN
+        MESSAGE 'Error -400- selecting from sessiontable. ' + IIerrtext
+        WITH STYLE = POPUP;
+        RETURN -1;
+      ENDIF;
+
+      IF IIrowcount > 0 THEN
+        non_sw_flag = 1;
+      ENDIF;
+
+/*----------------------------------------------------------*/
+/*  Create Temp Table if in Debugging Mode                  */
+/*----------------------------------------------------------*/
+    IF lv_debug = 1 THEN
+      SELECT  table_name AS temp_tabname
+        FROM  iitables
+       WHERE  table_name  = 'az_sessiontable'
+         AND  table_owner = :temp_tabowner;
+
+      /**************************
+      ** Check For INGRES Error
+      ***************************/
+      INQUIRE_INGRES (IIerrorno = ERRORNO,
+      IIerrtext = ERRORTEXT,
+      IIrowcount = ROWCOUNT);
+
+      IF IIerrorno != 0 THEN
+        MESSAGE 'Error -500- selecting from iitables. ' + IIerrtext
+        WITH STYLE = POPUP;
+        RETURN -1;
+      ENDIF;
+
+        IF IIrowcount = 0 THEN
+          IF mess_flag = 1 THEN
+            MESSAGE '-ISS- About to create az_sessiontable ' WITH STYLE=POPUP;
+          ENDIF;
+
+          CREATE TABLE az_sessiontable AS SELECT *
+          FROM :sess_name;
+
+          /**************************
+          ** Check For INGRES Error
+          ***************************/
+          INQUIRE_INGRES (IIerrorno  = ERRORNO,
+          IIerrtext = ERRORTEXT,
+          IIrowcount = ROWCOUNT);
+
+          IF IIerrorno != 0 THEN
+            MESSAGE 'Error -600- creating az_sessiontable ' + :IIerrtext
+            WITH STYLE=POPUP;
+            RETURN -1;
+          ENDIF;
+
+            IF mess_flag = 1 THEN
+              MESSAGE '-ISS- [INIT] Created az_sessiontable ' WITH STYLE=POPUP;
+            ENDIF;
+
+        ENDIF;
+
+    ENDIF;
+
+     IF lv_debug = 1 THEN
+       DROP TABLE az_sessiontable;
+
+       CREATE TABLE az_sessiontable AS 
+       SELECT * FROM :sess_name;
+
+       IF mess_flag = 1 THEN
+         MESSAGE '-ISS- Refresh az_sessiontable ' WITH STYLE=POPUP;
+       ENDIF;
+
+     ENDIF;
+  
+     /* Report excluding stop_warn */
+     IF non_sw_flag = 1 THEN
+       filename       = 'cus03_masterdata';
+       email_body     = :gc_temp + :filename + '.eml';
+       attach_file    = :gc_temp + :filename + '.csv';
+       out_file       = :gc_temp + :filename + '.txt';
+       param_list     = 'sess_name = "' + 'agency_supplier_' + TRIM(now_digits) + '"';
+    
+       system_cmd = 'echo ' + ' ' + '"' + 'Please find AstraZeneca Daily Changes  '
+         + ' Report listing all Master Data account changes for today.' + '"' 
+         +  ' > ' + :email_body;
+       CALL SYSTEM :system_cmd;
+    
+       CALL REPORT (
+         report = 'cus03_email_summary1',
+         param  = :param_list,
+         file   = :out_file);
+  
+       system_cmd = 'tr -d "\014" < ' + VARCHAR(:out_file)
+            + ' | sed "s/^[ \t]*//" > ' + TRIM(:attach_file) + '.srt';
+       CALL SYSTEM :system_cmd;
+  
+       system_cmd = 'mv ' + TRIM(:attach_file) + '.srt ' + TRIM(:attach_file);
+       CALL SYSTEM :system_cmd;
+    
+       system_cmd = 'cat ' + VARCHAR(:attach_file)
+            + ' | sed "s/,/ /g" > ' + TRIM(:attach_file) + '.srt';
+       CALL SYSTEM :system_cmd;
+  
+       system_cmd = 'cat ' + VARCHAR(:attach_file) + '.srt'
+            + ' | sed "s/|/,/g" > ' + TRIM(:attach_file);
+       CALL SYSTEM :system_cmd;
+  
+       system_cmd = 'cat ' + VARCHAR(:attach_file)
+            + ' | sed "s/  //g" > ' + TRIM(:attach_file) + '.srt';
+       CALL SYSTEM :system_cmd;
+  
+       system_cmd = 'mv ' + TRIM(:attach_file) + '.srt ' + TRIM(:attach_file);
+       CALL SYSTEM :system_cmd;
+  
+       system_cmd = 'cp ' + TRIM(:attach_file) + ' ' + TRIM(:out_file);
+       CALL SYSTEM :system_cmd;
+  
+       system_cmd = 'uuencode ' + TRIM(:out_file) + ' ' + TRIM(:attach_file)
+          + ' | /usr/bin/cat - ' + TRIM(:email_body)
+          + ' | mailx -r DoNotReply@aah.co.uk -s '
+          + '''' + 'AstraZeneca Master Data Account Changes - ' 
+          + TRIM(VARCHAR(:form_completed)) + '''' 
+          + ' ' + TRIM(:email_to_unix);
+  
+       IF mess_flag = 1 THEN
+         MESSAGE 'system_cmd = ' + varchar(:system_cmd) WITH STYLE=POPUP;
+       ENDIF;
+  
+       IF mail_flag = 1 THEN
+         CALL SYSTEM :system_cmd; 
+       ENDIF;
+  
+       CALLPROC file_extention ();
+    
+       system_cmd = 'mv ' + TRIM(:attach_file) + ' ' + :gc_arc_mth_curr 
+          + TRIM(:filename) + '.' + TRIM(:file_ext) + '.csv';
+       CALL SYSTEM :system_cmd; 
+  
+       system_cmd = 'rm -f ' + TRIM(:out_file);
+       CALL SYSTEM :system_cmd; 
+
+     ELSE
+       /* Email no rows for AZ Master Data */ 
+       email_body  = '/aahdb/work/control/data/cus03_email_body.txt';
+ 
+       copy_string = 'echo ' + ' ' + '"' + '\nNo changes to report today'
+          + '"' + ' > ' + :email_body;
+       CALL SYSTEM :copy_string;
+
+       system_cmd = '/usr/bin/echo "From: DoNotReply@aah.co.uk\nTo: '
+          + TRIM(:email_to)
+          + '\nSubject: AstraZeneca Master Data Account Changes - '
+          + TRIM(VARCHAR(:form_completed)) 
+          + '" | /usr/bin/cat - '
+          + :email_body + ' | mail ' + TRIM(:email_to_unix);
+       IF mail_flag = 1 THEN
+          CALL SYSTEM :system_cmd;
+       ENDIF;
+
+       IF mess_flag = 1 THEN
+          MESSAGE 'system_cmd = ' + varchar(:system_cmd) WITH STYLE=POPUP;
+       ENDIF;
+ 
+     ENDIF;
+
+     /* Report containing stop_warn changes only */
+     IF sw_flag = 1 THEN
+
+       filename    = 'cus03_status';
+       email_body  = :gc_temp + :filename + '.eml';
+       attach_file = :gc_temp + :filename + '.csv';
+       out_file    = :gc_temp + :filename + '.txt';
+       param_list  = 'sess_name = "' + 'agency_supplier_' + TRIM(now_digits) + '"';
+    
+       system_cmd = 'echo ' + ' ' + '"' + 'Please find AstraZeneca Daily Changes '
+         + 'Report listing all Status changes for today.' + '"' +  ' > ' 
+         + :email_body;
+       CALL SYSTEM :system_cmd;
+    
+       CALL REPORT (
+         report = 'cus03_email_summary2',
+         param  = :param_list,
+         file   = :out_file);
+    
+       system_cmd = 'tr -d "\014" < ' + VARCHAR(:out_file)
+            + ' | sed "s/^[ \t]*//" > ' + TRIM(:attach_file) + '.srt';
+       CALL SYSTEM :system_cmd;
+
+       system_cmd = 'mv ' + TRIM(:attach_file) + '.srt ' + TRIM(:attach_file);
+       CALL SYSTEM :system_cmd;
+    
+       system_cmd = 'cat ' + VARCHAR(:attach_file)
+            + ' | sed "s/,/ /g" > ' + TRIM(:attach_file) + '.srt';
+       CALL SYSTEM :system_cmd;
+  
+       system_cmd = 'cat ' + VARCHAR(:attach_file) + '.srt'
+            + ' | sed "s/|/,/g" > ' + TRIM(:attach_file);
+       CALL SYSTEM :system_cmd;
+  
+       system_cmd = 'cat ' + VARCHAR(:attach_file)
+            + ' | sed "s/  //g" > ' + TRIM(:attach_file) + '.srt';
+       CALL SYSTEM :system_cmd;
+  
+       system_cmd = 'mv ' + TRIM(:attach_file) + '.srt ' + TRIM(:attach_file);
+       CALL SYSTEM :system_cmd;
+  
+       system_cmd = 'cp ' + TRIM(:attach_file) + ' ' + TRIM(:out_file);
+       CALL SYSTEM :system_cmd;
+
+       system_cmd = 'uuencode ' + TRIM(:out_file) + ' ' + TRIM(:attach_file)
+          + ' | /usr/bin/cat - ' + TRIM(:email_body)
+          + ' | mailx -r DoNotReply@aah.co.uk -s '
+          + '''' + 'AstraZeneca Status Account Changes - ' 
+          + TRIM(VARCHAR(:form_completed)) + '''' 
+          + ' ' + TRIM(:email_to_unix);
+    
+       IF mess_flag = 1 THEN
+         MESSAGE 'system_cmd = ' + varchar(:system_cmd) WITH STYLE=POPUP;
+       ENDIF;
+  
+       IF mail_flag = 1 THEN
+         CALL SYSTEM :system_cmd; 
+       ENDIF;
+
+       CALLPROC file_extention ();
+    
+       system_cmd = 'mv ' + TRIM(:attach_file) + ' ' + :gc_arc_mth_curr 
+          + TRIM(:filename) + '.' + TRIM(:file_ext) + '.csv';
+       CALL SYSTEM :system_cmd; 
+    
+       system_cmd = 'rm -f ' + TRIM(:out_file);
+       CALL SYSTEM :system_cmd; 
+
+     ELSE
+       /* Email no rows for Stop/Warn Data */ 
+       email_body  = '/aahdb/work/control/data/cus03_email_body.txt';
+ 
+       copy_string = 'echo ' + ' ' + '"' + '\nNo changes to report today'
+          + '"' + ' > ' + :email_body;
+       CALL SYSTEM :copy_string;
+
+       system_cmd = '/usr/bin/echo "From: DoNotReply@aah.co.uk\nTo: '
+          + TRIM(:email_to)
+          + '\nSubject: AstraZeneca Status Account Changes - '
+          + TRIM(VARCHAR(:form_completed)) 
+          + '" | /usr/bin/cat - '
+          + :email_body + ' | mail ' + TRIM(:email_to_unix);
+
+       IF mail_flag = 1 THEN
+          CALL SYSTEM :system_cmd;
+       ENDIF;
+
+       IF mess_flag = 1 THEN
+          MESSAGE 'system_cmd = ' + varchar(:system_cmd) WITH STYLE=POPUP;
+       ENDIF;
+ 
+  
+     ENDIF;
+
+     DROP TABLE :sess_name;
+  
+     /**************************
+     ** Check For INGRES Error
+     ***************************/
+     INQUIRE_INGRES (
+           IIerrorno  = ERRORNO,
+           IIerrtext = ERRORTEXT,
+           IIrowcount = ROWCOUNT);
+  
+     IF IIerrorno != 0
+     THEN
+        MESSAGE 'Error -800- drop session table. ' + IIerrtext WITH STYLE=POPUP;
+        RETURN -1;
+     ENDIF;
+   
+   ELSE /* No changes today so send appropriate email */
+     IF mess_flag = 1 THEN
+       MESSAGE 'No changes exist for today ' WITH STYLE=POPUP;
+     ENDIF;
+     email_body  = '/aahdb/work/control/data/cus03_email_body.txt';
+ 
+     copy_string = 'echo ' + ' ' + '"' + '\nNo changes to report today'
+        + '"' + ' > ' + :email_body;
+     CALL SYSTEM :copy_string;
+
+     system_cmd = '/usr/bin/echo "From: DoNotReply@aah.co.uk\nTo: '
+        + TRIM(:email_to)
+        + '\nSubject: AstraZeneca Account Changes - '
+        + TRIM(VARCHAR(:form_completed)) 
+        + '" | /usr/bin/cat - '
+        + :email_body + ' | mail ' + TRIM(:email_to_unix);
+
+     IF mail_flag = 1 THEN
+       CALL SYSTEM :system_cmd;
+     ENDIF;
+
+     IF mess_flag = 1 THEN
+       MESSAGE 'system_cmd = ' + varchar(:system_cmd) WITH STYLE=POPUP;
+     ENDIF;
+ 
+   ENDIF;
+
+   }; /* END */
+
+
+PROCEDURE file_extention ()=
+{
+  SELECT DATE_PART('day',date('today')) AS tempint;
+  IF tempint < 10 THEN
+    dt = '0' + SQUEEZE(CHAR(:tempint));
+  ELSE
+    dt = SQUEEZE(CHAR(:tempint));
+  ENDIF;
+  
+  SELECT DATE_PART('month',date('today')) AS tempint;
+  IF tempint < 10 THEN
+    mt = '0' + SQUEEZE(CHAR(:tempint));
+  ELSE
+    mt = SQUEEZE(CHAR(:tempint));
+  ENDIF;
+  
+  SELECT DATE_PART('year',date('today')) AS tempint;
+    yr = RIGHT(SQUEEZE(CHAR(:tempint)),4);
+    
+  file_ext = :yr + :mt + :dt;
+}

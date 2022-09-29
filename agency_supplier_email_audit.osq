@@ -1,0 +1,748 @@
+/****************************************************************************/
+/*  Frame  - Agency Supplier Email Audit                                    */
+/*  Author - Matthew Toyer                                                  */
+/*                                                                          */
+/*  Date   - June 2007                                                      */
+/*  Type   - Online Frame                                                   */
+/*                                                                          */
+/*  Source - agency_supplier_email_audit.osq                                */
+/*  Form   - agency_supplier_email_audit                                    */
+/*                                                                          */
+/*  Parameters expected - None.                                             */
+/*                                                                          */
+/****************************************************************************/
+/*  Version | Date     | Coded | Description of changes made                */
+/***********|**********|*******|*********************************************/
+/*  1.0     | 01.06.07 | MBT   | Original Code                              */
+/*--------------------------------------------------------------------------*/
+/*  1.1     | 30.11.09 | MBT   | Mercury Defect ID 31 LYNX 2 - AZ 2009      */ 
+/*          |          |       | add old_value column.                      */
+/****************************************************************************/
+initialize() =
+DECLARE
+		h_rows		 = INTEGER4 NOT NULL WITH DEFAULT;
+		pi_retval	 = INTEGER4 NOT NULL WITH DEFAULT;
+		pc_char		 = CHAR(1)  NOT NULL WITH DEFAULT;
+		IIint	     = INTEGER4 NOT NULL WITH DEFAULT;
+    field_name = CHAR(24) NOT NULL WITH DEFAULT;
+    table_owner = VARCHAR(32) NOT NULL WITH DEFAULT;
+		dup_check	 = INTEGER4 NOT NULL WITH DEFAULT;
+    string1    = VARCHAR(30) NOT NULL WITH DEFAULT;
+    string2    = VARCHAR(30) NOT NULL WITH DEFAULT;
+    string3    = VARCHAR(30) NOT NULL WITH DEFAULT;
+    string4    = VARCHAR(30) NOT NULL WITH DEFAULT;
+    loop       = INTEGER4 NOT NULL WITH DEFAULT;
+    loc        = INTEGER4 NOT NULL WITH DEFAULT;
+    thischar   = CHAR(1)  NOT NULL WITH DEFAULT; 
+    IIchar     = CHAR(1)  NOT NULL WITH DEFAULT;
+
+    request    = VARCHAR(6) NOT NULL WITH DEFAULT;
+    account_branch = CHAR(4) NOT NULL WITH DEFAULT;
+    account_no = CHAR(9) NOT NULL WITH DEFAULT;
+    table_name = VARCHAR(32) NOT NULL WITH DEFAULT;
+    var_user_details  = VARCHAR(255) NOT NULL WITH DEFAULT;
+    var_email_details = VARCHAR(255) NOT NULL WITH DEFAULT;
+    var_table_details = VARCHAR(500) NOT NULL WITH DEFAULT;
+    
+    iitf.agency_supplier = INTEGER4 NOT NULL WITH DEFAULT;
+    iitf.supplier_group = INTEGER4 NOT NULL WITH DEFAULT;
+    iitf.email_details = VARCHAR(255) NOT NULL WITH DEFAULT;
+    iitf.table_details = VARCHAR(500) NOT NULL WITH DEFAULT;
+
+    get_details = PROCEDURE RETURNING INTEGER NOT NULL;
+    create_table = PROCEDURE RETURNING INTEGER NOT NULL;
+    extract_parameters = PROCEDURE RETURNING INTEGER NOT NULL;
+    lp_val_agency_supplier = PROCEDURE RETURNING INTEGER NOT NULL;
+    lp_val_supplier_group = PROCEDURE RETURNING INTEGER NOT NULL;
+    lp_val_resend_from = PROCEDURE RETURNING INTEGER NOT NULL;
+    lp_val_resend_to = PROCEDURE RETURNING INTEGER NOT NULL;
+BEGIN
+
+	SET_FORMS FRS(TIMEOUT = :gc_timeout);
+
+  SET_FORMS FRS (ACTIVATE(previousfield) = 1);
+
+  SET_FORMS FRS(MAP(FRSKEY1)='pf1');
+  SET_FORMS FRS(LABEL(FRSKEY1)='F1');
+  SET_FORMS FRS(MAP(FRSKEY7)='pf3');
+  SET_FORMS FRS(LABEL(FRSKEY7)='F3');
+  SET_FORMS FRS(MAP(FRSKEY8)='pf4');
+  SET_FORMS FRS(LABEL(FRSKEY8)='F4');
+  SET_FORMS FRS(MAP(FRSKEY9)='pf5');
+  SET_FORMS FRS(LABEL(FRSKEY9)='F5');
+  SET_FORMS FRS(MAP(FRSKEY14)='pf6');
+  SET_FORMS FRS(LABEL(FRSKEY14)='F6');
+  SET_FORMS FRS(MAP(FRSKEY11)='pf7');
+  SET_FORMS FRS(LABEL(FRSKEY11)='F7');
+  SET_FORMS FRS(MAP(FRSKEY12)='pf8');
+  SET_FORMS FRS(LABEL(FRSKEY12)='F8');
+  SET_FORMS FRS(MAP(FRSKEY13)='pf9');
+  SET_FORMS FRS(LABEL(FRSKEY13)='F9');
+  SET_FORMS FRS(MAP(FRSKEY10)='pf10');
+  SET_FORMS FRS(LABEL(FRSKEY10)='F10');
+  SET_FORMS FRS(MAP(FRSKEY4)='pf11');
+  SET_FORMS FRS(LABEL(FRSKEY4)='F11');
+  SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+  SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+  SET_FORMS FRS(MAP(menu10)='pf22');
+  SET_FORMS FRS(LABEL(menu10)='Alt&F3');
+  SET_FORMS FRS(MAP(FRSKEY28)='pf17');
+  SET_FORMS FRS(LABEL(FRSKEY28)='End');
+
+  CLEAR FIELD ALL;
+	CLEAR FIELD iitf; 
+  date = DATE('now');
+  INITTABLE iitf READ;
+
+  IF gv_user_id = '' 
+  THEN
+     gv_user_id = 'jt';
+  ENDIF;
+  IF gv_branch_id = ''
+  THEN
+     gv_branch_id = '409V';
+  ENDIF; 
+
+  gv_boxid = get_nodename();
+  IF gv_boxid = 'ares'
+  THEN
+     table_owner = 'imsdev';
+  ELSE 
+     table_owner = 'imsprod';
+  ENDIF;
+
+  RESUME FIELD agency_supplier;
+END
+
+ON TIMEOUT =
+BEGIN
+		CALLPROC timeout_popup();
+END
+
+AFTER FIELD 'agency_supplier'=
+{
+  IIint = CALLPROC lp_val_agency_supplier();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  RESUME NEXT;
+}
+
+AFTER FIELD 'supplier_group'=
+{
+  IIint = CALLPROC lp_val_supplier_group();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  RESUME NEXT;
+}
+
+AFTER FIELD 'resend_from'=
+{
+  IIint = CALLPROC lp_val_resend_from();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  RESUME NEXT;
+}
+
+AFTER FIELD 'resend_to'=
+{
+  IIint = CALLPROC lp_val_resend_to();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  RESUME NEXT;
+}
+
+'Email Details',KEY frskey13 =
+BEGIN
+  field_name = '';
+  INQUIRE_FORMS FORM (field_name = FIELD);
+  IF field_name != 'iitf'
+  THEN
+     MESSAGE 'Function not available on this field.' WITH STYLE = POPUP;
+     RESUME;
+  ENDIF;
+
+  var_user_details  = '';
+  var_table_details = '';
+  var_email_details = '';
+  var_user_details = :iitf.user_details;
+  var_email_details = :iitf.email_details;
+  var_table_details = :iitf.table_details;
+
+  IF var_user_details = '' AND var_table_details = '' AND var_email_details = ''
+  THEN
+     MESSAGE 'Cursor must be placed on an email row' 
+        WITH STYLE = POPUP;
+     RESUME;
+  ENDIF;
+     
+  IIint = CALLPROC extract_parameters(p_email_details = :var_email_details);
+
+  IF TRIM(request) = 'N'
+  THEN
+     MESSAGE 'Function valid only for Account Amendment Emails'
+        WITH STYLE = POPUP;
+     RESUME;
+  ENDIF; 
+
+  IF :iitf.agency_supplier != 0
+  AND :iitf.supplier_group != 0
+  THEN
+     IIint = CALLPROC create_table(p_table_details = :var_table_details,
+                                   p_table_name    = :table_name);
+     IF IIint != 0
+     THEN
+        MESSAGE 'Error Calling create_table procedure'   
+           WITH STYLE = POPUP;
+        RESUME;
+     ENDIF;
+     CALLFRAME agency_supplier_email_audit01(in_table_name = :table_name,
+                                             in_user_details = :var_user_details);
+
+     DROP TABLE :table_name;
+     COMMIT;
+  ENDIF;
+
+END
+
+'Choices',KEY frskey10	=
+BEGIN
+
+  SET_FORMS FRS(LABEL(FRSKEY9)='F12');
+
+  field_name = '';
+
+  INQUIRE_FORMS FORM (field_name = FIELD);
+
+	IF field_name = 'agency_supplier'
+  THEN
+      callproc mapst();
+      IIint = CALLFRAME look_up(
+        II_QUERY  =
+              SELECT agency_supplier,
+                     supplier_name 
+              FROM   agency_supplier;
+        II_FIELD1       = 'agency_supplier',
+        II_FIELD2       = 'supplier_name',
+        II_FIELD_TITLE1 = 'Agency Supplier',
+        II_FIELD_TITLE2 = 'Description',
+        agency_supplier = BYREF(agency_supplier),
+        supplier_name   = BYREF(supplier_name),
+        II_ROWS         = 10);
+      COMMIT; 
+      REDISPLAY;
+      callproc mapend();
+
+      IF IIint = 0
+      THEN
+         RESUME;
+			ELSE
+				 RESUME NEXT;
+      ENDIF;
+
+	ELSEIF field_name = 'supplier_group'
+  THEN
+      callproc mapst();
+      IIint = CALLFRAME look_up(
+        II_QUERY  =
+              SELECT supplier_group,
+                     supplier_group_name 
+              FROM   agency_supplier_email_group
+              WHERE  agency_supplier = :agency_supplier;
+        II_FIELD1       = 'supplier_group',
+        II_FIELD2       = 'supplier_group_name',
+        II_FIELD_TITLE1 = 'Supplier Group',
+        II_FIELD_TITLE2 = 'Description',
+        supplier_group  = BYREF(supplier_group),
+        supplier_group_name = BYREF(supplier_group_name),
+        II_ROWS         = 10);
+      COMMIT; 
+      REDISPLAY;
+      callproc mapend();
+
+      IF IIint = 0
+      THEN
+         RESUME;
+			ELSE
+				 RESUME NEXT;
+      ENDIF;
+	ELSE
+
+      MESSAGE 'Function not available on this field.' WITH STYLE = POPUP;
+
+      SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+      SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+      SET_FORMS FRS(MAP(FRSKEY9)='pf5');
+      SET_FORMS FRS(LABEL(FRSKEY9)='F5');
+
+      RESUME;
+	ENDIF;
+END
+
+'Resend All',KEY frskey4 =
+BEGIN
+  IIint = CALLPROC lp_val_agency_supplier();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  IIint = CALLPROC lp_val_supplier_group();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  IIint = CALLPROC lp_val_resend_from();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+  IIint = CALLPROC lp_val_resend_to();
+  IF IIint != 0
+  THEN
+     RESUME; 
+  ENDIF;
+
+  IIchar = '';
+  WHILE (UPPERCASE(IIchar) != 'Y') AND (UPPERCASE(IIchar) != 'N')
+  DO
+     IIchar = PROMPT 'Resend emails. Are you sure ? (Y/N).'
+                 WITH STYLE = POPUP;
+  ENDWHILE;
+
+  IF (UPPERCASE(IIchar) = 'N') THEN
+     RESUME;
+  ENDIF;
+
+  MESSAGE 'Resending Emails .......'; SLEEP 2;
+
+  UNLOADTABLE iitf
+  BEGIN
+     var_email_details = '';
+     var_table_details = '';
+     var_email_details = :iitf.email_details;
+     var_table_details = :iitf.table_details;
+     
+     IIint = CALLPROC extract_parameters(p_email_details = :var_email_details);
+
+     IF :iitf.agency_supplier != 0
+     AND :iitf.supplier_group != 0
+     THEN
+        IIint = CALLPROC create_table(p_table_details = :var_table_details,
+                                      p_table_name    = :table_name);
+     ENDIF;
+
+     IIint = CALLPROC agency_supplier_email_notify
+                (request=TRIM(:request),
+                 account_branch=TRIM(:account_branch),
+                 account_no=TRIM(:account_no),
+                 in_table_name=(:table_name));
+
+     IF IIint != 0
+     THEN
+        MESSAGE 'Error Calling agency_supplier_email_notify procedure'   
+           WITH STYLE = POPUP;
+        ENDLOOP;
+     ENDIF;
+     IF :iitf.agency_supplier != 0
+     AND :iitf.supplier_group != 0
+     THEN
+        DROP TABLE :table_name;
+        COMMIT;
+     ENDIF;
+
+  END;
+
+END
+
+'Exit',KEY frskey3 =
+BEGIN
+  IF (agency_supplier != 0 AND agency_supplier IS NOT NULL)
+  OR (supplier_group != 0 AND supplier_group IS NOT NULL)
+  OR resend_from != ''
+  OR resend_to != ''
+  THEN
+     CLEAR FIELD ALL;
+	   CLEAR FIELD iitf; 
+     date = DATE('now');
+     RESUME FIELD agency_supplier;
+  ENDIF;
+	MESSAGE 'exiting..';
+	COMMIT;
+	RETURN;
+END
+
+PROCEDURE get_details()=
+{
+	INITTABLE iitf 'READ';
+
+	CLEAR FIELD  iitf; 
+  date = DATE('now');
+
+	iitf = 
+		SELECT
+        agency_supplier,
+        supplier_group,
+        user_details = TRIM(user_details),
+				email_details = TRIM(email_details),
+			  table_details = TRIM(table_details),
+        audit_date 
+		FROM 
+				agency_supplier_email_audit
+    WHERE 
+       (agency_supplier = :agency_supplier
+    AND supplier_group  = :supplier_group
+    AND audit_date     >= :resend_from
+    AND audit_date     <= :resend_to
+       )
+    OR
+       (agency_supplier = 0
+    AND supplier_group  = 0
+    AND audit_date     >= :resend_from
+    AND audit_date     <= :resend_to
+       )
+    ORDER BY audit_date DESC;
+
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	IF (g_error != 0)
+	THEN
+      ROLLBACK;
+			MESSAGE 'Error occured initializing agency_supplier_email_audit details..!' + X'0A'
+						+ 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+			RETURN -1;
+	ENDIF;
+
+  COMMIT;
+
+	IF :g_rows <= 0 
+	THEN
+			MESSAGE 'No Agency Supplier Email Audit records present.'
+						WITH STYLE=POPUP;
+	ENDIF;
+
+  RETURN 0;
+}
+
+PROCEDURE lp_val_agency_supplier()=
+{
+  IF agency_supplier = ''
+  THEN
+     CLEAR FIELD supplier_name; 
+     MESSAGE 'Agency Supplier must be entered.' WITH STYLE = POPUP;
+     RETURN 1;
+  ENDIF;
+
+  SELECT supplier_name = supplier_name 
+  FROM agency_supplier
+  WHERE agency_supplier = :agency_supplier;
+
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	IF (g_error != 0)
+	THEN
+      ROLLBACK;
+			MESSAGE 'Error occured initializing agency_supplier details..!' + X'0A'
+						+ 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+			RETURN -1;
+	ENDIF;
+
+  COMMIT;
+
+	IF :g_rows <= 0 
+	THEN
+			MESSAGE 'Please enter a valid Agency Supplier code.'
+						WITH STYLE=POPUP;
+      RETURN 1;
+	ENDIF;
+
+  RETURN 0;
+}
+
+PROCEDURE lp_val_supplier_group()=
+{
+  IF supplier_group = ''
+  THEN
+     CLEAR FIELD supplier_group_name; 
+     MESSAGE 'Supplier Group must be entered.' WITH STYLE = POPUP;
+     RETURN 1;
+  ENDIF;
+
+  SELECT supplier_group_name = supplier_group_name 
+  FROM agency_supplier_email_group
+  WHERE agency_supplier = :agency_supplier
+  AND   supplier_group  = :supplier_group;
+
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	IF (g_error != 0)
+	THEN
+      ROLLBACK;
+			MESSAGE 'Error occured initializing agency_supplier_email_group details..!' + X'0A'
+						+ 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+			RETURN -1;
+	ENDIF;
+
+  COMMIT;
+
+	IF :g_rows <= 0 
+	THEN
+			MESSAGE 'Please enter a valid Agency Supplier Group code.'
+						WITH STYLE=POPUP;
+      RETURN 1;
+	ENDIF;
+  RETURN 0;
+}
+
+PROCEDURE lp_val_resend_from()=
+{
+  IF resend_from = ''
+  THEN
+     CLEAR FIELD resend_to; 
+     MESSAGE 'Resend from date must be entered.' WITH STYLE = POPUP;
+     RETURN 1;
+  ENDIF;
+
+  IF resend_from != '' AND resend_to != '' AND
+     resend_from > resend_to
+  THEN
+     CLEAR FIELD resend_from, resend_to; 
+     MESSAGE 'Resend from date must be earlier than to date.' WITH STYLE = POPUP;
+     RETURN 1;
+  ENDIF;
+  
+
+  RETURN 0;
+}
+
+PROCEDURE lp_val_resend_to()=
+{
+  IF resend_to = ''
+  THEN
+     MESSAGE 'Resend to date must be entered.' WITH STYLE = POPUP;
+     RETURN 1;
+  ENDIF;
+
+  IF resend_from != '' AND resend_to != '' AND
+     resend_from > resend_to
+  THEN
+     CLEAR FIELD resend_to; 
+     MESSAGE 'Resend to date must be later than from date.' WITH STYLE = POPUP;
+     RETURN 1;
+  ENDIF;
+
+  IIint = get_details();
+  IF IIint != 0
+  THEN
+     RETURN IIint;
+  ENDIF;
+
+  RETURN 0;
+}
+
+PROCEDURE create_table(p_table_details = VARCHAR(500) NOT NULL WITH DEFAULT,
+                       p_table_name    = VARCHAR(32) NOT NULL WITH DEFAULT)=
+{
+
+  SELECT table_name = table_name
+  FROM iitables
+  WHERE table_name = :p_table_name
+  AND table_owner = :table_owner;
+
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+	IF (g_error != 0)
+	THEN
+      ROLLBACK;
+			MESSAGE 'Error occured selecting from ' + varchar(:p_table_name) + '..!' + X'0A'
+						+ 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+			RETURN -1;
+	ENDIF;
+  COMMIT;
+  IF :g_rows > 0
+  THEN
+     RETURN 0;
+  ENDIF;
+
+  CREATE TABLE :p_table_name
+     (
+     table_name varchar(32) not null not default,
+     column_name varchar(32) not null not default,
+     new_value varchar(100) not null default ' ',
+     old_value varchar(100) not null default ' '
+     );
+	INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	IF (g_error != 0)
+	THEN
+      ROLLBACK;
+			MESSAGE 'Error occured creating ' + varchar(:p_table_name) + '..!' + X'0A'
+						+ 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+			RETURN -1;
+	ENDIF;
+  COMMIT;
+
+  string1 = '';
+  string2 = '';
+  string3 = '';
+  loop = 1;
+
+  IF :p_table_details != '' 
+  THEN
+
+  WHILE ( :loop <= LENGTH(:p_table_details)) DO
+     string1 = '';
+     string2 = '';
+     string3 = '';
+
+     loop = 1;
+     loc=LOCATE(:p_table_details,'=');
+     p_table_details=SHIFT(:p_table_details,-:loc);
+     thischar='';
+     WHILE (thischar != ',') DO
+        thischar = CHAREXTRACT(:p_table_details,:loop);
+        IF :thischar != ','
+        THEN
+           string1 = :string1 + :thischar;
+        ENDIF;
+        loop = loop + 1;
+     ENDWHILE;
+
+     loop = 1;
+     loc=LOCATE(:p_table_details,'=');
+     p_table_details=SHIFT(:p_table_details,-:loc);
+     thischar='';
+     WHILE (thischar != ',') DO
+        thischar = CHAREXTRACT(:p_table_details,:loop);
+        IF :thischar != ','
+        THEN
+           string2 = :string2 + :thischar;
+        ENDIF;
+        loop = loop + 1;
+     ENDWHILE;
+
+     loop = 1;
+     loc=LOCATE(:p_table_details,'=');
+     p_table_details=SHIFT(:p_table_details,-:loc);
+     thischar='';
+     WHILE (thischar != ',') DO
+        thischar = CHAREXTRACT(p_table_details,:loop);
+        IF :thischar != ','
+        THEN
+           string3 = :string3 + :thischar;
+        ENDIF;
+        loop = loop + 1;
+     ENDWHILE;
+
+     INSERT INTO :table_name
+     (
+     table_name,
+     column_name,
+     new_value,
+     old_value 
+     )
+     VALUES
+     (
+     :string1,
+     :string2,
+     :string3,
+     ''
+     );
+	   INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	   IF (g_error != 0)
+	   THEN
+        ROLLBACK;
+			  MESSAGE 'Error occured creating ' + varchar(:table_name) + '..!' + X'0A'
+						  + 'Error: ' + VARCHAR(:g_err_text)
+				   WITH STYLE=POPUP;
+			  RETURN -1;
+     ENDIF;
+     COMMIT;
+
+  ENDWHILE;
+  ENDIF;
+
+  RETURN 0;
+}
+
+PROCEDURE extract_parameters(p_email_details = varchar(255) not null with default)=
+{
+  string1 = '';
+  string2 = '';
+  string3 = '';
+  string4 = '';
+
+  request = '';
+  account_branch = '';
+  account_no = '';
+  table_name = '';
+
+  loop = 1;
+  loc=LOCATE(:p_email_details,'=');
+  p_email_details=SHIFT(:p_email_details,-:loc);
+  thischar='';
+  WHILE (thischar != ',') DO
+     thischar = CHAREXTRACT(:p_email_details,:loop);
+     IF :thischar != ','
+     THEN
+        string1 = :string1 + :thischar;
+     ENDIF;
+     loop = loop + 1;
+  ENDWHILE;
+  request = TRIM(:string1);
+
+  loop = 1;
+  loc=LOCATE(:p_email_details,'=');
+  p_email_details=SHIFT(:p_email_details,-:loc);
+  thischar='';
+  WHILE (thischar != ',') DO
+     thischar = CHAREXTRACT(:p_email_details,:loop);
+     IF :thischar != ','
+     THEN
+        string2 = :string2 + :thischar;
+     ENDIF;
+     loop = loop + 1;
+  ENDWHILE;
+  account_branch = TRIM(:string2);
+
+  loop = 1;
+  loc=LOCATE(:p_email_details,'=');
+  p_email_details=SHIFT(:p_email_details,-:loc);
+  thischar='';
+  WHILE (thischar != ',') DO
+     thischar = CHAREXTRACT(:p_email_details,:loop);
+     IF :thischar != ','
+     THEN
+        string3 = :string3 + :thischar;
+     ENDIF;
+     loop = loop + 1;
+  ENDWHILE;
+  account_no = TRIM(:string3); 
+
+  loop = 1;
+  loc=LOCATE(:p_email_details,'=');
+  p_email_details=SHIFT(:p_email_details,-:loc);
+  thischar='';
+  WHILE (thischar != ',') DO
+     thischar = CHAREXTRACT(:p_email_details,:loop);
+     IF :thischar != ','
+     THEN
+        string4 = :string4 + :thischar;
+     ENDIF;
+     loop = loop + 1;
+  ENDWHILE;
+  table_name = TRIM(:string4); 
+
+  RETURN 0;
+}

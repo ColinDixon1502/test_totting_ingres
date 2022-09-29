@@ -1,0 +1,872 @@
+/****************************************************************************/
+/*  Frame  - Agency Supplier Mapping                                        */
+/*  Author - P.Thorsen                                                      */
+/*                                                                          */
+/*  Date   - 17.05.07                                                       */
+/*  Type   - Online Frame                                                   */
+/*                                                                          */
+/*  Source - agency_supplier_mapping.osq                                    */
+/*  Form   - agency_supplier_mapping                                        */
+/*                                                                          */
+/*  Parameters expected - None.                                             */
+/*                                                                          */
+/****************************************************************************/
+/*  Version | Date     | Coded | Description of changes made                */
+/***********|**********|*******|*********************************************/
+/*  1.0     | 17.05.07 | PT    | Original code                              */
+/***********|**********|*******|*********************************************/
+/****************************************************************************/
+
+INITIALIZE(
+
+/******************************************************/
+/* INGRES ERROR HANDLING VARIABLES                    */
+/******************************************************/
+
+    IIrowcount     =  INTEGER(4) NOT NULL,
+
+/******************************************************/
+/* FRAME SPECIFIC VARIABLES                           */  
+/******************************************************/
+
+    IIint                     =  INTEGER(4) NOT NULL, 
+    IIint1                    =  INTEGER(4) NOT NULL,
+    IIchar1                   =  CHAR(1)    NOT NULL,
+    IIchar                    =  CHAR(20)   NOT NULL,
+    v_field_name              =  CHAR(24)   NOT NULL,
+    v_tf_entry_exist          =  INTEGER(1) NOT NULL,
+    h_aah_code                =  VARCHAR(4) NOT NULL,
+    h_command                 =  INTEGER    NOT NULL,
+    iitf.mapping_type         =  CHAR(6)    NOT NULL,
+    iitf.agency_supplier_desc =  CHAR(32)   NOT NULL,
+    
+)=
+DECLARE
+/******************************************************/
+/* Local Procedures                                   */
+/******************************************************/
+
+    lp_val_agency_supplier      = PROCEDURE RETURNING INTEGER;
+    lp_val_mapping_type         = PROCEDURE RETURNING INTEGER;
+    lp_val_aah_code             = PROCEDURE RETURNING INTEGER;
+    lp_val_agency_supplier_code = PROCEDURE RETURNING INTEGER;
+    update_dbase                = PROCEDURE RETURNING INTEGER;
+    check_for_changes           = PROCEDURE RETURNING INTEGER;
+    lp_clear                    = PROCEDURE;
+
+{
+/*******************/
+/* Initialise form* / 
+/*******************/
+
+    CALLPROC lp_clear();
+
+    SET_FORMS FRS(TIMEOUT = :gc_timeout);
+
+    SET_FORMS FRS(MAP(FRSKEY5)='pf5');
+    SET_FORMS FRS(LABEL(FRSKEY5)='F5');
+    SET_FORMS FRS(MAP(FRSKEY10)='pf10');
+    SET_FORMS FRS(LABEL(FRSKEY10)='F10');
+    SET_FORMS FRS(MAP(FRSKEY7)='pf11');
+    SET_FORMS FRS(LABEL(FRSKEY7)='F11');
+}
+
+AFTER FIELD 'agency_supplier'=
+{
+    IIint = CALLPROC lp_val_agency_supplier();
+    IF IIint != 0 THEN
+       RESUME;
+    ENDIF;
+    h_aah_code = '';
+    RESUME NEXT;
+}
+
+AFTER FIELD 'mapping_type'=
+{
+    IIint = CALLPROC lp_val_mapping_type();
+    IF IIint != 0 THEN
+        RESUME;
+    ENDIF;
+    h_aah_code = '';
+    RESUME NEXT;
+}
+
+AFTER FIELD 'aah_code'=
+{
+    IF ifnull(aah_code,'') = ''  and g_rows > 0 THEN
+        CLEAR field agency_supplier_code;
+        CLEAR FIELD agency_supplier_desc;
+        CLEAR FIELD aah_code_desc;
+        RESUME FIELD iitf;
+
+    ELSEIF h_aah_code != ifnull(aah_code,'') THEN
+        CLEAR field agency_supplier_code;
+        CLEAR FIELD agency_supplier_desc;
+        CLEAR FIELD aah_code_desc;
+
+        IIint = CALLPROC lp_val_aah_code();
+
+        IF IIint != 0 THEN
+            RESUME;
+        ENDIF;
+        h_aah_code = ifnull(:aah_code,'');                
+    ENDIF;
+    RESUME NEXT;
+}
+
+AFTER FIELD 'agency_supplier_code'=
+{
+    IIint = CALLPROC lp_val_agency_supplier_code();
+    IF IIint != 0 THEN
+       RESUME;
+    ENDIF;
+    RESUME NEXT;
+}
+
+
+ON TIMEOUT =
+{
+   CALLFRAME timeout_popup();
+}
+
+
+'Delete', KEY FRSKEY5 =
+{
+    INQUIRE_FORMS FORM (IIchar = FIELD); 
+    IF IIChar != 'iitf' 
+    OR g_rows = 0 THEN
+        MESSAGE 'Cursor must be on a mapping before using '
+              + 'the ' + '''Delete''' + ' key' WITH STYLE = POPUP;
+        RESUME;
+    ENDIF;
+
+    IIchar = PROMPT 'Do you wish to delete ' + X'0A'
+                    + VARCHAR(:iitf.agency_supplier_code) + ' - ' 
+                    + VARCHAR(:iitf.aah_code) + ' ?'
+                    WITH STYLE=POPUP;
+
+    IF UPPERCASE(:IIchar) != 'Y' THEN
+        RESUME;
+    ENDIF;
+
+    MESSAGE 'Deleting..';
+
+
+    DELETE FROM  agency_supplier_mapping
+    WHERE        agency_supplier      = :agency_supplier
+    AND          mapping_type         = :mapping_type
+    AND          aah_code             = :iitf.aah_code
+    AND          agency_supplier_code = :iitf.agency_supplier_code
+    AND          agency_supplier_desc = :iitf.agency_supplier_desc;
+
+    INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,
+                               g_err_text=ERRORTEXT);
+
+    IF (g_error != 0) THEN
+
+         ROLLBACK;
+			   MESSAGE 'Error occured deleting agency_supplier_mapping ' 
+                 + 'details..!' + X'0A'
+						     + 'Error: ' + VARCHAR(:g_err_text)
+							   WITH STYLE=POPUP;
+         RESUME;
+    ENDIF;
+
+    COMMIT;
+    DELETEROW iitf;
+}
+
+
+'Choices', KEY FRSKEY10 =
+{
+
+    IIchar = '';
+
+    INQUIRE_FORMS FORM (v_field_name = FIELD);
+    
+    IF v_field_name = 'agency_supplier' THEN
+
+        CALLPROC mapst();
+
+        IIint = CALLFRAME look_up(
+        II_QUERY  =
+            SELECT agency_supplier,
+                   supplier_name
+            FROM   agency_supplier;
+        II_FIELD1       = 'agency_supplier',
+        II_FIELD2       = 'supplier_name',
+        II_FIELD_TITLE1 = 'Agency Supplier',
+        II_FIELD_TITLE2 = 'Description',
+        agency_supplier = BYREF(agency_supplier),
+        supplier_name   = BYREF(supplier_name),
+        II_ROWS         = 10);
+
+        REDISPLAY;
+
+        CALLPROC mapend();
+
+        IF IIint = 0 THEN
+            RESUME;
+        ELSE
+            RESUME NEXT;
+        ENDIF;
+
+    ELSEIF v_field_name = 'mapping_type' THEN
+
+        CALLPROC mapst();
+
+        IIint = CALLFRAME look_up(
+        II_QUERY  =
+            SELECT mapping_type,
+                   mapping_type_desc
+            FROM   mapping_types;
+        II_FIELD1       = 'mapping_type',
+        II_FIELD2       = 'mapping_type_desc',
+        II_FIELD_TITLE1 = 'Mapping Type',
+        II_FIELD_TITLE2 = 'Description',
+        mapping_type = BYREF(mapping_type),
+        mapping_type_desc   = BYREF(mapping_type_desc),
+        II_ROWS         = 10);
+        REDISPLAY;
+
+        CALLPROC mapend();
+
+        IF IIint = 0
+        THEN
+            RESUME;
+        ELSE
+            RESUME NEXT;
+        ENDIF;
+
+    ELSEIF v_field_name = 'aah_code' THEN
+
+        /* Mapping of the AAH code values and lookup varies */
+        /* depending on the mapping type$.                  */
+
+        IF mapping_type = 'INVCRD' 
+        OR mapping_type = 'STKCRD' THEN
+
+            CALLPROC mapst();
+
+            IIint = CALLFRAME LOOK_UP
+
+                 (II_QUERY = SELECT code = char(code),
+                                    description
+                             FROM   credit_decode;
+                   II_FIELD1 = 'code',
+                   II_FIELD2 = 'description',
+                   II_FIELD_TITLE1 = 'AAH Code',
+                   II_FIELD_TITLE2 = 'Description',
+                   code        = BYREF(aah_code),
+                   description = BYREF(aah_code_desc),
+                   II_ROWS   = 14);
+
+            REDISPLAY;
+
+            CALLPROC mapend();
+
+            IF IIint = 0 THEN
+                RESUME;
+            ENDIF;
+
+        ELSEIF mapping_type = 'CUST' THEN
+
+            CALLPROC mapst();
+
+            IIint = CALLFRAME LOOK_UP
+                 (II_QUERY = SELECT custype_no = char(custype_no),
+                                    custype
+                             FROM   cust_types;
+                   II_FIELD1 = 'custype_no',
+                   II_FIELD2 = 'custype',
+                   II_FIELD_TITLE1 = 'AAH Code',
+                   II_FIELD_TITLE2 = 'Description',
+                   custype_no     = BYREF(aah_code),
+                   custype         = BYREF(aah_code_desc),
+                   II_ROWS   = 14);
+
+            REDISPLAY;
+
+            CALLPROC mapend();
+
+            IF IIint = 0 THEN
+                RESUME;
+            ENDIF;
+
+        ELSEIF mapping_type = 'OMITS' 
+            OR mapping_type = 'RECEPT' 
+            OR mapping_type = 'ADJUST' THEN
+
+            CALLPROC mapst();
+
+            IIint = CALLFRAME LOOK_UP
+                 (II_QUERY = SELECT code,
+                         description
+                        FROM grn_analysis_types
+                        WHERE type = :mapping_type;
+                   II_FIELD1 = 'code',
+                   II_FIELD2 = 'description',
+                   II_FIELD_TITLE1 = 'AAH Code',
+                   II_FIELD_TITLE2 = 'Description',
+                   code        = BYREF(aah_code),
+                   description = BYREF(aah_code_desc),
+                   II_ROWS   = 14);
+
+            REDISPLAY;
+
+            CALLPROC mapend();
+
+            IF IIint = 0 THEN
+                RESUME;
+            ENDIF;
+
+
+        ENDIF;
+
+    ELSE
+    
+        MESSAGE 'Function not available on this field'
+        WITH STYLE = POPUP;
+    
+        RESUME;
+    
+    ENDIF;
+
+    IF IIint = 0 THEN
+    RESUME;
+    ENDIF;
+
+}
+
+'Save', KEY FRSKEY7=
+{
+    /* First validate all data */
+
+    IIint = CALLPROC lp_val_agency_supplier();
+    IF IIint != 0 THEN
+       RESUME field agency_supplier;
+    ENDIF;
+
+    IIint = CALLPROC lp_val_mapping_type();
+    IF IIint != 0 THEN
+       RESUME field mapping_type;
+    ENDIF;
+
+    IIint = CALLPROC lp_val_aah_code();
+    IF IIint != 0 THEN
+       RESUME field aah_code;
+    ENDIF;
+    
+    /* All data valid so update the database */
+    IIint = CALLPROC update_dbase();
+   
+    IF IIint != 0 THEN
+        ROLLBACK;
+        RESUME;
+    ENDIF;
+
+    CALLPROC lp_clear;
+
+    RESUME field agency_supplier;
+}
+
+'End', KEY FRSKEY3 =
+{
+    /* check before ending whether there are any changes to */
+    /* save, if so remind user to save them                 */
+
+    IIint = 0;
+
+    INQUIRE_FORMS FORM (IIint = CHANGE);
+    IF IIint != 0 THEN
+
+        IIchar1 = '';
+
+        WHILE UPPERCASE(IIchar1) != 'N' AND
+              UPPERCASE(IIchar1) != 'Y'
+        DO
+            IIchar1 = PROMPT 'Save changes (Y/N) ?' WITH STYLE = POPUP;
+        ENDWHILE;
+
+        IF UPPERCASE(IIchar1) = 'N' THEN
+                CALLPROC lp_clear();
+                RETURN;
+
+        ELSE
+            /* First validate all data */
+
+            IIint = CALLPROC lp_val_agency_supplier();
+            IF IIint != 0 THEN
+                RESUME field agency_supplier;
+            ENDIF;
+
+            IIint = CALLPROC lp_val_mapping_type();
+            IF IIint != 0 THEN
+               RESUME field mapping_type;
+            ENDIF;
+
+            IIint = CALLPROC lp_val_aah_code();
+            IF IIint != 0 THEN
+               RESUME field aah_code;
+            ENDIF;
+
+            /* All data valid so update the database */
+            IIint = CALLPROC update_dbase();
+   
+            IF IIint != 0 THEN
+                ROLLBACK;
+                RESUME;
+            ENDIF;
+        ENDIF;
+    ELSE
+        RETURN;
+    ENDIF;
+    COMMIT;
+
+    CALLPROC lp_clear();
+
+    RESUME FIELD agency_supplier; 
+}
+
+/***********************************************/
+/* Procedure to validate agency_supplier field */
+/***********************************************/
+PROCEDURE lp_val_agency_supplier()=
+{
+    IF agency_supplier = '' THEN
+        CLEAR FIELD supplier_name; 
+        MESSAGE 'Agency Supplier must be entered.' WITH STYLE = POPUP;
+        RETURN 1;
+    ENDIF;
+
+    SELECT supplier_name = supplier_name 
+    FROM  agency_supplier
+    WHERE agency_supplier = :agency_supplier;
+
+	  INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+  	IF (g_error != 0) THEN
+        ROLLBACK;
+			  MESSAGE 'Error occured initializing agency_supplier details..!' + X'0A'
+						  + 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+			  RETURN -1;
+	  ENDIF;
+
+    COMMIT;
+
+	  IF :g_rows <= 0 THEN
+			  MESSAGE 'Please enter a valid Agency Supplier code.'
+						  WITH STYLE=POPUP;
+        RETURN 1;
+  	ENDIF;
+
+    RETURN 0;
+}
+
+/***********************************************/
+/* Procedure to validate mapping_type field    */
+/***********************************************/
+PROCEDURE lp_val_mapping_type()=
+{
+    IF ifnull(mapping_type,'') = '' THEN
+        CLEAR FIELD mapping_type_desc; 
+        MESSAGE 'Mapping Type must be entered.' WITH STYLE = POPUP;
+        RETURN 1;
+    ENDIF;
+
+    /* validate mapping_type this is hard coded as any other     */
+    /* values will have a substantial impact on the program      */
+    /* design if they were to be added                           */
+
+    IF  ifnull(mapping_type,'') != 'INVCRD'      /* Inv Credit   */
+    AND ifnull(mapping_type,'') != 'STKCRD'      /* Stock Credit */
+    AND ifnull(mapping_type,'') != 'OMITS'       /* Omits        */
+    AND ifnull(mapping_type,'') != 'RECEPT'      /* Reciepts     */
+    AND ifnull(mapping_type,'') != 'ADJUST'      /* Adjustments  */
+    AND ifnull(mapping_type,'') != 'CUST'   THEN /* Customer     */
+
+        CLEAR FIELD mapping_type_desc; 
+        MESSAGE 'A valid Mapping Type Code must be entered.' WITH STYLE = POPUP;
+        RETURN 1;
+
+    ENDIF;
+
+
+    SELECT mapping_type_desc = mapping_type_desc 
+    FROM   mapping_types
+    WHERE  mapping_type    = :mapping_type;
+
+	  INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	  IF (g_error != 0)
+	  THEN
+        ROLLBACK;
+
+			  MESSAGE 'Error occured initializing mapping_type details..!' + X'0A'
+			  			+ 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+
+			  RETURN -1;
+
+	  ENDIF;
+
+    /* Now check if relevant record exists in agency_supplier_mapping */ 
+    iitf = SELECT mapping_type,
+                  aah_code,
+                  agency_supplier_code,
+                  agency_supplier_desc
+           FROM   agency_supplier_mapping
+           WHERE  agency_supplier = :agency_supplier
+           AND    mapping_type    = :mapping_type; 
+
+	  INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,g_err_text=ERRORTEXT);
+
+	  IF (g_error != 0) THEN
+
+        ROLLBACK;
+
+			  MESSAGE 'Error occured initializing aah_code details..!' + X'0A'
+						  + 'Error: ' + VARCHAR(:g_err_text)
+							WITH STYLE=POPUP;
+
+			  RETURN -1;
+
+	  ENDIF;
+
+    COMMIT;
+
+    UNLOADTABLE iitf
+    {
+        IF iitf.mapping_type = 'INVCRD'
+        OR iitf.mapping_type = 'STKCRD' THEN
+
+            SELECT :iitf.aah_code_desc = description 
+            FROM   credit_decode
+            WHERE  char(code) = :iitf.aah_code;
+
+            INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,
+                                                   g_err_text=ERRORTEXT);
+
+  	        IF (g_error != 0) THEN
+                ROLLBACK;
+			          MESSAGE 'Error occured initializing credit_decode ' 
+                      + 'details..!' + X'0A'
+						          + 'Error: ' + VARCHAR(:g_err_text)
+							        WITH STYLE=POPUP;
+			          RETURN -1;
+	          ENDIF;
+
+            COMMIT;
+
+         ELSEIF iitf.mapping_type = 'CUST' THEN 
+             SELECT :iitf.aah_code_desc = custype 
+             FROM   cust_types
+             WHERE  char(custype_no) = :iitf.aah_code;
+
+             INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,
+                                                   g_err_text=ERRORTEXT);
+
+  	         IF (g_error != 0) THEN
+                 ROLLBACK;
+			           MESSAGE 'Error occured initializing cust_types ' 
+                       + 'details..!' + X'0A'
+						           + 'Error: ' + VARCHAR(:g_err_text)
+						 	        WITH STYLE=POPUP;
+			           RETURN -1;
+	           ENDIF;
+
+             COMMIT;
+
+         ELSEIF iitf.mapping_type = 'OMITS' 
+             OR iitf.mapping_type = 'RECEPT'
+             OR iitf.mapping_type = 'ADJUST' THEN
+
+             SELECT :iitf.aah_code_desc = description 
+             FROM   grn_analysis_types
+             WHERE  code = :iitf.aah_code
+             AND    type = :iitf.mapping_type;
+
+             INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,
+                                                   g_err_text=ERRORTEXT);
+
+  	         IF (g_error != 0) THEN
+                 ROLLBACK;
+			           MESSAGE 'Error occured initializing grn_analysis_types ' 
+                       + 'details..!' + X'0A'
+						           + 'Error: ' + VARCHAR(:g_err_text)
+						 	         WITH STYLE=POPUP;
+			           RETURN -1;
+	           ENDIF;
+
+             COMMIT;
+        ENDIF;
+        
+    };
+    RETURN 0;
+}
+
+/***********************************************/
+/* Procedure to validate aah_code field        */
+/***********************************************/
+PROCEDURE lp_val_aah_code()=
+{
+    IF aah_code = '' THEN
+        CLEAR FIELD aah_code_desc; 
+        CLEAR FIELD agency_supplier_code; 
+        CLEAR FIELD agency_supplier_desc; 
+        h_aah_code = '';
+        MESSAGE 'AAH Code must be entered.' WITH STYLE = POPUP;
+        RETURN 1;
+    ENDIF;
+
+                                     /* Process only if new code */
+    IF h_aah_code != ifnull(aah_code,'') THEN 
+
+        /* Validation needs to take place against a number of    */
+        /* tables depending on the mapping type                  */
+
+        IF ifnull(mapping_type,'') = 'INVCRD'      /* Credit       */
+        OR ifnull(mapping_type,'') = 'STKCRD' THEN 
+            SELECT :aah_code_desc = description
+            FROM   credit_decode
+            WHERE  char(code) = :aah_code;
+
+    	      INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,
+                                                      g_err_text=ERRORTEXT);
+
+      	    IF (g_error != 0) THEN
+                ROLLBACK;
+			          MESSAGE 'Error occured selecting credit_decode details..!' 
+                        + X'0A' + 'Error: ' + VARCHAR(:g_err_text)
+						    	      WITH STYLE=POPUP;
+			          RETURN -1;
+	          ENDIF;
+
+            COMMIT;
+
+	          IF :g_rows <= 0 THEN
+			          MESSAGE 'Please enter a valid AAH Code .'
+					        	  WITH STYLE=POPUP;
+                CLEAR FIELD aah_code_desc; 
+                CLEAR FIELD agency_supplier_code; 
+                CLEAR FIELD agency_supplier_desc; 
+                RETURN 1;
+  	        ENDIF;
+
+        ELSEIF ifnull(mapping_type,'') = 'CUST' THEN /* Customer     */
+            SELECT :aah_code_desc = custype
+            FROM   cust_types
+            WHERE  char(custype_no) = :aah_code;
+
+    	      INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,
+                                                      g_err_text=ERRORTEXT);
+
+      	    IF (g_error != 0) THEN
+                ROLLBACK;
+			          MESSAGE 'Error occured selecting cust_types details..!' + X'0A'
+					        	  + 'Error: ' + VARCHAR(:g_err_text)
+						        	WITH STYLE=POPUP;
+			          RETURN -1;
+	          ENDIF;
+
+            COMMIT;
+
+	          IF :g_rows <= 0 THEN
+			          MESSAGE 'Please enter a valid AAH Code .'
+					             WITH STYLE=POPUP;
+                CLEAR FIELD aah_code_desc; 
+                CLEAR FIELD agency_supplier_code; 
+                CLEAR FIELD agency_supplier_desc; 
+                RETURN 1;
+  	        ENDIF;
+
+        ELSEIF ifnull(mapping_type,'') = 'OMITS'       /* Omits        */
+            OR ifnull(mapping_type,'') = 'RECEPT'      /* Reciepts     */
+            OR ifnull(mapping_type,'') = 'ADJUST' THEN /* Adjustments  */
+
+            SELECT :aah_code_desc = description
+            FROM   grn_analysis_types
+            WHERE  code = :aah_code
+            AND type = :mapping_type;
+
+    	      INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,
+                                                    g_err_text=ERRORTEXT);
+
+      	    IF (g_error != 0) THEN
+                ROLLBACK;
+			          MESSAGE 'Error occured selecting grn_anakisys_types details..!' 
+                  + X'0A' + 'Error: ' + VARCHAR(:g_err_text)
+						    	WITH STYLE=POPUP;
+			          RETURN -1;
+	          ENDIF;
+
+            COMMIT;
+
+	          IF :g_rows <= 0 THEN
+			          MESSAGE 'Please enter a valid AAH Code .'
+					        	  WITH STYLE=POPUP;
+                CLEAR FIELD aah_code_desc; 
+                CLEAR FIELD agency_supplier_code; 
+                CLEAR FIELD agency_supplier_desc; 
+                RETURN 1;
+  	        ENDIF;
+
+        ELSE MESSAGE 'Please enter a valid AAH Code code.'
+  		        WITH STYLE=POPUP;
+             CLEAR FIELD aah_code_desc; 
+             CLEAR field agency_supplier_code;
+             CLEAR FIELD agency_supplier_desc;
+             RETURN 1;
+
+        ENDIF;
+
+
+        /* check if mapping type AAH Code combination already exists */
+        /* in table field, if it does then we can assume it is an    */
+        /* acceptable agency_supplier mapping_code/AAH Code          */
+        /* combination                                               */ 
+
+        v_tf_entry_exist   =  0;
+        UNLOADTABLE iitf
+        {
+            IF  :iitf.aah_code = :aah_code 
+            AND :mapping_type = iitf.mapping_type THEN
+                v_tf_entry_exist   =  1;  
+             
+                IF mapping_type = :iitf.mapping_type          
+                AND aah_code     = :iitf.aah_code THEN        
+                    agency_supplier_code = 
+                                          ifnull(:iitf.agency_supplier_code,'');
+                    agency_supplier_desc = 
+                                          ifnull(:iitf.agency_supplier_desc,'');
+                ENDIF;    
+
+                IF :aah_code_desc = '' THEN
+                    aah_code_desc        = ifnull(:iitf.aah_code_desc,'');
+                ENDIF;
+        
+            ENDIF;
+        };
+    ENDIF;
+
+    RETURN 0;
+}
+
+/****************************************************/
+/* Procedure to validate agency_supplier_code field */
+/****************************************************/
+PROCEDURE lp_val_agency_supplier_code()=
+{
+    INQUIRE_FORMS frs (h_command = COMMAND);
+
+    IF h_command != 4  AND aah_code != '' THEN
+        IF agency_supplier_code = '' THEN
+            CLEAR FIELD agency_supplier_desc; 
+            MESSAGE 'Agency Supplier Code must be entered.' WITH STYLE = POPUP;
+            RETURN 1;
+        ENDIF;
+    ENDIF;
+}
+
+/***********************************************/
+/* Procedure to update the database            */
+/***********************************************/
+PROCEDURE update_dbase()=
+DECLARE
+    RESULT = INTEGER;
+{
+    /* Depending on whether this is a new AAH  */
+    /* code this may involve either an update  */
+    /* or an insert                            */
+    IF v_tf_entry_exist = 0 THEN   /* New entry needs insert*/
+        INSERT INTO agency_supplier_mapping(agency_supplier,
+                                            mapping_type,
+                                            aah_code,
+                                            agency_supplier_code,
+                                            agency_supplier_desc,
+                                            audit_branch,
+                                            audit_user,
+                                            audit_date)
+        VALUES (:agency_supplier,
+                :mapping_type,
+                :aah_code,
+                :agency_supplier_code,
+                :agency_supplier_desc,
+                :gv_branch_id,
+                :gv_user_id,
+                date('today'));
+
+        INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,
+                                                   g_err_text=ERRORTEXT);
+
+  	    IF (g_error != 0) THEN
+            ROLLBACK;
+			      MESSAGE 'Error occured inserting agency_supplier_mapping ' 
+                        + 'details..!' + X'0A'
+						            + 'Error: ' + VARCHAR(:g_err_text)
+							          WITH STYLE=POPUP;
+			              RETURN -1;
+	      ENDIF;
+
+        COMMIT;
+
+    ELSE                           /* This data needs update*/
+        UPDATE  agency_supplier_mapping
+           SET  agency_supplier_code = :agency_supplier_code,
+                agency_supplier_desc = :agency_supplier_desc,
+                audit_branch         = :gv_branch_id,
+                audit_user           = :gv_user_id,
+                audit_date           = date('today')
+        WHERE   agency_supplier = :agency_supplier
+        AND     mapping_type    = :mapping_type
+        AND     aah_code        = :aah_code;
+
+        INQUIRE_INGRES(g_error=ERRORNO,g_rows=ROWCOUNT,
+                                                   g_err_text=ERRORTEXT);
+
+  	    IF (g_error != 0) THEN
+            ROLLBACK;
+			      MESSAGE 'Error occured updating agency_supplier_mapping ' 
+                        + 'details..!' + X'0A'
+						            + 'Error: ' + VARCHAR(:g_err_text)
+							          WITH STYLE=POPUP;
+			              RETURN -1;
+	      ENDIF;
+
+        COMMIT;
+    ENDIF;
+    RESULT = 0;
+   
+    RETURN RESULT;
+}
+
+/***************************************/
+/* Procedure to check for changes      */
+/***************************************/
+PROCEDURE check_for_changes()=
+DECLARE
+    RESULT    = INTEGER;
+{
+    INQUIRE_FORMS FORM(RESULT = CHANGE);
+
+    IF RESULT != 0 THEN
+       RETURN 1;
+    ENDIF;
+
+    RETURN RESULT;
+}
+
+/***************************************/
+/* Procedure to clear screen           */
+/***************************************/
+PROCEDURE lp_clear()=  
+{  
+    CLEAR FIELD ALL;  
+  
+    SET_FORMS FORM (CHANGE = 0);  
+  
+    screen_date = DATE('NOW');  
+  
+    RETURN;  
+};  

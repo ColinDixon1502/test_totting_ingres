@@ -1,0 +1,173 @@
+/*
+**	Report: agency_supplier_email_notify
+**
+**		Last Modified: 2009_12_16 11:16:00 ISS  
+**		Level: 1
+*/
+
+.NAME	agency_supplier_email_notify
+.SHORTREMARK Generation of the CUS03 interface file.
+.LONGREMARK
+Agency Email Notification   
+v1.1 : 20160307 : CED : TE2500363 - Changed GPS Number to GPhC Number.
+.ENDREMARK
+.PAGEWIDTH	500
+.SETUP
+	SET LOCKMODE SESSION WHERE READLOCK = NOLOCK ,MAXLOCKS = 300 ;
+.QUERY
+  SELECT  request, agency_supplier, account_branch, account_no, 
+          table_name, column_name, old_value, new_value, 
+          description, man_ind, subject, due_for_del, del_date, 
+          form_completed, addr_line1, addr_line2, addr_line3, 
+          addr_line4, post_code, tel_no, fax_no, email, payer_id, 
+          status_text, az_channel, az_channel_desc, custype_no, 
+          custype_text, custgroup_no, custgroup_text, credit_risk, 
+          credit_text, credit_desc, credit_terms, credit_limit, 
+          vat_rate, vat_status, vat_no, email_from, email_to, 
+          sort_order, gmc_seq_no, gmc_supp_ref, gmc_account_no, 
+          rps_seq_no, rps_supp_ref, rps_account_no   
+  FROM	  SESSION.$sess_name
+	
+  ORDER BY sort_order
+
+.HEADER	report
+	.NOFIRSTFF 
+	.FORMFEEDS 
+	.PL 77
+	.PRINT 'From: '
+	.PRINT email_from(c100)
+	.NL 
+	.PRINT 'Bcc: '
+	.PRINT email_to(c500)
+	.PRINT '\'
+	.NL 
+	.PRINT 'Subject: '
+	.PRINT subject(c100)
+	.NL 
+	.PRINT 'Content-Type: text/html'
+	.NL 
+	.PRINT '<html>'
+	.NL 
+	.PRINT '<body><pre>'
+	.PRINT '<font size=3>'
+	.IF request='N' .THEN
+		.PRINT '<B>'
+		.NL 
+		.PRINT 'N E W   A C C O U N T'
+		.NL 
+		.PRINT '</B>'
+	.ELSE 
+		.PRINT '<B>'
+		.NL 
+		.PRINT 'C L O S E D   A C C O U N T'
+		.NL 
+		.PRINT '</B>'
+	.ENDIF 
+	.PRINT '</font>'
+	.PRINT '<font size=2>'
+	.NL 4
+	.IF request='N' OR request='C' .THEN
+            .IF request='N' .THEN
+		.PRINT 'Customer Trading Start Date    : '
+		.PRINT form_completed(d "03/02/1901")
+		.NL 
+            .ENDIF
+		.PRINT 'Customer Name                  : '
+		.PRINT addr_line1(c32)
+		.NL 
+		.PRINT 'Customer Address               : '
+		.PRINT addr_line2(c32)
+		.NL 
+		.PRINT '                                 '
+		.PRINT addr_line3(c32)
+		.NL 
+		.PRINT '                                 '
+		.PRINT addr_line4(c32)
+		.NL 
+		.PRINT '                                 '
+		.PRINT post_code(c8)
+		.NL 
+            .IF request='N' .THEN
+		.PRINT 'Tel No                         : '
+		.PRINT tel_no(c12)
+		.NL 
+		.PRINT 'Fax No                         : '
+		.PRINT fax_no(c12)
+		.NL 
+		.PRINT 'Email Address                  : '
+		.PRINT email(c50)
+		.NL 2
+            .ENDIF
+            .IF request='C' .THEN
+		.NL
+            .ENDIF
+		.PRINT 'Agents Customer ID             : '
+		.PRINT account_branch(c4)
+		.PRINT account_no(c9)
+		.NL 
+            .IF request='N' .THEN
+		.PRINT 'Agents Customer Trading Status : '
+		.PRINT status_text(c32)
+		.NL 2
+		.PRINT 'AZ Customer Group              : '
+		.PRINT az_channel
+		.PRINT ' : '
+		.PRINT az_channel_desc(c35)               
+		.NL 
+		.PRINT 'AAH Customer Type              : '
+		.PRINT custype_no
+		.PRINT ' : '
+		.PRINT custype_text(c32)
+		.NL 
+		.PRINT 'AAH Customer Group             : '
+		.PRINT custgroup_no
+		.PRINT ' : '
+		.PRINT custgroup_text(c32)
+		.NL 2
+		.PRINT 'Agent Credit Check Complete?   : '
+		.PRINT credit_text(c32)
+		.NL 2
+		.PRINT 'GPHC Number                    : '
+		.PRINT rps_account_no(c20)
+		.NL 
+		.PRINT 'GMC Number                     : '
+		.PRINT gmc_account_no(c20)
+		.NL 2
+		.PRINT 'VAT Status                     : '
+		.PRINT vat_status(c12)
+		.NL 2
+		.PRINT 'Reason For Opening Account     : '
+		.PRINT '   '               
+		.NL 
+            .ENDIF
+            .IF request='C' .THEN
+		.NL
+		.PRINT 'Date Stopped Trading           : '
+		.PRINT del_date(d "03/02/1901")
+		.NL 2
+		.PRINT 'Reason For Closing Account     : '
+		.PRINT '   '               
+		.NL 
+            .ENDIF
+	.ELSE 
+		.PRINT addr_line1(c32)
+		.NL
+		.PRINT addr_line2(c32)
+		.NL 2
+		.PRINT 'Agents Customer ID             : '
+		.PRINT account_branch(c4)
+		.PRINT account_no(c9)
+		.NL 
+		.PRINT 'Customer Group                 : '
+		.PRINT custype_text(c32)
+		.NL 2
+	.ENDIF 
+	.NL 
+
+.HEADER	page
+	.NEED 55
+
+.FOOTER	report
+	.PRINT '</font>'
+	.PRINT '</pre></body>'
+	.PRINT '</html>'
