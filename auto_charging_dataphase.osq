@@ -1,0 +1,1855 @@
+/*****************************************************************************
+*  Frame  - Maintain Auto Charging - Dataphase
+*  Author - T. Farrell
+*
+*  Date   - 07.02.95
+*  Type   - Online Frame
+*
+*  Source - auto_charging_dataphase.osq
+*  Form   - auto_charging_dataphase
+*
+*  Parameters expected - None.
+*
+*******************************************************************************
+*  Version | Date     | Coded | Description of changes made
+***********|**********|*******|************************************************
+*  1.0     | 07.02.95 | TF    | Original code
+***********|**********|*******|************************************************
+*  1.1     | 02.10.03 | AL    | Allow duplicate codes for overlapping periods,
+*          |          |       | user confirmation required (WR22066).
+******************************************************************************/
+
+INITIALIZE(
+
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+    IIrowcount     =  INTEGER(4) NOT NULL,
+    IIsacctscount  =  INTEGER(4) NOT NULL,
+
+
+/*******************************************************
+** FRAME SPECIFIC VARIABLES  
+*******************************************************/
+
+    IIint              =  INTEGER(4) NOT NULL, 
+    IIint1             =  INTEGER(4) NOT NULL,
+    IIchar1            =  CHAR(1)    NOT NULL,
+    IIchar             =  CHAR(20)   NOT NULL,
+    hf_account         =  CHAR(9)    NOT NULL,
+    II_last_update     =  DATE,
+    II_udi_name        =  CHAR(20)   NOT NULL,
+    II_umbrella_group  =  INTEGER(1) NOT NULL,
+    
+    II_product_code       = CHAR(8) NOT NULL,
+    II_product_desc       = CHAR(40) NOT NULL,   
+    II_qty                = INTEGER4 NOT NULL,       
+    II_charge_period      = INTEGER1 NOT NULL,          
+    II_charge_period_desc = CHAR(12) NOT NULL,             
+    II_special_price      = FLOAT8 NOT NULL,      
+    II_price              = FLOAT8 NOT NULL,      
+    II_discount           = FLOAT8 NOT NULL,      
+    II_charge_branch      = CHAR(4) NOT NULL,        
+    II_start_date         = DATE,       
+    II_stop_date          = DATE,       
+    II_comments           = CHAR(50) NOT NULL,      
+    II_discont_date       = DATE,             
+    II_authorisation_no   = INTEGER1 NOT NULL,          
+    II_reason_no          = INTEGER1 NOT NULL,          
+    
+    product_table.period_no          = INTEGER1 NOT NULL,          
+    product_table.special_price      = FLOAT8 NOT NULL,      
+    product_table.discount           = FLOAT8 NOT NULL,      
+    product_table.trade_price        = FLOAT8 NOT NULL,      
+    product_table.authorisation_no   = INTEGER1 NOT NULL,          
+    product_table.reason_no          = INTEGER1 NOT NULL,          
+    product_table.comments           = CHAR(50) NOT NULL,      
+    product_table.last_update        = DATE,       
+    product_table.row_amended        = INTEGER1,       
+    product_table.insert_date        = DATE,       
+
+    group_sw                         = INTEGER1,    
+)=
+
+DECLARE
+
+/*******************************************************
+** Local Procedures
+*******************************************************/
+    v_branch                   =  PROCEDURE RETURNING INTEGER;
+    v_account                  =  PROCEDURE RETURNING INTEGER;
+    retrieve_saccts            =  PROCEDURE RETURNING INTEGER;
+    retrieve_products          =  PROCEDURE RETURNING INTEGER;
+    update_dbase               =  PROCEDURE RETURNING INTEGER;
+    update_table               =  PROCEDURE RETURNING INTEGER;
+    insert_row                 =  PROCEDURE RETURNING INTEGER;
+    amend_row                  =  PROCEDURE RETURNING INTEGER;
+    delete_from_table          =  PROCEDURE RETURNING INTEGER;
+    process_group              =  PROCEDURE RETURNING INTEGER;
+    update_group_accounts      =  PROCEDURE RETURNING INTEGER;
+    process_account_product    =  PROCEDURE RETURNING INTEGER;
+    delete_from_group_accounts =  PROCEDURE RETURNING INTEGER;
+    check_for_changes          =  PROCEDURE RETURNING INTEGER;
+    check_for_duplicates       =  PROCEDURE RETURNING INTEGER;
+    check_dates                =  PROCEDURE RETURNING INTEGER;
+    check_ingres_error         =  PROCEDURE RETURNING INTEGER;
+    p_clear                    =  PROCEDURE RETURNING INTEGER;
+
+
+    account_array = ARRAY OF TYPE OF TABLE sales_accts;
+
+    
+BEGIN
+    /******************
+    ** Initialise form 
+    *******************/
+
+    IIint = CALLPROC p_clear();
+
+    SET_FORMS FRS(TIMEOUT = :gc_timeout);
+
+    SET_FORMS FRS(MAP(FRSKEY1)='pf1');
+    SET_FORMS FRS(LABEL(FRSKEY1)='F1');
+    SET_FORMS FRS(MAP(FRSKEY7)='pf3');
+    SET_FORMS FRS(LABEL(FRSKEY7)='F3');
+    SET_FORMS FRS(MAP(FRSKEY8)='pf4');
+    SET_FORMS FRS(LABEL(FRSKEY8)='F4');
+    SET_FORMS FRS(MAP(FRSKEY9)='pf5');
+    SET_FORMS FRS(LABEL(FRSKEY9)='F5');
+    SET_FORMS FRS(MAP(FRSKEY14)='pf6');
+    SET_FORMS FRS(LABEL(FRSKEY14)='F6');
+    SET_FORMS FRS(MAP(FRSKEY11)='pf7');
+    SET_FORMS FRS(LABEL(FRSKEY11)='F7');
+    SET_FORMS FRS(MAP(FRSKEY13)='pf9');
+    SET_FORMS FRS(LABEL(FRSKEY13)='F9');
+    SET_FORMS FRS(MAP(FRSKEY10)='pf10');
+    SET_FORMS FRS(LABEL(FRSKEY10)='F10');
+    SET_FORMS FRS(MAP(FRSKEY4)='pf11');
+    SET_FORMS FRS(LABEL(FRSKEY4)='F11');
+    SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+    SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+    
+    
+    /*******************************************************
+    *   This variable holds an umbrella group value.
+    *   It defines which umbrella group products apply
+    *   to this auto charging routine.
+    ********************************************************/
+
+    II_umbrella_group = 12;
+
+END
+
+
+
+AFTER FIELD 'branch_id' =
+BEGIN
+
+    IIint = CALLPROC v_branch();
+    IF IIint != 0 THEN
+    RESUME FIELD branch_id;
+    ENDIF;
+
+    RESUME FIELD account_no;
+    
+END
+
+
+AFTER FIELD 'account_no' =
+BEGIN
+
+    IIint = CALLPROC v_account();
+    IF IIint != 0 THEN
+       RESUME;
+    ENDIF;
+
+    SET_FORMS FIELD '' (DISPLAYONLY(branch_id) = 1,
+            DISPLAYONLY(account_no) = 1);
+            
+    date = DATE('NOW');
+
+    SET_FORMS FORM (CHANGE = 0);
+
+END
+
+
+
+ON TIMEOUT =
+BEGIN
+
+   CALLFRAME timeout_popup();
+   
+END
+
+
+
+'Help', KEY FRSKEY1 =
+BEGIN
+    callproc help_proc(SUBJECT = 
+           'Help on Dataphase Auto Charging',
+           file = :gc_help_dir+'auto_charge_dataphase.hlp');
+END
+
+
+'Delete', KEY FRSKEY7 =
+BEGIN
+
+   IF branch_id = '' OR account_no = '' THEN
+      MESSAGE 'You have not selected an account'
+      WITH STYLE = POPUP;
+      RESUME FIELD branch_id;
+   ENDIF;   
+
+   INQUIRE_FORMS FORM (IIchar = FIELD);
+   
+   IF IIchar != 'product_table' THEN
+      MESSAGE 'You must place the cursor on the product you wish to delete.'
+      WITH STYLE = POPUP;
+      RESUME;
+   ENDIF;   
+
+   INQUIRE_FORMS TABLE '' (IIint = LASTROW);
+   
+   IF IIint = 0 THEN
+      MESSAGE 'There are no product codes to delete'
+      WITH STYLE = POPUP;
+      RESUME;
+   ENDIF;   
+
+   IIchar = '';
+   
+   WHILE (UPPERCASE(IIchar) != 'Y') AND (UPPERCASE(IIchar) != 'N')
+      DO
+      
+     IIchar = PROMPT
+          'Request to delete code ' + product_table.product_code + '. ' +
+          'Are you sure ? (Y/N).'
+          WITH STYLE = POPUP;
+          
+   ENDWHILE;
+          
+   IF (UPPERCASE(IIchar) = 'N') THEN                  
+      RESUME;
+   ENDIF;   
+
+   DELETEROW product_table;
+
+   RESUME
+
+END
+
+
+'Amend', KEY FRSKEY8 =
+{
+   IF branch_id = '' OR account_no = '' THEN
+      MESSAGE 'You have not selected an account'
+      WITH STYLE = POPUP;
+      RESUME FIELD branch_id;
+   ENDIF;   
+
+   INQUIRE_FORMS FORM (IIchar = FIELD);
+   
+   IF IIchar != 'product_table' THEN
+      MESSAGE 'To amend a product code, ' +
+          'you must place the cursor in the product table'
+      WITH STYLE = POPUP;
+      RESUME;
+   ENDIF;   
+
+   INQUIRE_FORMS TABLE '' (IIint = LASTROW);
+   
+   IF IIint = 0 THEN
+      MESSAGE 'There are no product codes to amend'
+      WITH STYLE = POPUP;
+      RESUME;
+   ENDIF;   
+
+
+   II_product_code       = :product_table.product_code;   
+   II_product_desc       = :product_table.description;    
+   II_qty                = :product_table.qty;            
+   II_charge_period      = :product_table.period_no;      
+   II_charge_period_desc = :product_table.period;         
+   II_special_price      = :product_table.special_price;
+   II_discount           = :product_table.discount;  
+   II_charge_branch      = :product_table.charge_branch;  
+   II_start_date         = :product_table.start_date;     
+   II_stop_date          = :product_table.stop_date;      
+   II_comments           = :product_table.comments;       
+   II_authorisation_no   = :product_table.authorisation_no;           
+   II_reason_no          = :product_table.reason_no;        
+
+
+   IIint = CALLFRAME auto_charging_popup(II_umbrella_group   = :II_umbrella_group, 
+                     II_branch           = :branch_id,
+                     II_account          = :hf_account, 
+                     II_authorisation_no = BYREF(:II_authorisation_no),
+                     II_reason_no        = BYREF(:II_reason_no),  
+                     II_price            = BYREF(:II_price),
+                     screen_message      = 'AMEND CODE',
+                     product_code        = BYREF(:II_product_code),
+                     product_desc        = BYREF(:II_product_desc),
+                     qty                 = BYREF(:II_qty),
+                     charge_period       = BYREF(:II_charge_period),
+                     charge_period_desc  = BYREF(:II_charge_period_desc),
+                     special_price       = BYREF(:II_special_price),
+                     discount            = BYREF(:II_discount),
+                     charge_branch       = BYREF(:II_charge_branch),
+                     start_date          = BYREF(:II_start_date),
+                     stop_date           = BYREF(:II_stop_date),
+                     comments            = BYREF(:II_comments));
+                     
+
+
+   IF IIint !=0 THEN
+      RESUME;
+   ENDIF;   
+
+   product_table.row_amended = 1;
+
+   product_table.product_code     = :II_product_code;
+   product_table.description      = left(:II_product_desc,35);
+   product_table.qty              = :II_qty;
+   product_table.period_no        = :II_charge_period;
+   product_table.period           = :II_charge_period_desc;
+   product_table.special_price    = :II_special_price;
+   product_table.discount         = :II_discount;
+   product_table.charge_branch    = :II_charge_branch;
+   product_table.start_date       = :II_start_date;
+   product_table.stop_date        = :II_stop_date;
+   product_table.comments         = :II_comments;
+   product_table.authorisation_no = :II_authorisation_no;
+   product_table.reason_no        = :II_reason_no;         
+
+   IF II_special_price = 0 AND II_discount = 0 THEN
+      product_table.price = :II_price;
+   ELSEIF II_discount = 0 THEN
+      product_table.price = :II_special_price;
+   ELSE
+      product_table.price = II_price - ((II_price * II_discount) / 100);
+   ENDIF;   
+
+   RESUME
+}   
+
+
+'Insert', KEY FRSKEY9 =
+{
+
+   IF branch_id = '' OR account_no = '' THEN
+      MESSAGE 'You have not selected an account'
+      WITH STYLE = POPUP;
+      RESUME FIELD branch_id;
+   ENDIF;   
+
+   INQUIRE_FORMS FORM (IIchar = FIELD);
+   
+   IF IIchar != 'product_table' THEN
+      MESSAGE 'To insert a product code, ' +
+          'you must place the cursor in the product table'
+      WITH STYLE = POPUP;
+      RESUME;
+   ENDIF;   
+
+   IIint = CALLFRAME auto_charging_popup(II_umbrella_group   = :II_umbrella_group, 
+                     II_branch           = :branch_id,
+                     II_account          = :hf_account,
+                     II_authorisation_no = BYREF(:II_authorisation_no),
+                     II_reason_no        = BYREF(:II_reason_no),
+                     II_price            = BYREF(:II_price),
+                     screen_message      = 'INSERT CODE',
+                     product_code        = BYREF(:II_product_code),
+                     product_desc        = BYREF(:II_product_desc),
+                     qty                 = BYREF(:II_qty),
+                     charge_period       = BYREF(:II_charge_period),
+                     charge_period_desc  = BYREF(:II_charge_period_desc),
+                     special_price       = BYREF(:II_special_price),
+                     discount            = BYREF(:II_discount),
+                     charge_branch       = BYREF(:II_charge_branch),
+                     start_date          = BYREF(:II_start_date),
+                     stop_date           = BYREF(:II_stop_date),
+                     comments            = BYREF(:II_comments));
+
+   IF IIint !=0 THEN
+      RESUME;
+   ENDIF;   
+
+
+   IIint = CALLPROC check_for_duplicates(code_in = :II_product_code,
+                     start   = :II_start_date,
+                     stop    = :II_stop_date);
+   
+   
+   IF IIint != 0 THEN
+      RESUME;
+   ENDIF;
+
+
+   INQUIRE_FORMS TABLE '' (IIint = LASTROW);
+   
+   IF IIint = 0 THEN
+   
+      LOADTABLE product_table
+        (product_code     = '',
+         description      = '',
+         qty              = 0,
+         period_no        = 0,
+         period           = '',
+         special_price    = 0,
+         discount         = 0,
+         charge_branch    = '',
+         start_date       = '',
+         stop_date        = '',
+         comments         = '',
+         authorisation_no = 0,          
+         reason_no        = 0,         
+         last_update      = '');       
+         
+   ELSE    
+
+      INSERTROW product_table
+        (product_code     = '',
+         description      = '',
+         qty              = 0,
+         period_no        = 0,
+         period           = '',
+         special_price    = 0,
+         discount         = 0,
+         charge_branch    = '',
+         start_date       = '',
+         stop_date        = '',
+         comments         = '',
+         authorisation_no = 0,          
+         reason_no        = 0,         
+         last_update      = '');       
+         
+   ENDIF;
+
+   product_table.product_code     = :II_product_code;
+   product_table.description      = left(:II_product_desc,35);
+   product_table.qty              = :II_qty;
+   product_table.period_no        = :II_charge_period;
+   product_table.period           = :II_charge_period_desc;
+   product_table.special_price    = :II_special_price;
+   product_table.discount         = :II_discount;
+   product_table.charge_branch    = :II_charge_branch;
+   product_table.start_date       = :II_start_date;
+   product_table.stop_date        = :II_stop_date;
+   product_table.comments         = :II_comments;
+   product_table.authorisation_no = :II_authorisation_no;          
+   product_table.reason_no        = :II_reason_no;
+   product_table.last_update      = :II_last_update;
+   product_table.row_amended      = 1;
+
+
+   IF II_special_price = 0 AND II_discount = 0 THEN
+      product_table.price = :II_price;
+   ELSEIF II_discount = 0 THEN
+      product_table.price = :II_special_price;
+   ELSE
+      product_table.price = II_price - ((II_price * II_discount) / 100);
+   ENDIF;   
+
+   RESUME
+}   
+/* AL - No longer required. Will not work in it's present state if it is
+** ever required again.
+'Group', KEY FRSKEY14 =
+{
+    IF branch_id = '' OR account_no = '' THEN
+        MESSAGE 'You have not selected an account' WITH STYLE = POPUP;
+        RESUME FIELD branch_id;
+    ENDIF;   
+
+    IF group_no = '' THEN
+        MESSAGE 'This account is not a group account' WITH STYLE = POPUP;
+        RESUME;
+    ENDIF;   
+
+    IIint = ArrayAllRows(account_array);
+   
+    IF IIint = 0 THEN
+        MESSAGE 'No accounts on the system for group ' + 
+                TRIM(char(:group_no)) WITH STYLE = POPUP;
+        RESUME;
+    ENDIF;   
+
+    IF gv_branch_id != '409V' AND gv_branch_id != '001B' AND 
+       gv_branch_id != '607T' 
+    THEN
+        MESSAGE 'You are not allowed to apply these changes to all group ' +
+                trim(char(:group_no)) + ' accounts.' WITH STYLE = POPUP;
+        RESUME;
+    ENDIF;   
+
+    IIint = CALLPROC check_for_changes();
+   
+    IF IIint = 0 THEN
+        MESSAGE 'No changes have been made' WITH STYLE = POPUP;
+        RESUME;
+    ENDIF;   
+
+    IIchar = '';
+   
+    WHILE (UPPERCASE(IIchar) != 'Y') AND (UPPERCASE(IIchar) != 'N')
+    DO
+        IIchar = PROMPT 'Request to apply these changes to all the group ' +
+                        TRIM(char(:group_no)) + ' accounts.              ' +
+                        'Are you sure ? (Y/N).' WITH STYLE = POPUP;
+          
+    ENDWHILE;
+          
+    IF (UPPERCASE(IIchar) = 'N') THEN                  
+        RESUME FIELD branch_id;
+    ENDIF;   
+
+    group_sw = 1;
+   
+    IIint = CALLPROC process_group();
+   
+    IF IIint != 0 THEN
+        ROLLBACK;
+        RESUME;
+    ENDIF;
+    COMMIT;
+   
+    IIint = CALLPROC p_clear();
+
+    group_sw = 0;   
+   
+    RESUME FIELD branch_id;
+}
+*/
+
+'UDI', KEY FRSKEY11 =
+{
+    INQUIRE_FORMS FORM (IIchar = FIELD);
+    
+    IF IIchar != 'account_no' THEN
+        MESSAGE 'Must be on Account No. field to use this function.'
+                WITH STYLE = POPUP;
+        RESUME;
+    ENDIF;
+
+    IIint = CALLFRAME udi_popup
+                    ( branch_id = branch_id,
+                      udi_name  = BYREF(:II_udi_name));
+    IF IIint != 0 THEN
+        RESUME;
+    ENDIF;
+
+    SET_FORMS FRS(MAP(FRSKEY9)='pf12');
+    SET_FORMS FRS(LABEL(FRSKEY9)='F12');
+
+    IIint = CALLFRAME LOOK_UP
+                    ( II_QUERY = SELECT account_no,
+                                        udi_name
+                                 FROM sales_accts
+                                 WHERE branch   = :branch_id
+                                   AND udi_name LIKE :II_udi_name;
+
+                      account_no = BYREF(hf_account),
+                      II_FIELD1 = 'account_no',
+                      II_FIELD2 = 'udi_name',
+                      II_FIELD_TITLE1 = 'Account No',
+                      II_FIELD_TITLE2 = 'UDI Name',
+                      II_ROWS   = 14,
+                      II_STARTROW    = 4,
+                      II_STARTCOLUMN = 14);
+
+    IIint1 = CALLPROC check_ingres_error(proc_no = 10); 
+    COMMIT;
+
+    SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+    SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+    SET_FORMS FRS(MAP(FRSKEY9)='pf5');
+    SET_FORMS FRS(LABEL(FRSKEY9)='F5');
+
+    IF IIint1 != 0 THEN
+       RESUME;
+    ENDIF;   
+    
+    IF IIint = 0 THEN
+        RESUME;
+    ENDIF;
+
+    account_no = LEFT(hf_account, 8);
+    IIint = CALLPROC v_account();
+    
+    IF IIint != 0 THEN
+        RESUME FIELD branch_id;
+    ENDIF;
+
+    SET_FORMS FORM (CHANGE = 0);
+    date = DATE('NOW');
+    RESUME NEXT;
+}
+
+
+'Undo', KEY FRSKEY13 =
+BEGIN
+
+   IF branch_id = '' OR account_no = '' THEN
+      MESSAGE 'You have not selected an account'
+      WITH STYLE = POPUP;
+      RESUME FIELD branch_id;
+   ENDIF;   
+
+   IIint = CALLPROC check_for_changes();
+
+   IF IIint = 0 THEN
+      MESSAGE 'No changes to undo.'
+      WITH STYLE = POPUP;
+      RESUME FIELD branch_id;
+   ENDIF;   
+
+   IIchar = '';
+   
+   WHILE (UPPERCASE(IIchar) != 'Y') AND (UPPERCASE(IIchar) != 'N')
+      DO
+      
+     IIchar = PROMPT
+          'Request to undo changes made since the last save. ' +
+          'Are you sure ? (Y/N).'
+          WITH STYLE = POPUP;
+          
+   ENDWHILE;
+          
+   IF (UPPERCASE(IIchar) = 'N') THEN                  
+      RESUME FIELD branch_id;
+   ENDIF;   
+
+   IIint = CALLPROC retrieve_products();
+
+   RESUME;
+
+END
+
+
+'Choices', KEY FRSKEY10 =
+BEGIN
+
+    SET_FORMS FRS(MAP(FRSKEY9)='pf12');
+    SET_FORMS FRS(LABEL(FRSKEY9)='F12');
+
+
+    IIchar = '';
+
+    INQUIRE_FORMS FORM (IIchar = FIELD);
+    
+    IF IIchar = 'branch_id' THEN
+
+    IIint = CALLFRAME LOOK_UP
+        (II_QUERY = SELECT branch_id,
+                   name
+                  FROM branch
+                 WHERE type != 6
+                   AND closed_mkr = 'N'; 
+         branch_id = BYREF(branch_id),
+         II_FIELD1 = 'branch_id',
+         II_FIELD2 = 'name',
+         II_FIELD_TITLE1 = 'Branch Id',
+         II_FIELD_TITLE2 = 'Branch Name',
+         II_ROWS   = 14);
+    REDISPLAY;
+
+    ELSE
+    
+    MESSAGE 'Function not available on this field'
+    WITH STYLE = POPUP;
+    
+    SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+    SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+    SET_FORMS FRS(MAP(FRSKEY9)='pf5');
+    SET_FORMS FRS(LABEL(FRSKEY9)='F5');
+    
+    RESUME;
+    
+    ENDIF;
+
+    SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+    SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+    SET_FORMS FRS(MAP(FRSKEY9)='pf5');
+    SET_FORMS FRS(LABEL(FRSKEY9)='F5');
+
+
+    IF IIint = 0 THEN
+    RESUME;
+    ENDIF;
+
+    IF IIchar = 'branch_id' THEN
+       RESUME FIELD account_no;
+    ENDIF;
+    
+END
+
+
+
+'End', KEY FRSKEY3 =
+{
+    IF branch_id = '' OR account_no = '' THEN
+        RETURN;
+    ENDIF;   
+
+    IF gv_branch_id != '409V' AND gv_branch_id != '001B' AND 
+       gv_branch_id != '607T' 
+    THEN
+        IIint = CALLPROC p_clear();
+        RESUME FIELD branch_id;
+    ENDIF;   
+
+    IIint = CALLPROC check_for_changes();
+   
+    IF IIint = 0 THEN
+        IIint = CALLPROC p_clear();
+        RESUME FIELD branch_id;
+    ENDIF;   
+
+    IIint = CALLPROC update_dbase();
+   
+    IF IIint != 0 THEN
+        ROLLBACK;
+        RESUME;
+    ENDIF;
+    COMMIT;
+
+    IIint = CALLPROC p_clear();
+    RESUME FIELD branch_id;
+}
+
+
+/***************************************
+** Procedure to validate entered branch
+****************************************/
+PROCEDURE v_branch()=
+DECLARE 
+
+   RESULT    = INTEGER;
+   hf_closed_mkr = CHAR(1);
+   
+BEGIN
+
+    IF branch_id = '' THEN
+    MESSAGE 'This field is mandatory' WITH STYLE = POPUP;
+    RETURN 1;
+    ENDIF;
+    
+    /******************************************
+    ** Check entered branch exists on database
+    *******************************************/
+
+    SELECT hf_closed_mkr = closed_mkr
+      FROM branch
+     WHERE branch_id = :branch_id
+       AND type != 6;
+
+    RESULT = CALLPROC check_ingres_error(proc_no = 20);
+
+    COMMIT;
+    
+    IF RESULT != 0 THEN
+    RETURN 1;
+    ENDIF;
+
+    IF IIrowcount < 1 THEN
+    MESSAGE 'This is not a valid branch' WITH STYLE = POPUP;
+    RETURN 1;
+    ENDIF;
+
+    IF hf_closed_mkr != 'N' THEN
+       MESSAGE 'This branch has been closed'
+       WITH STYLE = POPUP;
+       RETURN 1;
+    ENDIF;
+
+
+    RETURN 0;
+    
+END
+
+
+
+/***********************************************
+** Procedure to validate entered account number
+***********************************************/
+PROCEDURE v_account()=
+DECLARE
+
+   RESULT    = INTEGER;
+   hf_temp   = CHAR(9) NOT NULL;
+   hf_status = CHAR NOT NULL;
+   
+BEGIN
+
+    IF account_no = '' THEN
+    MESSAGE 'This field is mandatory' WITH STYLE = POPUP;
+    CLEAR FIELD account_check;
+    RETURN 1;
+    ENDIF;
+
+    /**********************************************
+    ** Call procedure to calculate the check digit
+    **********************************************/
+
+    hf_account = account_no;
+
+    IIint = CALLPROC saccts_check_char(BYREF(hf_account));
+
+    account_check = CHAREXTRACT(hf_account,9);
+
+    RESULT = CALLPROC retrieve_saccts();
+
+    IF RESULT != 0 THEN
+       RETURN 1;
+    ENDIF;   
+
+    RESULT = CALLPROC retrieve_products();
+
+    IF RESULT != 0 THEN
+       RETURN 1;
+    ENDIF;   
+
+    SET_FORMS FIELD '' (DISPLAYONLY(branch_id)  = 1,
+            DISPLAYONLY(account_no) = 1);
+    RETURN 0;
+    
+END    
+    
+
+
+/***********************************************
+** Procedure to retrieve salesaccount details
+***********************************************/
+PROCEDURE retrieve_saccts()=
+DECLARE
+
+   RESULT         = INTEGER;
+   discount_int   = INTEGER NOT NULL;
+   discount_float = FLOAT4  NOT NULL;
+   hf_del_mkr     = CHAR(1);
+   stop_warn      = CHAR(1);
+   
+BEGIN
+
+    SELECT stop_warn        = stop_warn,
+       udi_name         = udi_name,
+       due_for_del      = IFNULL(del_date,''),
+       hf_del_mkr       = due_for_del,
+       name             = addr_line1,
+       address1         = addr_line2,
+       address2         = addr_line3,
+       address3         = addr_line4,
+       post_code        = post_code,
+       udi_name         = udi_name,
+       tel_no           = tel_no,
+       group_no         = custgroup_no,
+       custype_no       = custype_no,
+       vant_date        = vantage_date
+      FROM sales_accts
+     WHERE branch     = :branch_id
+       AND account_no = :hf_account;
+    
+    RESULT = CALLPROC check_ingres_error(proc_no = 30);
+
+    COMMIT;
+    
+    IF RESULT != 0 THEN
+       RETURN 1;
+    ENDIF;   
+
+    IF IIrowcount = 0 THEN
+       MESSAGE 'This account is not on the system'
+       WITH STYLE = POPUP;
+       CLEAR FIELD account_check;
+       RETURN 1;
+    ENDIF;   
+
+    IF hf_del_mkr = 'Y' THEN
+       screen_message = 'DUE FOR DELETION';
+    ELSE
+       CLEAR FIELD screen_message;   
+    ENDIF;    
+
+    IF stop_warn = 'S' THEN
+       status = 'STOP';
+    ELSEIF stop_warn = 'W' THEN
+       status = 'WARN';
+    ELSE
+       status = 'FREE';
+    ENDIF;
+
+
+    IF custype_no = 0 THEN
+       CLEAR FIELD custype_no, custype_desc;
+    ELSE;   
+       /*************************************
+       *  obtain customer type description
+       **************************************/
+       SELECT custype_desc = custype
+     FROM cust_types 
+    WHERE custype_no = :custype_no;
+
+       RESULT = CALLPROC check_ingres_error(proc_no = 40);
+
+       COMMIT;
+    
+       IF RESULT != 0 THEN
+      RETURN 1;
+       ENDIF;   
+
+    ENDIF;
+
+
+    IF group_no = 0 THEN
+       CLEAR FIELD group_no, group_desc;
+       RETURN 0;
+    ENDIF;           
+
+    /*************************************
+    *  obtain customer group description
+    **************************************/
+    
+    SELECT group_desc = custgroup_name
+      FROM cust_groups 
+     WHERE custgroup_no = :group_no;
+
+    RESULT = CALLPROC check_ingres_error(proc_no = 50);
+
+    COMMIT;
+    
+    IF RESULT != 0 THEN
+       RETURN 1;
+    ENDIF;   
+
+
+    /*******************************************************************
+    *  Retrieve and store all accounts with the same cust. group no.
+    *  02-11-95 Do not include due for deletion accounts.
+    ********************************************************************/
+    account_array = SELECT branch = branch,
+               account_no = account_no
+              FROM sales_accts
+             WHERE custgroup_no = :group_no
+               AND due_for_del != 'Y';       
+
+    RESULT = CALLPROC check_ingres_error(proc_no = 60);
+
+    COMMIT;
+    
+    IF RESULT != 0 THEN
+       RETURN 1;
+    ENDIF;   
+
+    
+    RETURN 0;
+    
+END    
+    
+
+/***********************************************
+** Procedure to retrieve charge product codes
+************************************************/
+PROCEDURE retrieve_products()=
+DECLARE
+   
+   RESULT = INTEGER;
+   
+BEGIN
+
+   INITTABLE product_table 'UPDATE';
+
+   product_table = SELECT product_code     = ac.product_code
+                        , special_price    = ac.special_price
+                        , discount         = ac.discount
+                        , price            = pv.man_trade_price
+                        , qty              = ac.qty
+                        , period_no        = ac.period_no 
+                        , start_date       = ac.start_date
+                        , stop_date        = ac.stop_date
+                        , charge_branch    = ac.charge_branch
+                        , authorisation_no = ac.authorisation_no
+                        , reason_no        = ac.reason_no
+                        , comments         = ac.comments       
+                        , last_update      = ac.last_update
+                        , insert_date      = ac.insert_date
+                        , description      = left(pv.description,13)
+                        , trade_price      = pv.man_trade_price
+                        , period           = acp.period_desc
+                   FROM   auto_charging ac
+                        , auto_charging_period acp
+                        , product_view pv
+                   WHERE  ac.branch_id      = :branch_id
+                   AND    ac.account_no     = :hf_account
+                   AND    ac.product_code   = pv.product_code
+                   AND    ac.period_no      = acp.period_no
+                   AND    pv.umbrella_group = :II_umbrella_group
+                   ORDER BY 1,6;             
+
+   RESULT = CALLPROC check_ingres_error(proc_no = 70);
+   
+   COMMIT;
+    
+   IF RESULT != 0 THEN
+      RETURN 1;
+   ENDIF;   
+
+   UNLOADTABLE product_table
+      BEGIN
+      
+     product_table.row_amended = 0;
+
+     IF product_table.special_price = 0 AND product_table.discount = 0 THEN
+        product_table.price = product_table.trade_price;
+     ELSEIF product_table.discount = 0 THEN
+        product_table.price = product_table.special_price;
+     ELSE
+        product_table.price = product_table.trade_price - ((product_table.trade_price * product_table.discount) / 100);
+     ENDIF;   
+
+      END;   
+
+   RETURN 0;
+
+END
+
+
+
+/**************************************************************
+** Procedure to check for changes to customer's product codes
+***************************************************************/
+PROCEDURE check_for_changes()=
+DECLARE
+   
+   RESULT = INTEGER;
+   hf_state = INTEGER;
+   
+BEGIN
+
+   RESULT = 0;
+   
+   UNLOADTABLE product_table (hf_state = _STATE)
+      
+      BEGIN
+      
+     IF hf_state = 4 OR product_table.row_amended = 1 THEN
+       
+        RESULT = 1;
+        
+     ENDIF;
+     
+     IF RESULT != 0 THEN
+     
+        ENDLOOP;
+        
+     ENDIF;
+     
+      END;          
+
+   
+   RETURN RESULT;
+
+END
+
+
+
+/***********************************************
+** Procedure to update the database
+************************************************/
+PROCEDURE update_dbase()=
+DECLARE
+   
+   RESULT = INTEGER;
+   hf_state = INTEGER;
+   
+BEGIN
+
+   RESULT = 0;
+
+   MESSAGE 'Updating codes for ' + :branch_id + ' ' + :hf_account;
+   SLEEP 2;
+
+   
+   UNLOADTABLE product_table (hf_state = _STATE)
+   { 
+     IF hf_state = 4 THEN
+
+        RESULT = CALLPROC delete_from_table
+                   ( product_code = product_table.product_code
+                   , start_date   = product_table.start_date
+                   , insert_date  = product_table.insert_date
+                   );
+
+     ELSEIF (hf_state = 3) OR (product_table.row_amended = 1) THEN
+       
+        RESULT = CALLPROC update_table
+                   ( product_code     = product_table.product_code
+                   , special_price    = product_table.special_price
+                   , discount         = product_table.discount
+                   , qty              = product_table.qty
+                   , period_no        = product_table.period_no
+                   , start_date       = product_table.start_date
+                   , stop_date        = product_table.stop_date
+                   , charge_branch    = product_table.charge_branch
+                   , authorisation_no = product_table.authorisation_no
+                   , reason_no        = product_table.reason_no
+                   , comments         = product_table.comments
+                   , last_update      = product_table.last_update
+                   , insert_date      = product_table.insert_date
+                   );
+
+     ENDIF;
+     
+     IF RESULT != 0 THEN
+     
+        ENDLOOP;
+        
+     ENDIF;
+   };
+   
+   RETURN RESULT;
+
+END
+
+
+
+/************************************************
+** Procedure to update the auto charging tables
+*************************************************/
+PROCEDURE update_table ( product_code     = CHAR(8)
+                       , special_price    = FLOAT8
+                       , discount         = FLOAT8
+                       , qty              = INTEGER
+                       , period_no        = INTEGER1
+                       , start_date       = DATE
+                       , stop_date        = DATE 
+                       , charge_branch    = CHAR(4)
+                       , authorisation_no = INTEGER1
+                       , reason_no        = INTEGER1
+                       , comments         = CHAR(50)
+                       , last_update      = DATE
+                       , insert_date      = DATE
+                       )=
+DECLARE
+
+   RESULT   = INTEGER;
+   hf_product_code = CHAR(8);
+   
+BEGIN
+
+   SELECT hf_product_code = product_code 
+   FROM   auto_charging
+   WHERE  branch_id    = :branch_id
+   AND    account_no   = :hf_account
+   AND    product_code = :product_code
+   AND    start_date   = :start_date
+   AND    insert_date  = :insert_date;  
+
+   RESULT = CALLPROC check_ingres_error(proc_no = 80);
+   
+   IF RESULT != 0 THEN
+      RETURN 1;
+   ENDIF;   
+
+   IF IIrowcount = 0 THEN
+      RESULT = CALLPROC insert_row
+                 ( branch           = :branch_id
+                 , account_no       = :hf_account
+                 , product_code     = :product_code
+                 , special_price    = :special_price
+                 , discount         = :discount
+                 , qty              = :qty
+                 , period_no        = :period_no
+                 , start_date       = :start_date
+                 , stop_date        = :stop_date
+                 , charge_branch    = :charge_branch
+                 , authorisation_no = :authorisation_no
+                 , reason_no        = :reason_no
+                 , comments         = :comments
+                 );       
+
+      /* AL - allow 1 second difference before next insert so insert_date
+      ** can be used with product, branch, and account to identify rows for
+      ** future updates.
+      */
+      SLEEP 1; 
+   ELSE
+      RESULT = CALLPROC amend_row
+                 ( branch           = :branch_id
+                 , account_no       = :hf_account
+                 , product_code     = :product_code
+                 , special_price    = :special_price
+                 , discount         = :discount
+                 , qty              = :qty
+                 , period_no        = :period_no
+                 , start_date       = :start_date
+                 , stop_date        = :stop_date
+                 , charge_branch    = :charge_branch
+                 , authorisation_no = :authorisation_no
+                 , reason_no        = :reason_no
+                 , comments         = :comments
+                 , last_update      = :last_update
+                 , insert_date      = :insert_date
+                 );
+   ENDIF;
+   
+   RETURN RESULT;
+
+END
+
+
+
+/******************************
+** Procedure to insert row
+*******************************/
+PROCEDURE insert_row(branch           = CHAR(4),
+             account_no       = CHAR(9),
+             product_code     = CHAR(8),
+             special_price    = FLOAT8,
+             discount         = FLOAT8,
+             qty              = INTEGER,    
+             period_no        = INTEGER1,
+             start_date       = DATE,
+             stop_date        = DATE, 
+             charge_branch    = CHAR(4),
+             authorisation_no = INTEGER1,
+             reason_no        = INTEGER1,
+             comments         = CHAR(50))=
+DECLARE
+
+   RESULT   = INTEGER;
+   
+BEGIN
+
+   INSERT INTO auto_charging
+           (branch_id,
+        account_no,
+        product_code,     
+        special_price,
+        discount,    
+        qty,                  
+        period_no,        
+        start_date,       
+        stop_date,         
+        charge_branch,    
+        authorisation_no, 
+        reason_no,        
+        comments,
+        insert_date,
+        last_update,
+        user_branch,
+        user_id)
+    VALUES (:branch,
+        :account_no,
+        :product_code,
+        :special_price,
+        :discount,
+        :qty,
+        :period_no,
+        :start_date,
+        :stop_date,
+        :charge_branch,
+        :authorisation_no,
+        :reason_no,
+        :comments,
+        DATE('NOW'),
+        DATE('NOW'),
+        :gv_branch_id,
+        :gv_user_id);                 
+
+   RESULT = CALLPROC check_ingres_error(proc_no = 90);
+   
+   RETURN RESULT;
+
+END
+
+
+
+/******************************
+** Procedure to amend row
+*******************************/
+PROCEDURE amend_row( branch           = CHAR(4)
+                   , account_no       = CHAR(9)
+                   , product_code     = CHAR(8)
+                   , special_price    = FLOAT8
+                   , discount         = FLOAT8
+                   , qty              = INTEGER
+                   , period_no        = INTEGER1
+                   , start_date       = DATE
+                   , stop_date        = DATE
+                   , charge_branch    = CHAR(4)
+                   , authorisation_no = INTEGER1
+                   , reason_no        = INTEGER1
+                   , comments         = CHAR(50)
+                   , last_update      = DATE
+                   , insert_date      = DATE
+                   )=
+DECLARE
+
+   RESULT    = INTEGER;
+   date_hold = DATE;
+   
+BEGIN
+
+   SELECT date_hold = last_update
+     FROM auto_charging
+    WHERE branch_id    = :branch
+      AND account_no   = :account_no
+      AND product_code = :product_code
+      AND start_date   = :start_date
+      AND insert_date  = :insert_date;    
+
+   RESULT = CALLPROC check_ingres_error(proc_no = 100);
+
+   IF RESULT != 0 THEN
+      RETURN 1;
+   ENDIF;
+
+   IF group_sw = 0 THEN
+   
+     IF date_hold != :last_update THEN   
+     MESSAGE 'While these account details have been displayed on your screen, ' +
+         'they have been updated by another user. ' +
+         'To maintain data integrity, this save has been abandoned.'
+     WITH STYLE = POPUP;
+     RESULT = CALLPROC p_clear();
+     RETURN 1;
+     ENDIF;      
+     
+   ENDIF;
+
+   UPDATE auto_charging
+      SET special_price    = :special_price
+        , discount         = :discount
+        , qty              = :qty
+        , period_no        = :period_no
+        , start_date       = :start_date
+        , stop_date        = :stop_date
+        , charge_branch    = :charge_branch
+        , authorisation_no = :authorisation_no
+        , reason_no        = :reason_no
+        , comments         = :comments
+        , last_update      = DATE('NOW') 
+        , user_branch      = :gv_branch_id
+        , user_id          = :gv_user_id
+    WHERE branch_id        = :branch
+      AND account_no       = :account_no
+      AND product_code     = :product_code
+      AND start_date       = :start_date
+      AND insert_date      = :insert_date;    
+
+   RESULT = CALLPROC check_ingres_error(proc_no = 101);
+   
+   RETURN RESULT;
+
+END
+
+
+
+/******************************
+** Procedure to delete a row
+*******************************/
+PROCEDURE delete_from_table( product_code = CHAR(8)
+                           , start_date   = DATE
+                           , insert_date  = DATE
+                           )=
+DECLARE
+
+   RESULT    = INTEGER;
+   
+BEGIN
+
+   DELETE FROM auto_charging
+   WHERE  branch_id    = :branch_id
+   AND    account_no   = :hf_account
+   AND    product_code = :product_code
+   AND    start_date   = :start_date
+   AND    insert_date  = :insert_date;    
+
+   RESULT = CALLPROC check_ingres_error(proc_no = 102);
+   
+   RETURN RESULT;
+
+END
+
+
+
+/***************************************************************
+** Procedure to apply changes to all accounts in the group.
+****************************************************************/
+PROCEDURE process_group()=
+DECLARE
+
+   RESULT   = INTEGER;
+   hf_state = INTEGER;
+   
+BEGIN
+
+   MESSAGE 'Updating codes for all group ' +
+       trim(char(:group_no)) + ' accounts.';
+   SLEEP 2;
+
+   UNLOADTABLE product_table (hf_state = _STATE)
+      
+      BEGIN
+
+     IF hf_state = 4 THEN
+
+           RESULT = CALLPROC delete_from_group_accounts
+                      ( product_code = product_table.product_code
+                      , start_date   = product_table.start_date
+                      );     
+
+     ELSEIF (hf_state = 3) OR (product_table.row_amended = 1) THEN
+
+           RESULT = CALLPROC update_group_accounts
+                     ( product_code     = product_table.product_code
+                     , special_price    = product_table.special_price
+                     , discount         = product_table.discount
+                     , qty              = product_table.qty
+                     , period_no        = product_table.period_no
+                     , start_date       = product_table.start_date 
+                     , stop_date        = product_table.stop_date
+                     , charge_branch    = product_table.charge_branch
+                     , authorisation_no = product_table.authorisation_no
+                     , reason_no        = product_table.reason_no
+                     , comments         = product_table.comments
+                     , last_update      = product_table.last_update
+                     );
+     ENDIF;
+     
+     IF RESULT != 0 THEN
+     
+        ENDLOOP;
+        
+     ENDIF;
+     
+      END;          
+   
+   RETURN RESULT;
+
+END
+
+
+
+/*******************************************************************
+** Procedure to update the auto charging tables for group accounts
+********************************************************************/
+PROCEDURE update_group_accounts(product_code     = CHAR(8),
+                special_price    = FLOAT8,
+                discount         = FLOAT8,
+                qty              = INTEGER,    
+                period_no        = INTEGER1,
+                start_date       = DATE,
+                stop_date        = DATE, 
+                charge_branch    = CHAR(4),
+                authorisation_no = INTEGER1,
+                reason_no        = INTEGER1,
+                comments         = CHAR(50),
+                last_update      = DATE)=
+DECLARE
+
+   RESULT          = INTEGER;
+   no_of_accounts  = INTEGER;
+   acct_count      = INTEGER;
+   hf_update_type  = CHAR(6);
+   hf_product_code = CHAR(8);
+   
+BEGIN
+
+   /***********************************
+   ** Update host account
+   ************************************/
+
+   SELECT hf_product_code = product_code 
+     FROM auto_charging
+    WHERE branch_id = :branch_id
+      AND account_no = :hf_account
+      AND product_code = :product_code
+      AND start_date = :start_date;
+
+   RESULT = CALLPROC check_ingres_error(proc_no = 110);
+   
+   IF RESULT != 0 THEN
+      RETURN 1;
+   ENDIF;   
+
+   IF IIrowcount = 0 THEN
+   
+      hf_update_type = 'INSERT';  
+      
+      RESULT = CALLPROC insert_row(branch           = :branch_id,
+                   account_no       = :hf_account,
+                   product_code     = :product_code,   
+                   special_price    = :special_price,
+                   discount         = :discount,  
+                   qty              = :qty,            
+                   period_no        = :period_no,       
+                   start_date       = :start_date,     
+                   stop_date        = :stop_date,      
+                   charge_branch    = :charge_branch,
+                   authorisation_no = :authorisation_no,
+                   reason_no        = :reason_no,  
+                   comments         = :comments);       
+                   
+   ELSE
+   
+      hf_update_type = 'AMEND';
+      
+      RESULT = CALLPROC amend_row(branch           = :branch_id,
+                  account_no       = :hf_account,
+                  product_code     = :product_code,   
+                  special_price    = :special_price,
+                  discount         = :discount,  
+                  qty              = :qty,            
+                  period_no        = :period_no,       
+                  start_date       = :start_date,     
+                  stop_date        = :stop_date,      
+                  charge_branch    = :charge_branch,
+                  authorisation_no = :authorisation_no,
+                  reason_no        = :reason_no,  
+                  comments         = :comments,       
+                  last_update      = :last_update);
+                  
+   ENDIF;
+
+
+   /********************************
+   ** Update other group accounts
+   *********************************/
+
+   acct_count = 0;
+
+   no_of_accounts = ArrayAllRows(account_array);
+    
+   WHILE acct_count < no_of_accounts
+      DO
+         
+     acct_count = acct_count + 1;
+
+     IF account_array[acct_count].branch != branch_id OR account_array[acct_count].account_no != hf_account THEN
+
+        RESULT = CALLPROC process_account_product(update_type      = :hf_update_type,
+                              branch           = :account_array[acct_count].branch,
+                              account_no       = :account_array[acct_count].account_no,
+                              product_code     = :product_code,   
+                              special_price    = :special_price,
+                              discount         = :discount,  
+                              qty              = :qty,            
+                              period_no        = :period_no,       
+                              start_date       = :start_date,     
+                              stop_date        = :stop_date,      
+                              charge_branch    = :charge_branch,
+                              authorisation_no = :authorisation_no,
+                              reason_no        = :reason_no,  
+                              comments         = :comments);       
+     ENDIF;   
+        
+     IF RESULT != 0 THEN
+        acct_count = no_of_accounts;
+     ENDIF;      
+                           
+   ENDWHILE;                                                   
+                           
+   
+   RETURN RESULT;
+
+END
+
+
+
+/*************************************************************
+** Procedure to process a product for a group account
+**************************************************************/
+PROCEDURE process_account_product(update_type      = CHAR(6),  
+                  branch           = CHAR(4),
+                  account_no       = CHAR(9), 
+                  product_code     = CHAR(8),
+                  special_price    = FLOAT8,
+                  discount         = FLOAT8,
+                  qty              = INTEGER,    
+                  period_no        = INTEGER1,
+                  start_date       = DATE,
+                  stop_date        = DATE, 
+                  charge_branch    = CHAR(4),
+                  authorisation_no = INTEGER1,
+                  reason_no        = INTEGER1,
+                  comments         = CHAR(50),
+                  last_update      = DATE)=
+DECLARE
+
+   RESULT   = INTEGER;
+   hf_product_code = CHAR(8);
+
+BEGIN
+
+   SELECT hf_product_code = product_code 
+     FROM auto_charging
+    WHERE branch_id = :branch
+      AND account_no = :account_no
+      AND product_code = :product_code
+      AND start_date = :start_date;
+
+   RESULT = CALLPROC check_ingres_error(proc_no = 120);
+   
+   IF RESULT != 0 THEN
+      RETURN 1;
+   ENDIF;   
+
+   IF IIrowcount = 0 AND update_type = 'INSERT' THEN
+   
+      RESULT = CALLPROC insert_row(branch           = :branch,
+                   account_no       = :account_no,
+                   product_code     = :product_code,   
+                   special_price    = :special_price,
+                   discount         = :discount,  
+                   qty              = :qty,            
+                   period_no        = :period_no,       
+                   start_date       = :start_date,     
+                   stop_date        = :stop_date,      
+                   charge_branch    = :charge_branch,
+                   authorisation_no = :authorisation_no,
+                   reason_no        = :reason_no,  
+                   comments         = :comments);       
+   ELSEIF IIrowcount > 0 AND update_type = 'AMEND' THEN
+   
+      RESULT = CALLPROC amend_row(branch           = :branch,
+                  account_no       = :account_no,
+                  product_code     = :product_code,   
+                  special_price    = :special_price,
+                  discount         = :discount,  
+                  qty              = :qty,            
+                  period_no        = :period_no,       
+                  start_date       = :start_date,     
+                  stop_date        = :stop_date,      
+                  charge_branch    = :charge_branch,
+                  authorisation_no = :authorisation_no,
+                  reason_no        = :reason_no,  
+                  comments         = :comments,       
+                  last_update      = :last_update);
+   ENDIF;
+   
+   RETURN RESULT;
+
+END
+
+
+
+/***********************************************************************
+** Procedure to delete from the auto charging tables for group accounts
+************************************************************************/
+PROCEDURE delete_from_group_accounts(product_code = CHAR(8),
+                     start_date   = DATE)=
+DECLARE
+
+   RESULT          = INTEGER;
+   no_of_accounts  = INTEGER;
+   acct_count      = INTEGER;
+   
+BEGIN
+
+   /***********************************
+   ** Delete from host account
+   ************************************/
+
+   DELETE FROM auto_charging
+    WHERE branch_id = :branch_id
+      AND account_no = :hf_account
+      AND product_code = :product_code
+      AND start_date = :start_date;    
+
+   RESULT = CALLPROC check_ingres_error(proc_no = 121);
+
+   IF RESULT != 0 THEN
+      RETURN 1;
+   ENDIF;   
+
+   /********************************
+   ** Update other group accounts
+   *********************************/
+
+   acct_count = 0;
+
+   no_of_accounts = ArrayAllRows(account_array);
+
+    
+   WHILE acct_count < no_of_accounts
+      DO
+         
+     acct_count = acct_count + 1;
+
+     IF account_array[acct_count].branch != branch_id OR account_array[acct_count].account_no != hf_account THEN
+
+        DELETE FROM auto_charging
+         WHERE branch_id = :account_array[acct_count].branch
+           AND account_no = :account_array[acct_count].account_no
+           AND product_code = :product_code
+           AND start_date = :start_date;    
+           
+        RESULT = CALLPROC check_ingres_error(proc_no = 121);
+
+     ENDIF;   
+        
+     IF RESULT != 0 THEN
+        acct_count = no_of_accounts;
+     ENDIF;      
+                           
+   ENDWHILE;                                                   
+   
+   RETURN RESULT;
+
+END
+
+
+/***************************************************************
+** Procedure to check if code already assigned to the account.
+****************************************************************/
+PROCEDURE check_for_duplicates(code_in = CHAR(8),start = DATE,stop = DATE)=
+DECLARE
+
+   RESULT   = INTEGER;
+   hf_state = INTEGER;
+   confirm  = CHAR(1) NOT NULL;
+   
+BEGIN
+
+   RESULT = 0;
+   
+   UNLOADTABLE product_table (hf_state = _STATE)
+      BEGIN
+      
+     IF hf_state != 4 AND product_table.product_code = :code_in THEN
+
+        RESULT = CALLPROC check_dates(start_in   = :start,
+                      stop_in    = :stop,
+                      start_date = :product_table.start_date,
+                      stop_date  = :product_table.stop_date);
+        
+     ENDIF;
+     
+     IF RESULT != 0 THEN
+     
+        ENDLOOP;
+        
+     ENDIF;
+     
+      END;      
+
+   IF RESULT != 0 THEN  
+      confirm = '';
+      confirm = PROMPT 'Code already used, do you want to continue? '
+                    WITH STYLE = POPUP;
+
+      IF UPPERCASE(confirm) = 'Y' THEN
+          RETURN 0;
+      ENDIF; 
+
+/*
+      MESSAGE 'Code ' + :code_in + ' has already been assigned to account ' +
+          :branch_id + ' ' + :hf_account + '. ' +
+          'The start and stop dates you have just input, overlap the ' +
+          'dates on the original entry.'
+      WITH STYLE = POPUP;
+*/
+   ENDIF;      
+        
+   RETURN RESULT;
+
+END
+
+
+
+PROCEDURE check_dates(start_in = DATE,stop_in = DATE,start_date = DATE,stop_date = DATE)=
+DECLARE
+
+   RESULT = INTEGER;
+   
+BEGIN
+
+   RESULT = 0;
+   
+   IF (stop_date IS NULL OR stop_date = '') AND (start_in >= start_date) THEN
+           
+      RESULT = 1;
+
+   ELSEIF (stop_date IS NULL OR stop_date = '') AND (stop_in >= start_date) THEN
+           
+      RESULT = 1;
+
+   ELSEIF start_in >= start_date AND stop_in <= stop_date THEN
+        
+      RESULT = 1; 
+
+   ELSEIF stop_in >= start_date AND stop_in <= stop_date THEN
+        
+      RESULT = 1; 
+
+   ELSEIF start_in >= start_date AND start_in < stop_date THEN
+        
+      RESULT = 1; 
+
+   ELSEIF (start_in <= start_date) AND (stop_in = '' OR stop_in IS NULL) THEN
+        
+      RESULT = 1; 
+      
+   ELSEIF (start_in <= start_date) AND (stop_in >= start_date) THEN
+        
+      RESULT = 1; 
+      
+   ENDIF;   
+      
+   RETURN RESULT;
+
+END
+
+
+/***************************************
+** Procedure to check ingres errors
+****************************************/
+PROCEDURE check_ingres_error(proc_no = INTEGER)=
+DECLARE
+
+   hf_errorno   = INTEGER;
+   hf_errortext = CHAR(256);
+   
+BEGIN
+
+    INQUIRE_INGRES (hf_errorno   = ERRORNO,
+            hf_errortext = ERRORTEXT,
+            IIrowcount   = ROWCOUNT);
+
+    IF hf_errorno != 0 THEN
+    MESSAGE 'INGRES ERROR ' + trim(char(:proc_no)) +
+        ' - ' + trim(char(:hf_errorno)) + ' ' + :hf_errortext 
+    WITH STYLE = POPUP;
+    RETURN 1;
+    ENDIF;
+
+    RETURN 0;
+
+END
+
+
+
+/***************************************
+** Procedure to clear screen
+****************************************/
+PROCEDURE p_clear()=
+DECLARE
+
+   RESULT = INTEGER;
+   
+BEGIN
+
+    CLEAR FIELD ALL;
+
+    SET_FORMS FIELD '' (DISPLAYONLY(branch_id)  = 0,
+            DISPLAYONLY(account_no) = 0);
+            
+    SET_FORMS FORM (CHANGE = 0);
+
+    date = DATE('NOW');
+
+    RETURN 0;
+    
+END
+

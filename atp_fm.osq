@@ -1,0 +1,240 @@
+/******************************************************************************
+*  Frame  - ATP Marker File Maintenance                          
+*  Author - A.Barratt.
+*
+*  Date   - 11.10.94
+*  Type   - Online Frame
+*
+*  Source - atp_fm.osq      
+*  Form   - atp_fm       
+*
+*  Parameters expected - None.
+*
+*******************************************************************************
+*  Version | Date     | Coded | Description of changes made
+***********|**********|*******|************************************************
+*  1.0     | 03.10.94 | AAB   | Original code
+******************************************************************************/
+
+INITIALIZE
+(
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+    IIrowcount  =  INTEGER(4) NOT NULL,
+    IIerrorno   =  INTEGER(4) NOT NULL,
+    hf_errtext  =  CHAR(256)  NOT NULL,
+
+/*******************************************************
+** FRAME SPECIFIC VARIABLES  
+*******************************************************/
+    IIint       =  INTEGER(4) NOT NULL, /* Holds procedure return values     */
+    hf_code     =  INTEGER(1) NOT NULL, /* Holds returned code from popup    */
+    hf_type     =  CHAR(3) NOT NULL,
+    IIchar1     =  CHAR(1)    NOT NULL, /* General single character variable */
+    IIchar      =  CHAR(20)   NOT NULL, /* General purpose char variable     */
+    hf_desc     =  CHAR(40)   NOT NULL, /* Holds returned desc from popup    */
+)=
+{
+    /******************************************************
+    ** Initialise form field values and set to query mode
+    *******************************************************/
+
+    date = DATE('now');
+
+    SET_FORMS FRS(TIMEOUT = :gc_timeout);
+    
+    SET_FORMS FRS (ACTIVATE(previousfield) = 1);
+
+    /*********************************************************
+    ** Set table mode to read and populate from the database
+    **********************************************************/
+
+    INITTABLE iitf 'READ';
+
+    iitf := SELECT atp_mkr        = atp_mkr,
+		   atp_type       = atp_type,
+		   description = description
+	      FROM atp_types
+	  ORDER BY 1;
+
+    /**************************
+    ** Check For INGRES Error 
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+		    hf_errtext = ERRORTEXT,
+		    IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+	ROLLBACK;
+	MESSAGE '-01- INGRES error in select ' 
+		+ :hf_errtext WITH STYLE = POPUP;
+	RETURN;
+    ENDIF;
+
+    COMMIT;
+}
+
+ON TIMEOUT =
+{
+
+    CALLFRAME timeout_popup();
+
+}
+
+
+'Help', KEY FRSKEY1=
+{
+	callproc help_proc(
+		SUBJECT='Help on ATP Marker File Maintenance Frame',
+		FILE=:gc_help_dir+'atp_fm.hlp'
+			);
+}
+
+'Insert', KEY FRSKEY9 =
+{
+    hf_code = 0;
+    hf_desc = '';
+    hf_type = '';
+
+    /************************************************
+    ** Call popup to insert new credit description
+    **************************************************/
+
+    IIint = CALLFRAME atp_fm_popup(screenmode = 'INSERT',
+					  atp_mkr        = BYREF(hf_code),
+					  atp_type       = BYREF(hf_type),
+					  description = BYREF(hf_desc));
+
+    IF IIint = 0 THEN /** New row has been inserted **/
+
+	/**********************************
+	** Reselect data into table field
+	***********************************/
+
+	INITTABLE iitf 'READ';
+
+	iitf := SELECT atp_mkr        = atp_mkr,
+		       atp_type = atp_type,
+		       description = description
+		  FROM atp_types
+	      ORDER BY 1;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-02- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN;
+	ENDIF;
+
+	COMMIT;
+
+    ELSEIF IIint = -1 THEN
+	/*******************************************************
+	** Returned -1 : INGRES Error return to calling frame 
+	********************************************************/
+	RETURN; 
+    ENDIF;
+
+    /*****************************************************************
+    ** If returned value is not 0 or -1 then insert cancelled, resume
+    ******************************************************************/
+
+    RESUME;
+}
+
+
+'Update', KEY FRSKEY4 =
+{
+    /** Set temporary description to be passed by reference **/
+
+    hf_type = ifnull(iitf.atp_type,'');
+    hf_desc = ifnull(iitf.description,''); 
+
+    /********************************************
+    ** Call popup to update credit description
+    *********************************************/
+
+    IIint = CALLFRAME atp_fm_popup(screenmode  = 'UPDATE',
+					  atp_mkr        = :iitf.atp_mkr,
+					  atp_type       = BYREF(hf_type),
+					  description = BYREF(hf_desc));
+    IF IIint = 0 THEN
+	/************************************************************
+	** Returned 0 : successful update, reset description in iitf 
+	*************************************************************/
+	iitf.description = hf_desc;
+	iitf.atp_type    = hf_type;
+    ELSEIF IIint = -1 THEN
+	/*******************************************************
+	** Returned -1 : INGRES Error return to calling frame 
+	********************************************************/
+	RETURN; 
+    ENDIF;
+
+    /*****************************************************************
+    ** If returned value is not 0 or -1 then update cancelled, resume
+    ******************************************************************/
+
+    RESUME;
+}
+
+
+'Delete', KEY FRSKEY14 =
+{
+    /***************************
+    ** Prompt for confirmation
+    ****************************/
+
+    IIchar1 = '';
+
+    WHILE UPPERCASE(IIchar1) != 'N' AND
+	  UPPERCASE(IIchar1) != 'Y' 
+    DO
+	IIchar1 = PROMPT 'Delete code ' + TRIM(CHAR(:iitf.atp_mkr)) +
+			 '.  Confirm (Y/N) ?' WITH STYLE = POPUP;
+    ENDWHILE;
+
+    IF UPPERCASE(IIchar1) = 'Y' THEN
+	/********************
+	** Delete confirmed
+	*********************/
+
+	DELETE FROM atp_types     
+	      WHERE atp_mkr = :iitf.atp_mkr
+	      AND atp_type = :iitf.atp_type;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-03- INGRES error in DELETE ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN;
+	ENDIF;
+
+	COMMIT;
+
+	DELETEROW iitf;
+    ENDIF;
+
+    RESUME;
+}
+
+
+'End', KEY FRSKEY3 =
+{
+    RETURN;
+}

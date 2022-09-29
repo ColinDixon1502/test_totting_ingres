@@ -1,0 +1,209 @@
+/******************************************************************************
+*  Frame  - Auto Charging - authorisation fm popup
+*  Author - T. Farrell.   
+*
+*  Date   - 06.02.95
+*  Type   - Online Frame
+*
+*  Source - auto_charging_auth_opup.osq
+*  Form   - auto_charging_auth_popup
+*
+*  Parameters expected - Mode (INSERT or UPDATE),
+*                        If in UPDATE mode - code and description.
+*
+*******************************************************************************
+*  Version | Date     | Coded | Description of changes made
+***********|**********|*******|************************************************
+*  1.0     | 06.02.95 |  TF    | Original code
+******************************************************************************/
+
+INITIALIZE
+(
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+    IIrowcount  =  INTEGER(4) NOT NULL,
+    IIerrorno   =  INTEGER(4) NOT NULL,
+    hf_errtext  =  CHAR(256)  NOT NULL,
+
+/*******************************************************
+** FRAME SPECIFIC VARIABLES  
+*******************************************************/
+    IIint       =  INTEGER(4) NOT NULL, /* Holds procedure return values     */
+    IIchar1     =  CHAR(1)    NOT NULL, /* General single character variable */
+    IIchar      =  CHAR(20)   NOT NULL, /* General purpose char variable     */
+    max_code    =  INTEGER(4) NOT NULL, /* Current maximum code              */
+)=
+
+BEGIN
+
+    SET_FORMS FRS (TIMEOUT = :gc_timeout);
+
+    SET_FORMS FRS (MAP(FRSKEY1) = 'pf1');
+    SET_FORMS FRS (LABEL(FRSKEY1) = 'F1');
+    SET_FORMS FRS (MAP(FRSKEY4) = 'pf11');
+    SET_FORMS FRS (LABEL(FRSKEY4) = 'F11');
+    SET_FORMS FRS (MAP(FRSKEY3) = 'pf12');
+    SET_FORMS FRS (LABEL(FRSKEY3) = 'F12');
+    
+    /******************************************************
+    ** Initialise form field values and set to query mode
+    *******************************************************/
+
+    SET_FORMS FRS (ACTIVATE(previousfield) = 1);
+    /*******************************************************/
+
+
+    IF screenmode = 'INSERT' THEN
+
+	/**********************************
+	** Select maximum value from table 
+	***********************************/
+
+	SELECT max_code = IFNULL(MAX(authorisation_no),0) + 1
+	  FROM auto_charging_authorise;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-05- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN -1;
+	ENDIF;
+
+	COMMIT;
+
+	authorisation_no = max_code;
+	
+    ENDIF;
+
+    RESUME FIELD authorisation_desc;
+
+END
+
+
+ON TIMEOUT =
+BEGIN
+
+   CALLFRAME timeout_popup();
+   
+END
+
+
+BEFORE FIELD 'authorisation_no' =
+BEGIN
+    IF screenmode = 'UPDATE' THEN
+	RESUME FIELD authorisation_desc;
+    ENDIF;
+END
+
+
+'Help', KEY FRSKEY1=
+BEGIN
+	callproc help_proc(
+		SUBJECT='Help on Auto Charging Authorisation Popup Frame',
+		FILE=
+		:gc_help_dir+'auto_charge_authorisation_popup.hlp'
+			);
+END
+
+'Save', KEY FRSKEY4 =
+BEGIN
+    IF screenmode = 'UPDATE' THEN
+
+	UPDATE auto_charging_authorise     
+	   SET authorisation_desc = :authorisation_desc
+	 WHERE authorisation_no = :authorisation_no;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-01- INGRES error in UPDATE ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN -1;
+	ENDIF;
+
+	COMMIT;
+
+    ELSEIF screenmode = 'INSERT' THEN
+
+	/**************************************
+	** Check code does not already exist
+	***************************************/
+
+	SELECT IIint = authorisation_no
+	  FROM auto_charging_authorise
+	 WHERE authorisation_no  = :authorisation_no;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-03- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN -1;
+	ENDIF;
+
+	COMMIT;
+
+	IF IIrowcount <= 0 THEN
+
+	    INSERT INTO auto_charging_authorise
+	    (
+	     authorisation_no,
+	     authorisation_desc
+	    )
+	    VALUES
+	    (
+	     :authorisation_no,
+	     :authorisation_desc
+	    );
+
+	    /**************************
+	    ** Check For INGRES Error 
+	    ***************************/
+	    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			    hf_errtext = ERRORTEXT,
+			    IIrowcount = ROWCOUNT);
+
+	    IF IIerrorno != 0 THEN
+		ROLLBACK;
+		MESSAGE '-02- INGRES error in INSERT ' 
+			+ :hf_errtext WITH STYLE = POPUP;
+		RETURN -1;
+	    ENDIF;
+
+	    COMMIT;
+	ELSE
+	    MESSAGE 'Authorisation already exists.  No data saved.' WITH STYLE = POPUP;
+	    CLEAR FIELD authorisation_desc;
+	    RESUME FIELD authorisation_desc;
+	ENDIF;
+    ENDIF;
+
+    RETURN 0;
+END
+
+
+'Cancel', KEY FRSKEY3 =
+BEGIN
+    RETURN 1;
+END
+

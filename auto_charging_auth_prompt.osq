@@ -1,0 +1,336 @@
+/******************************************************************************
+*  Frame  - Auto Charging - Authority Prompt
+*  Author - T. Farrell.   
+*
+*  Date   - 13.02.95
+*  Type   - Online Frame
+*
+*  Source - auto_charging_auth_prompt.osq
+*  Form   - auto_charging_auth_prompt
+*
+*
+*******************************************************************************
+*  Version | Date     | Coded | Description of changes made
+***********|**********|*******|************************************************
+*  1.0     | 13.02.95 |  TF   | Original code
+******************************************************************************/
+
+INITIALIZE
+(
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+    IIrowcount  =  INTEGER(4) NOT NULL,
+    IIerrorno   =  INTEGER(4) NOT NULL,
+    hf_errtext  =  CHAR(256)  NOT NULL,
+
+/*******************************************************
+** FRAME SPECIFIC VARIABLES  
+*******************************************************/
+    IIint       =  INTEGER(4) NOT NULL, /* Holds procedure return values     */
+    IIchar1     =  CHAR(1)    NOT NULL, /* General single character variable */
+    IIchar      =  CHAR(20)   NOT NULL, /* General purpose char variable     */
+    max_code    =  INTEGER(4) NOT NULL, /* Current maximum code              */
+    
+    II_authority_no  = INTEGER(1) NOT NULL,
+    II_authority     = CHAR(16)   NOT NULL,
+    II_reason_no     = INTEGER(1) NOT NULL,
+    II_reason        = CHAR(20)   NOT NULL,
+    
+)=
+
+DECLARE
+
+   v_authority_no     = PROCEDURE RETURNING INTEGER;
+   v_reason_no        = PROCEDURE RETURNING INTEGER;
+   v_screen           = PROCEDURE RETURNING CHAR;
+   check_ingres_error = PROCEDURE RETURNING INTEGER;
+
+BEGIN
+
+   SET_FORMS FRS(TIMEOUT = :gc_timeout);
+
+   SET_FORMS FRS(MAP(FRSKEY1)='pf1');
+   SET_FORMS FRS(LABEL(FRSKEY1)='F1');
+   SET_FORMS FRS(MAP(FRSKEY10)='pf10');
+   SET_FORMS FRS(LABEL(FRSKEY10)='F10');
+   SET_FORMS FRS(MAP(FRSKEY4)='pf11');
+   SET_FORMS FRS(LABEL(FRSKEY4)='F11');
+   SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+   SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+
+   CLEAR FIELD ALL;
+
+END
+
+
+AFTER FIELD 'authority_no' =
+BEGIN
+
+    IIint = CALLPROC v_authority_no();
+    
+    IF IIint != 0 THEN
+       RESUME FIELD authority_no;
+    ENDIF;
+    
+    RESUME FIELD reason_no;
+    
+END
+
+
+AFTER FIELD 'reason_no' =
+BEGIN
+
+    IIint = CALLPROC v_reason_no;
+    
+    IF IIint != 0 THEN
+       RESUME FIELD reason_no;
+    ENDIF;
+    
+END
+
+
+
+'Help', KEY FRSKEY1=
+BEGIN
+	callproc help_proc(
+		SUBJECT='Help on Auto Charging Authority Prompt',
+		FILE=:gc_help_dir+'auto_charge_auth_prompt.hlp'
+			);
+END
+
+
+
+'Choices', KEY FRSKEY10=
+BEGIN
+
+   SET_FORMS FRS(MAP(FRSKEY9)='pf12');
+   SET_FORMS FRS(LABEL(FRSKEY9)='F12');
+
+
+   INQUIRE_FORMS FORM (IIchar = FIELD);
+
+   IF IIchar = 'authority_no' THEN
+   
+      IIint = CALLFRAME LOOK_UP
+	      (II_QUERY = SELECT DISTINCT authorisation_no,
+					  authorisation_desc 
+			    FROM auto_charging_authorise;
+		authorisation_no   = BYREF(:II_authority_no),
+		authorisation_desc = BYREF(:II_authority),
+		II_FIELD1 = 'authorisation_no',
+		II_FIELD2 = 'authorisation_desc',
+		II_FIELD_TITLE1 = 'No.',
+		II_FIELD_TITLE2 = 'Authority',
+		II_ROWS = 10,
+		II_STARTCOLUMN = 20,
+		II_STARTROW = 6);
+		      
+   ELSEIF IIchar = 'reason_no' THEN
+		     
+      IIint = CALLFRAME LOOK_UP
+	      (II_QUERY = SELECT reason_no,
+				 reason_desc
+			    FROM auto_charging_reason;
+		reason_no   = BYREF(:II_reason_no),
+		reason_desc = BYREF(:II_reason),
+		II_FIELD1 = 'reason_no',
+		II_FIELD2 = 'reason_desc',
+		II_FIELD_TITLE1 = 'No.',
+		II_FIELD_TITLE2 = 'Reason',
+		II_ROWS = 10,
+		II_STARTCOLUMN = 20,
+		II_STARTROW = 6);
+   
+   ENDIF;            
+
+   SET_FORMS FRS(MAP(FRSKEY3)='pf12');
+   SET_FORMS FRS(LABEL(FRSKEY3)='F12');
+   SET_FORMS FRS(MAP(FRSKEY9)='pf5');
+   SET_FORMS FRS(LABEL(FRSKEY9)='F5');
+
+				
+   IF IIint = 0 THEN
+      RESUME;
+   ENDIF;
+
+   IF IIchar = 'authority_no' THEN
+      
+      authority_no = :II_authority_no;
+      authority = II_authority;
+      
+      RESUME FIELD reason_no;
+      
+   ENDIF;
+
+   IF IIchar = 'reason_no' THEN
+
+      reason_no = :II_reason_no;
+      reason = :II_reason;
+      
+   ENDIF;
+   
+   RESUME;
+
+END
+
+
+
+'Select', KEY FRSKEY4 =
+BEGIN
+
+    IIchar = CALLPROC v_screen();
+   
+    IF IIchar != 'success' THEN
+       RESUME FIELD :IIchar;
+    ENDIF;
+
+    RETURN 0;
+    
+END
+
+
+'Cancel', KEY FRSKEY3 =
+BEGIN
+
+    RETURN 1;
+    
+END
+
+
+
+PROCEDURE v_authority_no()=
+DECLARE
+
+   RESULT = INTEGER;
+   
+BEGIN
+
+   IF authority_no = 0 THEN
+      CLEAR FIELD authority_no;
+   ENDIF;
+
+   IF authority_no = '' THEN
+      MESSAGE 'You must enter an authority no.'
+      WITH STYLE = POPUP;
+      RETURN 1;
+   ENDIF;
+
+   SELECT authority = authorisation_desc
+     FROM auto_charging_authorise
+    WHERE authorisation_no = :authority_no;
+
+   RESULT = CALLPROC check_ingres_error(proc_no = 10);
+   
+   IF RESULT != 0 THEN
+      RETURN 1;
+   ENDIF;
+   
+   COMMIT;
+   
+   IF IIrowcount = 0 THEN
+      MESSAGE 'Authority is not on the system'
+      WITH STYLE = POPUP;
+      RETURN 1;
+   ENDIF;
+
+   RETURN 0;
+   
+END
+
+
+
+PROCEDURE v_reason_no()=
+DECLARE
+
+   RESULT = INTEGER;
+   
+BEGIN
+
+   IF reason_no = '' THEN
+      CLEAR FIELD reason_no;
+   ENDIF;
+
+   IF reason_no = '' THEN
+      MESSAGE 'You must enter a reason no.'
+      WITH STYLE = POPUP;
+      RETURN 1;
+   ENDIF;
+
+   SELECT reason = reason_desc
+     FROM auto_charging_reason
+    WHERE reason_no = :reason_no;
+    
+   RESULT = CALLPROC check_ingres_error(proc_no = 20);
+   
+   IF RESULT != 0 THEN
+      RETURN 1;
+   ENDIF;
+   
+   COMMIT;
+   
+   IF IIrowcount = 0 THEN
+      MESSAGE 'Reason is not on the system'
+      WITH STYLE = POPUP;
+      RETURN 1;
+   ENDIF;
+
+   RETURN 0;
+   
+END
+
+
+PROCEDURE v_screen()=
+DECLARE
+
+   RESULT = INTEGER;
+   
+BEGIN
+
+   RESULT = CALLPROC v_authority_no();
+
+   IF RESULT != 0 THEN
+      RETURN 'authority_no';
+   ENDIF;
+
+   RESULT = CALLPROC v_reason_no();
+
+   IF RESULT != 0 THEN
+      RETURN 'reason_no';
+   ENDIF;
+
+   RETURN 'success';
+   
+END
+
+
+
+
+PROCEDURE check_ingres_error(proc_no = INTEGER)=
+DECLARE
+
+   hf_errorno = INTEGER;
+   hf_errortext = CHAR(25);
+   
+   RESULT = INTEGER;
+  
+BEGIN
+
+   INQUIRE_INGRES (hf_errorno   = ERRORNO,
+		   hf_errortext = ERRORTEXT,
+		   IIrowcount   = ROWCOUNT);
+		   
+   IF hf_errorno != 0 THEN
+      MESSAGE 'INGRES ERROR ' + trim(char(:proc_no)) + ' - ' +
+	      trim(char(:hf_errorno)) + ' ' + :hf_errortext
+      WITH STYLE = POPUP;
+      RETURN 1;
+   ENDIF;
+		   
+   RETURN 0;       
+		   
+END                
+		   
+		   
+		   
+		   

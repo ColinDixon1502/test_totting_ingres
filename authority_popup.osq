@@ -1,0 +1,97 @@
+/*
+** Inventory Management System CONTROL development using INGRES.
+** -------------------------------------------------------------
+**
+** SOURCE NAME: authority_popup.osq
+**
+** FRAME NAME:  authority_popup
+** FORM NAME:   authority_popup
+**
+** PURPOSE:     Update Authority on CD transactions
+**
+** VERSION:     1.0
+**
+** STATUS:      Development
+**
+** AUTHOR:      S Morris
+**
+** DATE:        27/09/94
+**
+** CHANGE DATE: N/A
+**
+** CHANGES:     The original version
+**
+** PARAMETERS:  None
+**
+*/
+
+initialize()=
+
+declare
+    retval = integer,
+    try_count = integer
+    
+begin
+    set_forms frs (timeout = :gc_timeout);
+    
+    try_count = 0;
+    retval = 0;
+end;
+
+after field pass_word=
+begin
+
+    if pass_word is null
+    then
+	message 'Must enter a Password ! ' with style = popup;
+	resume field pass_word;
+    endif;
+    
+    retval = callproc password_check_4gl
+/*       retval = EXECUTE PROCEDURE password_check */
+					    (user_id = :gv_user_id,
+					    branch_id = :gv_branch_id,
+					    password = :pass_word);
+					    
+/*    message 'Password OK ! ' + :pass_word;*/
+    
+    if retval != 0
+    then
+	try_count = try_count + 1;
+	if try_count < 3
+	then
+	    message 'INVALID PASSWORD !' with style = popup;
+	    resume field pass_word;
+	else
+	    message '3 ATTEMPTS ALLOWED ONLY !';
+	    sleep 3;
+	    try_count = 0;
+	    return -1;
+	endif;
+    endif;
+    
+    resume next;
+    
+end;
+
+on timeout = 
+begin
+    callframe timeout_popup();
+end;
+
+'Help', KEY FRSKEY1 =
+begin
+    callproc help_proc(SUBJECT = 
+	       'Help on CD Authrity Update frame',
+	       file = :gc_help_dir+'authority_popup.hlp');
+end;
+
+'End',key frskey3=
+begin
+    return -1;
+end;
+
+'Update',key frskey4= 
+begin
+    return 0;
+end;

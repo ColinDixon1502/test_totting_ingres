@@ -1,0 +1,263 @@
+/******************************************************************************
+*  Frame  - Auto Charging - authorisation fm                          
+*  Author - T. Farrell.
+*
+*  Date   - 06.02.95
+*  Type   - Online Frame
+*
+*  Source - auto_charging_auth_fm.osq     
+*  Form   - auto_charging_auth_fm.osq                                  
+*
+*  Parameters expected - None.
+*
+*******************************************************************************
+*  Version | Date     | Coded | Description of changes made
+***********|**********|*******|************************************************
+*  1.0     | 07.02.95 |  TF   | Original code
+******************************************************************************/
+
+INITIALIZE
+(
+/*******************************************************
+** INGRES ERROR HANDLING VARIABLES
+*******************************************************/
+    IIrowcount  =  INTEGER(4) NOT NULL,
+    IIerrorno   =  INTEGER(4) NOT NULL,
+    hf_errtext  =  CHAR(256)  NOT NULL,
+
+/*******************************************************
+** FRAME SPECIFIC VARIABLES  
+*******************************************************/
+    IIint                 =  INTEGER(4) NOT NULL, /* Holds procedure return values     */
+    hf_title_no           =  INTEGER(4) NOT NULL, /* Holds returned code from popup    */
+    IIchar1               =  CHAR(1)    NOT NULL, /* General single character variable */
+    IIchar                =  CHAR(20)   NOT NULL, /* General purpose char variable     */
+    hf_authorisation_no   =  INTEGER(4) NOT NULL,
+    hf_authorisation_desc =  CHAR(16)   NOT NULL,
+)=
+BEGIN
+
+    SET_FORMS FRS (TIMEOUT = :gc_timeout);
+
+    SET_FORMS FRS (MAP(FRSKEY1) = 'pf1');
+    SET_FORMS FRS (LABEL(FRSKEY1) = 'F1');
+    SET_FORMS FRS (MAP(FRSKEY9) = 'pf5');
+    SET_FORMS FRS (LABEL(FRSKEY9) = 'F5');
+    SET_FORMS FRS (MAP(FRSKEY14) = 'pf6');
+    SET_FORMS FRS (LABEL(FRSKEY14) = 'F6');
+    SET_FORMS FRS (MAP(FRSKEY4) = 'pf11');
+    SET_FORMS FRS (LABEL(FRSKEY4) = 'F11');
+    SET_FORMS FRS (MAP(FRSKEY3) = 'pf12');
+    SET_FORMS FRS (LABEL(FRSKEY3) = 'F12');
+    
+    /******************************************************
+    ** Initialise form field values and set to query mode
+    *******************************************************/
+
+    date = DATE('now');
+
+    SET_FORMS FRS (ACTIVATE(previousfield) = 1);
+
+    /*********************************************************
+    ** Set table mode to read and populate from the database
+    **********************************************************/
+
+    INITTABLE iitf 'READ';
+
+    iitf := SELECT authorisation_no,
+		   authorisation_desc
+	      FROM auto_charging_authorise
+	  ORDER BY 1;
+
+    /**************************
+    ** Check For INGRES Error 
+    ***************************/
+    INQUIRE_INGRES (IIerrorno  = ERRORNO,
+		    hf_errtext = ERRORTEXT,
+		    IIrowcount = ROWCOUNT);
+
+    IF IIerrorno != 0 THEN
+	ROLLBACK;
+	MESSAGE '-01- INGRES error in select ' 
+		+ :hf_errtext WITH STYLE = POPUP;
+	RETURN;
+    ENDIF;
+
+    COMMIT;
+END
+
+
+ON TIMEOUT =
+BEGIN
+
+   CALLFRAME timeout_popup();
+
+END
+
+
+'Help', KEY FRSKEY1=
+BEGIN
+	callproc help_proc(
+		SUBJECT='Help on Auto Charging Authorisation FM',
+		FILE=:gc_help_dir+'auto_charge_authorisation.hlp'
+			);
+END
+
+
+'Insert', KEY FRSKEY9 =
+BEGIN
+    hf_authorisation_no = 0;
+    hf_authorisation_desc = '';
+
+    /************************************************
+    ** Call popup to insert new description
+    **************************************************/
+
+    IIint = CALLFRAME auto_charging_auth_popup(screenmode = 'INSERT',
+					       authorisation_no  = BYREF(hf_authorisation_no),
+					       authorisation_desc = BYREF(hf_authorisation_desc));
+
+    IF IIint = 0 THEN /** New row has been inserted **/
+
+	/**********************************
+	** Reselect data into table field
+	***********************************/
+
+	INITTABLE iitf 'READ';
+
+	iitf := SELECT authorisation_no,
+		       authorisation_desc
+		  FROM auto_charging_authorise
+	      ORDER BY 1;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-02- INGRES error in select ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN;
+	ENDIF;
+
+	COMMIT;
+
+    ELSEIF IIint = -1 THEN
+	/*******************************************************
+	** Returned -1 : INGRES Error return to calling frame 
+	********************************************************/
+	RETURN; 
+    ENDIF;
+
+    /*****************************************************************
+    ** If returned value is not 0 or -1 then insert cancelled, resume
+    ******************************************************************/
+
+    RESUME;
+END
+
+
+
+'Delete', KEY FRSKEY14 =
+BEGIN
+
+    INQUIRE_FORMS TABLE '' (IIint = LASTROW);
+    
+    IF IIint = 0 THEN
+       MESSAGE 'No authorisation rows to delete'
+       WITH STYLE = POPUP;
+       RESUME;
+    ENDIF;
+
+    IIchar1 = '';
+
+    WHILE UPPERCASE(IIchar1) != 'N' AND
+	  UPPERCASE(IIchar1) != 'Y' 
+    DO
+	IIchar1 = PROMPT 'Delete authorisation ' + TRIM(CHAR(:iitf.authorisation_no)) +
+			 '.  Confirm (Y/N) ?' WITH STYLE = POPUP;
+    ENDWHILE;
+
+    IF UPPERCASE(IIchar1) = 'Y' THEN
+	/********************
+	** Delete confirmed
+	*********************/
+
+	DELETE FROM auto_charging_authorise     
+	      WHERE authorisation_no = :iitf.authorisation_no;
+
+	/**************************
+	** Check For INGRES Error 
+	***************************/
+	INQUIRE_INGRES (IIerrorno  = ERRORNO,
+			hf_errtext = ERRORTEXT,
+			IIrowcount = ROWCOUNT);
+
+	IF IIerrorno != 0 THEN
+	    ROLLBACK;
+	    MESSAGE '-03- INGRES error in DELETE ' 
+		    + :hf_errtext WITH STYLE = POPUP;
+	    RETURN;
+	ENDIF;
+
+	COMMIT;
+
+	DELETEROW iitf;
+    ENDIF;
+
+    RESUME;
+END
+
+
+'Update', KEY FRSKEY4 =
+BEGIN
+
+    INQUIRE_FORMS TABLE '' (IIint = LASTROW);
+    
+    IF IIint = 0 THEN
+       MESSAGE 'No authorisation rows to update'
+       WITH STYLE = POPUP;
+       RESUME;
+    ENDIF;
+
+    hf_authorisation_no = iitf.authorisation_no; 
+    hf_authorisation_desc = iitf.authorisation_desc; 
+
+    /********************************************
+    ** Call popup to update description
+    *********************************************/
+
+    IIint = CALLFRAME auto_charging_auth_popup(screenmode  = 'UPDATE',
+					       authorisation_no  = BYREF(hf_authorisation_no),
+					       authorisation_desc = BYREF(hf_authorisation_desc));
+    IF IIint = 0 THEN
+	/************************************************************
+	** Returned 0 : successful update, reset description in iitf 
+	*************************************************************/
+	iitf.authorisation_desc = hf_authorisation_desc;
+
+    ELSEIF IIint = -1 THEN
+	/*******************************************************
+	** Returned -1 : INGRES Error return to calling frame 
+	********************************************************/
+	RETURN; 
+    ENDIF;
+
+    /*****************************************************************
+    ** If returned value is not 0 or -1 then update cancelled, resume
+    ******************************************************************/
+
+    RESUME;
+END
+
+
+
+'End', KEY FRSKEY3 =
+BEGIN
+    RETURN;
+END
+
